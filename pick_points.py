@@ -32,69 +32,12 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-from src.points_io import PointsError, save_points, load_points
+from src.points_io import PointStore, PointsError, save_points, load_points  # noqa: F401  (PointStore re-exported)
 from src.review import ReviewError, ReviewNavigator, load_review
 from src.video_io import VideoInfo, probe_video, read_frame_at
 
 COLORS = [(0, 200, 255), (80, 255, 80), (255, 120, 60), (255, 60, 255), (60, 255, 255), (200, 200, 60),
           (120, 120, 255), (255, 200, 200), (90, 160, 90)]
-
-
-class PointStore:
-    """All clicks, independent of any GUI (unit-testable)."""
-
-    def __init__(self):
-        self.points: List[dict] = []     # {obj_id, frame_idx, x, y, label}
-        self.objects: List[int] = [1]
-        self.current = 1
-
-    def add(self, frame_idx: int, x: float, y: float, label: int):
-        if label not in (0, 1):
-            raise ValueError("label must be 0 or 1")
-        self.points.append({"obj_id": self.current, "frame_idx": int(frame_idx), "x": float(x), "y": float(y), "label": int(label)})
-
-    def new_object(self) -> int:
-        self.current = max(self.objects + [p["obj_id"] for p in self.points]) + 1
-        self.objects.append(self.current)
-        return self.current
-
-    def select(self, obj_id: int) -> bool:
-        if obj_id in self.objects or any(p["obj_id"] == obj_id for p in self.points):
-            self.current = obj_id
-            return True
-        return False
-
-    def undo(self, frame_idx: int) -> bool:
-        for i in range(len(self.points) - 1, -1, -1):
-            p = self.points[i]
-            if p["frame_idx"] == frame_idx and p["obj_id"] == self.current:
-                del self.points[i]
-                return True
-        return False
-
-    def clear_frame(self, frame_idx: int) -> int:
-        n = len(self.points)
-        self.points = [p for p in self.points if not (p["frame_idx"] == frame_idx and p["obj_id"] == self.current)]
-        return n - len(self.points)
-
-    def delete_object(self) -> int:
-        n = len(self.points)
-        self.points = [p for p in self.points if p["obj_id"] != self.current]
-        if self.current in self.objects and len(self.objects) > 1:
-            self.objects.remove(self.current)
-        self.current = self.objects[0]
-        return n - len(self.points)
-
-    def valid(self) -> List[str]:
-        """Problems that would make censor_video.py reject the file."""
-        probs = []
-        groups: Dict[tuple, List[int]] = {}
-        for p in self.points:
-            groups.setdefault((p["obj_id"], p["frame_idx"]), []).append(p["label"])
-        for (o, f), labs in groups.items():
-            if 1 not in labs:
-                probs.append(f"object {o} frame {f}: only negative points")
-        return probs
 
 
 class Picker:

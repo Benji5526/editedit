@@ -19,3 +19,6 @@ temp/*
 *.partial
 points*.json
 !config.example.json
+
+# per-video click files written by the desktop app
+*.points.json

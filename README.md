@@ -24,7 +24,21 @@ Then download a SAM 2.1 checkpoint into `models/` – see [models/README.md](mod
 Check the environment: `python -c "import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` must print `True`.
 `censor_video.py` refuses to silently fall back to CPU.
 
-## Usage
+## Desktop app (in progress: stage 1-2 of 6)
+```powershell
+python app.py [video]        # or double-click run_app.bat (no console window)
+```
+Implemented and tested: open a video (analysed in the background), preview with frame stepping (±1, ±10, ±1 s, slider, play/pause), click targets
+(left = positive, right = negative, several objects with their own colour/ID, undo, clear, delete), save/load the points file
+(`<video>.points.json` next to the video, auto-loaded when it matches the file's fingerprint, size, fps and frame count), unsaved-change prompts.
+Clicks are converted from widget to full-resolution frame coordinates with letterbox handling (clicks on the black bars are ignored, not clamped);
+the preview is decoded by FFmpeg (same decoder, rotation and frame numbering as the processing pipeline) and never blocks the UI thread.
+
+**Not yet in the app (still command line):** starting/cancelling processing with progress, the review screen, re-processing after re-clicks, EXE packaging.
+Use `censor_video.py` and `pick_points.py --review` below for those until the next stages land.
+Preview text rendering was checked on a real desktop window only for start-up (title, no errors); layout/fonts were inspected from an offscreen capture.
+
+## Usage (command line)
 1. **Pick targets** (OpenCV window; left click = this is the object, right click = this is NOT; `n` new object, `a/d` ±1 frame, `q/e` ±10, `z/c` ±1 s, trackbar, `u` undo, `s` save – full key list in `pick_points.py --help`/docstring):
    ```powershell
    python pick_points.py input\video.mp4 -o points.json
