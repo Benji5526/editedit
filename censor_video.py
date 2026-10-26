@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 
+from src.job_manager import file_signature
 from src.pipeline import Config, Pipeline, plan_reprocess
 
 
@@ -57,7 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--nudenet-res", type=int, default=320, help="inference resolution of that model")
     g.add_argument("--nudenet-tiles", type=int, default=1, help="also scan a NxN grid of crops (slower, finds smaller regions)")
     g = p.add_argument_group("mosaic")
-    g.add_argument("--block", type=int, default=32, help="mosaic block size in full-res pixels")
+    g.add_argument("--block", type=int, default=32, help="mosaic strength in full-res pixels: block size (pixelate) or 2 x sigma (blur)")
+    g.add_argument("--mosaic-style", choices=["pixelate", "blur", "solid"], default="pixelate",
+                   help="pixelate (default), blur (weakest) or solid black")
     g.add_argument("--mask-pad-px", type=float, default=24.0, help="grow SAM 2 masks by this many full-res pixels")
     g.add_argument("--temporal-radius", type=int, default=2, help="union masks of +-N neighbouring frames")
     g = p.add_argument_group("fail-closed (may cover more than the target)")
@@ -103,14 +106,15 @@ def main(argv=None) -> int:
         chunk_size=a.chunk_size, analysis_width=a.analysis_width, max_frames=a.max_frames,
         max_stale_frames=a.max_stale_frames, stale_prefix_frames=a.stale_prefix_frames, jump_ratio=a.jump_ratio,
         detect_every=a.detect_every, det_threshold=a.det_threshold, det_expand=a.det_expand, det_pad_px=a.det_pad_px,
-        det_fill_gap=a.det_fill_gap, det_hold=a.det_hold, block=a.block, mask_pad_px=a.mask_pad_px,
+        det_fill_gap=a.det_fill_gap, det_hold=a.det_hold, block=a.block, mosaic_style=a.mosaic_style, mask_pad_px=a.mask_pad_px,
         temporal_radius=a.temporal_radius, fail_closed=a.fail_closed, fail_closed_mode=a.fail_closed_mode,
         fail_closed_expand=a.fail_closed_expand, fail_closed_max_frames=a.fail_closed_max_frames,
         encoder=a.encoder, crf=a.crf, preset=a.preset, keep_audio=not a.no_audio, deep_verify=a.deep_verify,
         allow_vfr=a.allow_vfr, allow_hdr=a.allow_hdr, allow_points_mismatch=a.allow_points_mismatch, resume=a.resume,
         extra={"keep_temp": a.keep_temp, "nudenet": not a.no_nudenet, "det_classes": a.det_classes,
                "nudenet_model": a.nudenet_model, "nudenet_res": a.nudenet_res, "nudenet_tiles": a.nudenet_tiles,
-               "sam2_checkpoint": os.path.basename(a.sam2_checkpoint or ""), "device": a.device},
+               "sam2_ckpt_sig": file_signature(a.sam2_checkpoint) if a.sam2_checkpoint and os.path.isfile(a.sam2_checkpoint) else "",
+               "device": a.device},
     )
     def emit(ev: dict):
         if a.progress_json:

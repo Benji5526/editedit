@@ -106,3 +106,45 @@ def pixelate_region(frame: np.ndarray, mask: np.ndarray, block: int) -> np.ndarr
     sub = mask[y1:y2, x1:x2]
     region[sub] = pix[sub]
     return frame
+
+
+STYLES = ("pixelate", "blur", "solid")
+
+
+def blur_region(frame: np.ndarray, mask: np.ndarray, strength: int) -> np.ndarray:
+    """Gaussian blur inside the mask (sigma = strength / 2). Pixels just outside the mask bleed into the border of the
+    blurred area, which is fine; the pixels outside the mask are never modified. Returns the same array."""
+    if frame.shape[:2] != mask.shape:
+        raise ValueError(f"frame {frame.shape[:2]} and mask {mask.shape} differ")
+    bb = mask_bbox(mask)
+    if bb is None:
+        return frame
+    sigma = max(1.0, strength / 2.0)
+    pad = int(3 * sigma) + 1
+    h, w = mask.shape
+    x1, y1, x2, y2 = max(0, bb[0] - pad), max(0, bb[1] - pad), min(w, bb[2] + pad), min(h, bb[3] + pad)
+    region = frame[y1:y2, x1:x2]
+    blurred = cv2.GaussianBlur(region, (0, 0), sigmaX=sigma)
+    sub = mask[y1:y2, x1:x2]
+    region[sub] = blurred[sub]
+    return frame
+
+
+def solid_region(frame: np.ndarray, mask: np.ndarray, value: int = 0) -> np.ndarray:
+    """Fill the masked area with one colour (black by default): nothing of the original survives."""
+    if frame.shape[:2] != mask.shape:
+        raise ValueError(f"frame {frame.shape[:2]} and mask {mask.shape} differ")
+    frame[mask] = value
+    return frame
+
+
+def apply_mosaic(frame: np.ndarray, mask: np.ndarray, style: str = "pixelate", strength: int = 32) -> np.ndarray:
+    """Obscure ``frame`` in place where ``mask`` is True. ``strength`` is the block size (pixelate) or twice the sigma (blur);
+    it is ignored for solid. Pixelate and solid destroy the content; blur is the weakest of the three."""
+    if style == "pixelate":
+        return pixelate_region(frame, mask, strength)
+    if style == "blur":
+        return blur_region(frame, mask, strength)
+    if style == "solid":
+        return solid_region(frame, mask)
+    raise ValueError(f"unknown mosaic style {style!r}; choose one of {STYLES}")

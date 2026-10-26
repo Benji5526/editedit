@@ -34,7 +34,10 @@ logs/   temp/              run logs, review logs, status; intermediate chunks (n
 ```
 
 ## Install (Windows 11)
-Requirements: Python 3.10+ (tested 3.12), NVIDIA GPU + driver, FFmpeg and FFprobe on `PATH`, Git (optional).
+**Supported and tested: native Windows 11** (Python 3.12.10, RTX 4070 Ti 12 GB, driver with CUDA 13.3, PyTorch 2.11 `cu128` wheels, SAM 2 1.1.0, NudeNet 3.4.2,
+PySide6 6.12, FFmpeg 9.0.1). **WSL2 is not tested** (the desktop app needs a display; GPU pass-through and the Windows-only `taskkill`/`run_app.bat` helpers were not tried), so no WSL2 instructions are given.
+Requirements: Python 3.10+, NVIDIA GPU + driver, FFmpeg and FFprobe on `PATH`, Git (optional). Pick the PyTorch wheel that matches your driver from
+<https://pytorch.org/get-started/locally/>; do not install a guessed combination. SAM 2's own install notes: <https://github.com/facebookresearch/sam2>.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
@@ -45,6 +48,8 @@ pip uninstall -y opencv-python-headless opencv-python ; pip install opencv-pytho
 Then download a SAM 2.1 checkpoint into `models/` – see [models/README.md](models/README.md). The checkpoint is **not** included.
 
 Check the environment: `python -c "import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` must print `True`.
+Everything runs locally: no video, frame, point or log is sent anywhere, and no external service is required (only the one-time model download below needs internet).
+Logs and review files contain local file paths and file names; keep them private (the repository ignores `logs/`, `temp/`, `output/`, `input/`, `samples/`, `models/` and `backups/`).
 `censor_video.py` refuses to silently fall back to CPU.
 
 ## Desktop app (in progress: stages 1-4 of 6)
@@ -82,7 +87,14 @@ review events), recomputes everything after it, and refuses to reuse anything wh
 banner when the current points file or the output video no longer match the log. "Reviewed" marks are stored next to the log (`*_review_state.json`); after a re-process they are kept
 only for flags in reused chunks and reset for recomputed ones. "Reviewed" means a human looked at it, not that the frame is correct.
 
-**Not yet:** the SQLite job database (state lives in `temp/<job>/job.json` and `logs/*_status.json`), EXE packaging, a negative-only click on a frame (every clicked frame needs a positive point).
+*Job registry (SQLite).* Every run is recorded in `logs/jobs.sqlite` (job id = run id, input/points/settings/model fingerprints, library versions, per-chunk status
+`running/done/failed` with seconds and memory, output and review-log paths, status and error). When a video is opened the app looks for a job that stopped before finishing
+(cancelled, failed, or crashed - a job still marked `running` whose process is gone becomes `interrupted`) and offers `Process > Resume interrupted job`; `Process > Job history`
+lists all jobs of the video. **The registry is only an index**: whether chunks are reusable is decided from the files in `temp/<job>/` (job.json hashes, segment frame counts,
+state and QC files, a frame fingerprint at the resume point), so a wrong or missing registry row can never make the pipeline reuse a bad chunk, and a registry that cannot be
+opened or written never stops a job. Resuming also requires the same model file (name, size and a hash of its first/last MiB are part of the settings hash).
+
+**Not yet:** EXE packaging, a negative-only click on a frame (every clicked frame needs a positive point).
 Worker protocol (stdout lines `@@PROGRESS {json}`: `stage`, `start`, `progress`, `chunk_done`, `finished`) is documented in `src/app/job_runner.py`.
 
 ## Usage (command line)
@@ -141,6 +153,12 @@ Review JSON from PowerShell: `python -c "import json;d=json.load(open('logs/vide
 | `frame_count_mismatch`, `output_verification_failed` | output integrity problems | error |
 | `fail_closed_mosaic_applied` | `--fail-closed` added a conservative mosaic here (reason + mode in detail) | info |
 
+Names used in the project brief map to these types: tracking_lost = `tracking_lost_mid_frame`/`tracking_lost_at_edge`; mask_area_jump = `mask_area_jump`;
+detector_tracker_mismatch = `detection_without_mask`; chunk_boundary_failure = `chunk_boundary_resume_failed`; frame_read_error/frame_write_error = `frame_error` (the
+detail says which reader/writer) and `model_error`/`detector_error`; output_validation_failure = `output_verification_failed` and `frame_count_mismatch`. The JSON holds the
+fields frame, timestamp, type, severity, object_id, detail (detections, tracking result, reason), action (what the program did) and meta (input fingerprint, run id, points hash,
+output); `tests/test_imports_and_logs.py` checks that the CSV and the JSON contain the same events. "Reviewed" status is kept next to the log (`*_review_state.json`), not inside it.
+
 `tracking_lost_*` does **not** mean something was missed (the object may be occluded or off-screen) and the *absence* of events
 does **not** mean nothing was missed.
 
@@ -159,6 +177,8 @@ Without the flag the same events are logged but the frames pass through as compu
 * `video_io.py` – FFprobe metadata, real packet timestamps, VFR heuristic, FFmpeg raw-frame reader (`-fps_mode passthrough`, auto-rotation) and per-chunk encoder; audio is stream-copied from the source at the end.
 * Per chunk (`--chunk-size`, default 120; 120–240 recommended): the analysis reader (frames downscaled by FFmpeg to `--analysis-width`, default 1920) writes JPEGs for SAM 2 and feeds NudeNet; SAM 2 tracks; QC runs; then a **second reader streams full-resolution frames one by one**, the mosaic is applied at full resolution and encoded to a segment file. Masks are kept bit-packed. Per-chunk temp data is deleted. Memory is bounded by the chunk size, not the video length (measured: see below).
 * The final file is made by concatenating segments (stream copy) + original audio into `*.partial`, verifying it, and only then renaming it.
+* Mosaic style (`--mosaic-style`, `--block` = strength in full-resolution px): `pixelate` (default, block grid anchored to the image), `solid` (black; nothing of the original survives) or
+  `blur` (Gaussian, sigma = block/2; the weakest of the three, prefer pixelate or solid for sensitive content).
 * Mosaic area = union of (all objects' masks over ±`--temporal-radius` frames, grown by `--mask-pad-px`) ∪ (NudeNet boxes grown by `--det-expand`/`--det-pad-px`, with short gaps bridged and boxes held `--det-hold` frames) ∪ fail-closed regions. A union cannot lose one of its members. The pixel grid is anchored to the image so blocks do not shimmer as masks move.
 * NudeNet: model output is post-processed here with a configurable `--det-threshold` (the library's own `detect()` hard-codes a 0.2/0.25 floor). Lowering the threshold gives more detections and more false positives, not guaranteed recall. `--nudenet-tiles 2` additionally scans overlapping crops (small regions get more resolution; slower). It runs on CPU unless you install `onnxruntime-gpu` yourself.
 

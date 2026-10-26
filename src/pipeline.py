@@ -24,8 +24,9 @@ import cv2
 import numpy as np
 
 from . import quality_control as qc
+from .job_manager import JobDB, db_path_for
 from .detection import Det, fill_detections
-from .mosaic import (boxes_to_mask, dilate_mask, expand_box, mask_bbox, pixelate_region,
+from .mosaic import (STYLES, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
 from .points_io import Prompts, load_points
 from .tracking import Init, Tracker, TrackerError, pack_mask, unpack_mask
@@ -69,7 +70,8 @@ class Config:
     det_fill_gap: int = 6
     det_hold: int = 3
     # mosaic
-    block: int = 32                      # full-res pixels
+    block: int = 32                      # strength: block size (pixelate) or 2 x sigma (blur), full-res pixels
+    mosaic_style: str = "pixelate"       # pixelate | blur | solid
     mask_pad_px: float = 24.0            # full-res pixels
     temporal_radius: int = 2
     # fail-closed
@@ -212,6 +214,17 @@ class Pipeline:
         self.stem = os.path.splitext(os.path.basename(cfg.input))[0]
         self.progress, self.cancel_check = progress, cancel_check
         self._ci = self._nchunks = self._done_frames = 0
+        self.db: Optional[JobDB] = None
+        self.run_id: Optional[str] = None
+
+    def _db_call(self, name: str, *a, **k):
+        """Registry writes are best effort: a broken registry must never stop or corrupt a job."""
+        if self.db is None or self.run_id is None:
+            return
+        try:
+            getattr(self.db, name)(self.run_id, *a, **k)
+        except Exception:  # noqa: BLE001
+            log.warning("job registry write failed (%s)", name, exc_info=True)
 
     # ------------------------------------------------------------------ progress / cancel
     def _emit(self, **ev):
@@ -248,6 +261,8 @@ class Pipeline:
             raise JobFailed("resume needs reliable packet timestamps for frame-exact seeking; this file has none")
         if info.nb_frames <= 0:
             raise JobFailed("could not determine frame count")
+        if cfg.mosaic_style not in STYLES:
+            raise JobFailed(f"unknown mosaic style {cfg.mosaic_style!r}; choose one of {STYLES}")
 
     def run(self) -> int:
         cfg = self.cfg
@@ -259,17 +274,26 @@ class Pipeline:
         log.setLevel(logging.INFO)
         status_path = os.path.join(cfg.log_dir, f"{self.stem}_status.json")
         try:
+            self.db = JobDB(db_path_for(cfg.log_dir))
+            self.db.recover_interrupted()
+        except Exception:  # noqa: BLE001
+            self.db = None
+            log.warning("job registry unavailable; continuing without it", exc_info=True)
+        try:
             return self._run(status_path)
         except JobCancelled as e:
+            self._db_call("finish_job", "cancelled", str(e))
             log.warning("JOB CANCELLED: %s", e)
             _atomic_json(status_path, {"status": "cancelled", "reason": str(e), "time": time.strftime("%F %T"),
                                        "note": "completed chunks are kept; run again with --resume to continue"})
             return 3
         except (JobFailed, VideoError) as e:
+            self._db_call("finish_job", "failed", str(e)[:1000])
             log.error("JOB FAILED: %s", e)
             _atomic_json(status_path, {"status": "failed", "reason": str(e), "time": time.strftime("%F %T")})
             return 1
         except Exception as e:  # noqa: BLE001
+            self._db_call("finish_job", "failed", f"{type(e).__name__}: {e}"[:1000])
             log.exception("JOB FAILED (unexpected)")
             _atomic_json(status_path, {"status": "failed", "reason": f"{type(e).__name__}: {e}", "time": time.strftime("%F %T")})
             return 1
@@ -285,6 +309,11 @@ class Pipeline:
         log.info("input %s %dx%d %s fps nb_frames=%d dur=%.2fs rot=%d vfr=%s (%s) audio=%s pix_fmt=%s",
                  info.path, info.width, info.height, info.fps_rational, info.nb_frames, info.duration, info.rotation,
                  info.is_vfr, info.vfr_detail, info.has_audio, info.pix_fmt)
+        self.run_id = uuid.uuid4().hex[:12]
+        self._db_call("start_job", input_path=info.path, input_fp=info.fingerprint,
+                      total_frames=min(info.nb_frames, cfg.max_frames) if cfg.max_frames else info.nb_frames,
+                      chunk_size=cfg.chunk_size, output_path=os.path.abspath(cfg.output) if cfg.output else None,
+                      job_dir=None, resume=int(cfg.resume), model_sig=(cfg.extra or {}).get("sam2_ckpt_sig"))
         self._check_input(info)
         W, H = info.width, info.height
         total = min(info.nb_frames, cfg.max_frames) if cfg.max_frames else info.nb_frames
@@ -312,7 +341,6 @@ class Pipeline:
         job_dir = job_dir_for(cfg, info)
         self.job_dir = job_dir
         job_path = os.path.join(job_dir, "job.json")
-        self.run_id = uuid.uuid4().hex[:12]
         self.points_sha = file_sha(cfg.points)
         job = {"config_hash": h, "input": info.to_json_dict(), "config": asdict(cfg), "total_frames": total,
                "chunks": {}, "analysis_size": [aw, ah], "created": time.strftime("%F %T"),
@@ -336,6 +364,12 @@ class Pipeline:
         if start_ci == 0 and not os.path.isdir(job_dir):
             os.makedirs(job_dir)
         _atomic_json(job_path, job)
+        self._db_call("update_job", config_hash=h, points_sha=self.points_sha, n_chunks=len(chunks), reused_chunks=start_ci,
+                      job_dir=os.path.abspath(job_dir), versions=self.tracker.describe() if self.tracker else None)
+        for ci_done in range(start_ci):
+            c = job["chunks"].get(str(ci_done), {})
+            self._db_call("set_chunk", ci_done, "done", start_frame=c.get("start"), end_frame=c.get("end"), seconds=c.get("seconds"),
+                          rss_mb=c.get("rss_mb"), cuda_peak_mb=c.get("cuda_peak_mb"))
         if start_ci:
             if start_ci < len(chunks):
                 log.info("resuming at chunk %d/%d (frame %d)", start_ci, len(chunks), chunks[start_ci][0])
@@ -378,7 +412,14 @@ class Pipeline:
                 t0 = time.time()
                 self._ci, self._done_frames = ci, s
                 self._check_cancel()
-                chunk_events = self._process_chunk(ci, s, e, a_reader, f_reader, prompts)
+                self._db_call("set_chunk", ci, "running", start_frame=s, end_frame=e)
+                try:
+                    chunk_events = self._process_chunk(ci, s, e, a_reader, f_reader, prompts)
+                except JobCancelled:
+                    raise
+                except BaseException as ex:
+                    self._db_call("set_chunk", ci, "failed", start_frame=s, end_frame=e, error=f"{type(ex).__name__}: {ex}"[:500])
+                    raise
                 self._done_frames = e
                 events += chunk_events
                 mem = _mem_snapshot()
@@ -386,6 +427,8 @@ class Pipeline:
                                           "segment": f"seg_{ci:05d}.mp4", "seconds": round(time.time() - t0, 1), **mem,
                                           "last_frame_md5": hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest()}
                 _atomic_json(job_path, job)
+                self._db_call("set_chunk", ci, "done", start_frame=s, end_frame=e, seconds=round(time.time() - t0, 1),
+                              rss_mb=mem.get("rss_mb"), cuda_peak_mb=mem.get("cuda_peak_mb"))
                 self._emit(event="chunk_done", chunk=ci, chunks=len(chunks), start=s, end=e, done_frames=e, total_frames=total,
                            seconds=round(time.time() - t0, 2), events=len(chunk_events), **mem)
                 el = time.time() - t_start
@@ -667,7 +710,7 @@ class Pipeline:
                              f"reason={fc_reason[i]} mode={'full' if fc_full[i] else cfg.fail_closed_mode}",
                              action="full_frame_mosaic" if (fc_full[i] or cfg.fail_closed_mode == "full") else "expanded_bbox_mosaic")
                 m_full = upscale_mask(m_an, (info.height, info.width))
-                pixelate_region(full, m_full, cfg.block)
+                apply_mosaic(full, m_full, cfg.mosaic_style, cfg.block)
                 writer.write(full)
             writer.close()
         except BaseException:
@@ -750,6 +793,8 @@ class Pipeline:
             _atomic_json(status_path, {"status": "failed", "reason": "output verification failed", "problems": problems,
                                        "partial_file": partial, "time": time.strftime("%F %T")})
             log.error("output verification FAILED: %s (kept as %s)", problems, partial)
+            self._db_call("finish_job", "failed", "output verification failed: " + "; ".join(problems)[:900],
+                          review_log=os.path.abspath(review_json))
             return 1
         os.replace(partial, out_final)
         errors = sum(1 for e in qlog.events if e.severity == "error")
@@ -760,5 +805,6 @@ class Pipeline:
                                    "seconds": round(time.time() - t_start, 1), "summary": qlog.summary(),
                                    "note": "no flags does not prove nothing was missed; spot-check the output"})
         log.info("DONE %s status=%s errors=%d warns=%d", out_final, status, errors, warns)
+        self._db_call("finish_job", status, None, output_path=os.path.abspath(out_final), review_log=os.path.abspath(review_json))
         shutil.rmtree(self.job_dir, ignore_errors=True) if not cfg.extra.get("keep_temp") else None
         return 2 if errors else 0

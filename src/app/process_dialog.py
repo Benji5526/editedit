@@ -108,10 +108,15 @@ class ProcessDialog(QDialog):
         form.addRow("  uncertain region", self.fcm)
         form.addRow(QLabel("  Fail-closed can cover more than the target (up to whole frames). It does not catch objects no model sees."))
 
+        self.style = QComboBox()
+        self.style.addItems(["pixelate", "blur", "solid"])
+        self.style.setCurrentText(st.mosaic_style)
+        self.style.setToolTip("pixelate and solid destroy the content; blur is the weakest")
+        form.addRow("Mosaic style", self.style)
         self.block = QSpinBox()
         self.block.setRange(4, 256)
         self.block.setValue(st.block)
-        form.addRow("Mosaic block size (px)", self.block)
+        form.addRow("Mosaic strength (block size / blur, px)", self.block)
         self.pad = QSpinBox()
         self.pad.setRange(0, 500)
         self.pad.setValue(int(st.mask_pad_px))
@@ -164,7 +169,7 @@ class ProcessDialog(QDialog):
             sam2_checkpoint=self.ckpt.text().strip(), output=self.out.text().strip(), chunk_size=self.chunk.value(),
             analysis_width=int(self.aw.currentData()), use_nudenet=self.nude.isChecked(), detect_every=self.every.value(),
             det_threshold=round(self.thr.value(), 3), fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
-            block=self.block.value(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
+            block=self.block.value(), mosaic_style=self.style.currentText(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
             max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentText(),
             keep_chunks=self.keep.isChecked())
 

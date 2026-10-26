@@ -20,7 +20,10 @@ from src.review_data import ReviewData, load_review_data
 from src.video_io import VideoInfo, is_hdr, probe_video
 
 from .frame_server import FrameServer
+from src.job_manager import JobDB, db_path_for
+
 from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args, job_dir_for_video
+from .jobs_dialog import JobsDialog
 from .process_dialog import ProcessDialog, validate_settings
 from .process_panel import ProcessPanel
 from .review_panel import FlagSlider, ReviewPanel
@@ -77,6 +80,7 @@ class MainWindow(QMainWindow):
         self._plan: Optional[dict] = None
         self._plan_settings: Optional[ProcessSettings] = None
         self.review: Optional[ReviewData] = None
+        self.resumable_job: Optional[dict] = None
         self.job_running = False
         self.last_settings: Optional[ProcessSettings] = None
         self.last_result: Optional[dict] = None
@@ -157,7 +161,12 @@ class MainWindow(QMainWindow):
         pm.addAction(self.act_cancel)
         self.act_reprocess = act("Re-process with edited points...", "Ctrl+Shift+R", self.reprocess)
         self.act_cleanup = act("Delete intermediate chunks...", None, self.delete_intermediate)
+        self.act_resume_job = act("Resume interrupted job...", None, self.reprocess)
+        self.act_resume_job.setEnabled(False)
+        self.act_history = act("Job history...", None, self.show_job_history)
         pm.addAction(self.act_reprocess)
+        pm.addAction(self.act_resume_job)
+        pm.addAction(self.act_history)
         pm.addAction(self.act_cleanup)
         e = self.menuBar().addMenu("&Edit")
         e.addAction(act("Undo last point on this frame", "U", self.undo_point))
@@ -346,6 +355,42 @@ class MainWindow(QMainWindow):
         if self.ask_confirm(text):
             self.start_processing(dataclasses.replace(self._plan_settings, resume=bool(plan["can_resume"])))
 
+    # ------------------------------------------------------------------ job registry
+    def _log_dir(self) -> str:
+        return (self.last_settings.log_dir if self.last_settings and self.last_settings.log_dir else "") or os.path.join(PROJECT_ROOT, "logs")
+
+    def _job_db(self) -> Optional[JobDB]:
+        path = db_path_for(self._log_dir())
+        return JobDB(path) if os.path.isfile(path) else None
+
+    def check_resumable(self) -> Optional[dict]:
+        """Look for a job of this video that stopped before finishing (cancelled, failed, crashed) and tell the user."""
+        self.resumable_job = None
+        try:
+            db = self._job_db()
+            if self.info is not None and db is not None:
+                self.resumable_job = db.latest_resumable(self.info.fingerprint)
+        except Exception:  # noqa: BLE001  (the registry is only a convenience)
+            log.warning("job registry unavailable", exc_info=True)
+        j = self.resumable_job
+        self.act_resume_job.setEnabled(j is not None and not self.job_running)
+        if j is not None:
+            total = j.get("n_chunks") or "?"
+            done = j["chunks_done"] + (0 if j["chunks_done"] else (j.get("reused_chunks") or 0))
+            self.statusBar().showMessage(self.statusBar().currentMessage() + f"  |  Interrupted job found ({j['status']}, {done}/{total} chunks done, "
+                                         f"{j.get('created')}): Process > Resume interrupted job")
+        return j
+
+    def show_job_history(self):
+        if self.info is None:
+            return
+        try:
+            db = self._job_db()
+            jobs = db.jobs_for_input(self.info.fingerprint) if db is not None else []
+        except Exception:  # noqa: BLE001
+            jobs = []
+        JobsDialog(self, jobs, os.path.basename(self.info.path)).exec()
+
     def delete_intermediate(self):
         if self.info is None or self.job_running:
             return
@@ -378,6 +423,7 @@ class MainWindow(QMainWindow):
         self.act_open_points.setEnabled(not running)
         self.act_reprocess.setEnabled(not running)
         self.act_cleanup.setEnabled(not running)
+        self.act_resume_job.setEnabled(not running and self.resumable_job is not None)
 
     def start_processing_dialog(self):
         if self.info is None:
@@ -446,6 +492,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Processing {res.get('status')}: " + (res.get("reason") or res.get("output") or ""))
         if res.get("review_log") and os.path.isfile(res["review_log"]):
             self.load_review(res["review_log"], quiet=True)
+        self.check_resumable()
 
     # ------------------------------------------------------------------ dialogs (overridable for tests)
     def show_error(self, text: str):
@@ -523,6 +570,7 @@ class MainWindow(QMainWindow):
         if os.path.isfile(self.points_path):
             msg += self._try_load_points(self.points_path, quiet=True)
         self.statusBar().showMessage(msg)
+        self.check_resumable()
         self.frame_idx = -1
         self.goto(0)
 

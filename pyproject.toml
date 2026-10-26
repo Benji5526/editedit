@@ -1,0 +1,16 @@
+# Project metadata and tool configuration. This is an application, not a pip-installable package: install the dependencies
+# from requirements.txt (PyTorch needs the CUDA wheel index, see README) and run `python app.py`.
+[project]
+name = "video-censor-pipeline"
+version = "0.4.0"
+description = "Safety-first local video mosaic tool: SAM 2 tracking of clicked targets, optional NudeNet detection, chunked FFmpeg streaming, review log, PySide6 desktop app"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Not yet chosen" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+filterwarnings = [
+    "ignore:cannot import name '_C' from 'sam2':UserWarning",   # optional SAM 2 CUDA post-processing is not built on Windows
+]
