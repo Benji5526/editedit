@@ -130,7 +130,10 @@ class ProcessDialog(QDialog):
         self.test_n.setSpecialValueText("all frames")
         self.test_n.setValue(0)
         form.addRow("Only the first N frames (test run)", self.test_n)
-        self.resume = QCheckBox("Resume an interrupted job (same input, points and settings)")
+        self.keep = QCheckBox("Keep intermediate chunks (fast re-processing after re-clicks; needs disk space ~ output size)")
+        self.keep.setChecked(st.keep_chunks)
+        form.addRow(self.keep)
+        self.resume = QCheckBox("Resume an interrupted job (same input and settings; changed points only redo the affected chunks)")
         form.addRow(self.resume)
 
         self.error = QLabel("")
@@ -162,7 +165,8 @@ class ProcessDialog(QDialog):
             analysis_width=int(self.aw.currentData()), use_nudenet=self.nude.isChecked(), detect_every=self.every.value(),
             det_threshold=round(self.thr.value(), 3), fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
             block=self.block.value(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
-            max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentText())
+            max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentText(),
+            keep_chunks=self.keep.isChecked())
 
     def problems(self) -> list:
         return validate_settings(self.settings(), self.video_path, self.needs_sam2)

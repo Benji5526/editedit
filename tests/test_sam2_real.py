@@ -44,9 +44,11 @@ def test_real_sam2_tracks_square_across_chunks(video, tmp_path):
     def spy(frame_dir, n, inits):
         out = orig(frame_dir, n, inits)
         chunk_starts.append((n, [(i.obj_id, i.local_frame, i.source) for i in inits]))
+        prefix = n - 40                                  # frames in front of the chunk: 1 overlap frame, or more when a lost object is re-run
         for o, fr in out.items():
             for li, p in fr.items():
-                got[(len(chunk_starts) - 1, li)] = unpack_mask(p, (180, 320))
+                if li >= prefix:
+                    got[(len(chunk_starts) - 1, li - prefix)] = unpack_mask(p, (180, 320))
         return out
 
     tracker.track_chunk = spy
@@ -56,9 +58,7 @@ def test_real_sam2_tracks_square_across_chunks(video, tmp_path):
     assert rc in (0, 2)
     ious = {}
     for (c, li), m in got.items():
-        t = c * 40 + li - (1 if c > 0 else 0)
-        if c > 0 and li == 0:
-            continue                                    # overlap frame belongs to the previous chunk
+        t = c * 40 + li                                 # li is already relative to the chunk's first real frame
         g = gt_mask(t, (180, 320))
         if g.any():
             ious[t] = (m & g).sum() / max(1, (m | g).sum())
@@ -74,15 +74,16 @@ def test_real_sam2_tracks_square_across_chunks(video, tmp_path):
     assert len(pre) == 50 and np.mean(pre) > 0.8
     # ... and make the occlusion visible in the review log
     assert any(e["type"] == "tracking_lost_mid_frame" for e in review["events"])
-    # KNOWN LIMITATION (documented in README): SAM 2 small does not re-find the object after a full occlusion
-    # during which it moved. The pipeline cannot fix that; it must not report the later "recovery" as verified.
+    # with the lost-object re-run at the chunk boundary SAM 2 re-finds the object when it reappears (measured: mean IoU 0.92 over frames 86+)
+    assert np.mean(post) > 0.8
+    # but a recovery after a long loss is never reported as verified
     for e in review["events"]:
         if e["type"] == "tracking_recovered":
             assert e["severity"] == "warn"
 
 
-def test_reclick_after_occlusion_fixes_tracking(video, tmp_path):
-    """The review workflow: the log flags the occlusion, the user clicks the object again on a later frame, re-run."""
+def test_run_with_a_reclick_tracks_after_occlusion(video, tmp_path):
+    """A run whose points include a re-click at frame 90 (the review workflow) tracks the object after the occlusion."""
     info = probe_video(video)
     pts = str(tmp_path / "p.json")
     save_points(pts, info, [{"obj_id": 1, "frame_idx": 20, "x": square_x(20) + 30, "y": 180, "label": 1},

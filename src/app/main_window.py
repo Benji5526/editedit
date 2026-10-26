@@ -15,12 +15,15 @@ from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QHBoxLayo
                                QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from src.points_io import PointStore, PointsError, load_points, save_points
+from src.review import ReviewError
+from src.review_data import ReviewData, load_review_data
 from src.video_io import VideoInfo, is_hdr, probe_video
 
 from .frame_server import FrameServer
-from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args
+from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args, job_dir_for_video
 from .process_dialog import ProcessDialog, validate_settings
 from .process_panel import ProcessPanel
+from .review_panel import FlagSlider, ReviewPanel
 from .video_view import VideoView, object_color
 
 log = logging.getLogger("app")
@@ -70,6 +73,10 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._play_tick)
         self.runner = JobRunner(self)
+        self.plan_runner = JobRunner(self)
+        self._plan: Optional[dict] = None
+        self._plan_settings: Optional[ProcessSettings] = None
+        self.review: Optional[ReviewData] = None
         self.job_running = False
         self.last_settings: Optional[ProcessSettings] = None
         self.last_result: Optional[dict] = None
@@ -78,7 +85,7 @@ class MainWindow(QMainWindow):
         self.view.set_provider(self._points_on_frame, lambda: self.store.current)
         self.view.clicked.connect(self.on_click)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = FlagSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._slider_changed)
         self.pos_label = QLabel("no video")
@@ -112,7 +119,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self._build_side_panel()
         self._build_process_dock()
+        self._build_review_dock()
         self._build_menu()
+        self.plan_runner.progress.connect(self._on_plan_event)
+        self.plan_runner.job_finished.connect(self._on_plan_finished)
         self.runner.progress.connect(self._on_job_progress)
         self.runner.log_line.connect(self.panel.add_log)
         self.runner.job_finished.connect(self._on_job_finished)
@@ -133,6 +143,8 @@ class MainWindow(QMainWindow):
         self.act_open_points = act("Open points...", "Ctrl+L", self.open_points_dialog)
         m.addAction(self.act_open_video)
         m.addAction(self.act_open_points)
+        self.act_open_review = act("Open review log...", "Ctrl+Shift+O", self.open_review_dialog)
+        m.addAction(self.act_open_review)
         m.addAction(act("Save points", "Ctrl+S", self.save_points))
         m.addAction(act("Save points as...", "Ctrl+Shift+S", self.save_points_as))
         m.addSeparator()
@@ -143,6 +155,10 @@ class MainWindow(QMainWindow):
         self.act_cancel.setEnabled(False)
         pm.addAction(self.act_start)
         pm.addAction(self.act_cancel)
+        self.act_reprocess = act("Re-process with edited points...", "Ctrl+Shift+R", self.reprocess)
+        self.act_cleanup = act("Delete intermediate chunks...", None, self.delete_intermediate)
+        pm.addAction(self.act_reprocess)
+        pm.addAction(self.act_cleanup)
         e = self.menuBar().addMenu("&Edit")
         e.addAction(act("Undo last point on this frame", "U", self.undo_point))
         e.addAction(act("Delete this object's points on this frame", "X", self.clear_frame_points))
@@ -150,11 +166,13 @@ class MainWindow(QMainWindow):
         for key, fn in (("Left", lambda: self.step(-1)), ("Right", lambda: self.step(1)),
                         ("Shift+Left", lambda: self.step(-10)), ("Shift+Right", lambda: self.step(10)),
                         ("Ctrl+Left", lambda: self.step_seconds(-1)), ("Ctrl+Right", lambda: self.step_seconds(1)),
-                        ("Space", self.toggle_play)):
+                        ("Space", self.toggle_play), ("M", self.next_flag), ("B", self.prev_flag),
+                        ("R", lambda: self.review_panel.toggle_reviewed())):
             self.addAction(act("", key, fn))
 
     def _build_side_panel(self):
         dock = QDockWidget("Targets", self)
+        self.targets_dock = dock
         dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         w = QWidget()
         v = QVBoxLayout(w)
@@ -191,6 +209,157 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.process_dock)
         self.process_dock.hide()
 
+    def _build_review_dock(self):
+        self.review_panel = ReviewPanel()
+        self.review_panel.segment_selected.connect(self._flag_selected)
+        self.review_panel.next_requested.connect(self.next_flag)
+        self.review_panel.prev_requested.connect(self.prev_flag)
+        self.review_panel.reprocess_requested.connect(self.reprocess)
+        self.review_panel.reviewed_changed.connect(self._update_flag_ticks)
+        self.review_panel.sev.currentIndexChanged.connect(lambda *_: self._update_flag_ticks())
+        self.review_dock = QDockWidget("Review", self)
+        self.review_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        self.review_dock.setWidget(self.review_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.review_dock)
+        self.tabifyDockWidget(self.targets_dock, self.review_dock)
+        self.targets_dock.raise_()
+
+    # ------------------------------------------------------------------ review screen
+    def open_review_dialog(self):
+        if self.info is None:
+            self.show_error("Open a video first.")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open review log", os.path.join(PROJECT_ROOT, "logs"), "Review log (*.json)")
+        if path:
+            self.load_review(path)
+
+    def load_review(self, path: str, quiet: bool = False) -> bool:
+        if self.info is None:
+            return False
+        try:
+            data = load_review_data(path, self.info)
+        except ReviewError as e:
+            if not quiet:
+                self.show_error(str(e))
+            return False
+        self.review = data
+        self.review_panel.set_data(data, self._stale_reasons())
+        self._update_flag_ticks()
+        self.review_dock.raise_()
+        msg = f"Review log loaded: {len(data.filtered('warn'))} flags (warn+), {data.unreviewed_count()} not reviewed"
+        if data.dropped_marks:
+            msg += f"; {data.dropped_marks} 'reviewed' marks were reset because their chunks were re-processed"
+        self.statusBar().showMessage(msg)
+        return True
+
+    def _stale_reasons(self) -> list:
+        if self.review is None:
+            return []
+        pp = self.points_path if self.points_path and os.path.isfile(self.points_path) else None
+        reasons = self.review.staleness(pp, bool(self.store.points))
+        if self.dirty:
+            reasons.append("there are unsaved point edits")
+        return reasons
+
+    def _refresh_stale_banner(self):
+        if self.review is not None:
+            self.review_panel.set_banner(self._stale_reasons())
+
+    def _update_flag_ticks(self):
+        flags = []
+        if self.review is not None:
+            floor = self.review_panel.sev.currentData() or "warn"
+            for s in self.review.filtered(floor):
+                if not self.review.state.is_reviewed(s):
+                    flags += [(s["start_frame"], s["severity"]), (s["end_frame"], s["severity"])]
+        self.slider.set_flags(flags)
+
+    def _goto_flag(self, frame: int, obj: Optional[int]):
+        self.goto(frame)
+        if obj is not None and self.store.select(obj):
+            self._refresh_objects()
+            self.view.update()
+
+    def _flag_selected(self, seg: dict):
+        self._goto_flag(seg["start_frame"], seg.get("object_id"))
+
+    def _step_flag(self, forward: bool):
+        if self.review is None or self.info is None:
+            self.statusBar().showMessage("No review log loaded (File > Open review log).")
+            return
+        nav = self.review.navigator(self.review_panel.sev.currentData() or "warn")
+        tgt = nav.next_after(self.frame_idx) if forward else nav.prev_before(self.frame_idx)
+        if tgt is None:
+            self.statusBar().showMessage("No more flags in that direction.")
+            return
+        self._goto_flag(tgt, nav.object_at(tgt))
+        self.review_panel.select_row_for(tgt)
+
+    def next_flag(self):
+        self._step_flag(True)
+
+    def prev_flag(self):
+        self._step_flag(False)
+
+    # ------------------------------------------------------------------ re-processing after edits
+    def reprocess(self):
+        """Re-run with the edited points. A dry run (--plan-only) first tells what is reused and what is recomputed."""
+        if self.info is None or self.job_running or self.plan_runner.is_running():
+            return
+        if self.dirty:
+            choice = self.ask_save_changes()
+            if choice == "cancel" or (choice == "save" and not self.save_points()):
+                return
+        settings = self.last_settings
+        if settings is None:
+            dlg = ProcessDialog(self, self.info.path, self._points_for_job() is not None, self.info.nb_frames)
+            dlg.resume.setChecked(True)
+            if not dlg.exec():
+                return
+            settings = dlg.settings()
+        settings = dataclasses.replace(settings, resume=True)
+        points = self._points_for_job()
+        probs = validate_settings(settings, self.info.path, points is not None)
+        if probs:
+            self.show_error("\n".join(probs))
+            return
+        self._plan, self._plan_settings = None, settings
+        cancel_file = self.plan_runner.new_cancel_file()
+        self.statusBar().showMessage("Checking what can be reused ...")
+        self.plan_runner.start(build_args(self.info.path, points, settings, cancel_file, plan_only=True), cancel_file)
+
+    def _on_plan_event(self, ev: dict):
+        if ev.get("event") == "plan":
+            self._plan = ev
+
+    def _on_plan_finished(self, res: dict):
+        plan = self._plan
+        if plan is None:
+            self.show_error("Could not work out what can be re-used: " + str(res.get("reason") or "unknown error"))
+            return
+        n, total = plan["total_chunks"], plan["total_frames"]
+        if plan["can_resume"] and plan["reusable_chunks"]:
+            text = (f"{plan['reason'].capitalize()}.\n\n{plan['frames_reused']} of {total} frames are reused; "
+                    f"{total - plan['frames_reused']} frames are re-processed (chunks {plan['reusable_chunks'] + 1}-{n}).\nStart?")
+        else:
+            text = f"{plan['reason'].capitalize()}.\n\nAll {total} frames will be processed. Start?"
+        if self.ask_confirm(text):
+            self.start_processing(dataclasses.replace(self._plan_settings, resume=bool(plan["can_resume"])))
+
+    def delete_intermediate(self):
+        if self.info is None or self.job_running:
+            return
+        work = self.last_settings.work_dir if self.last_settings else ""
+        jd = job_dir_for_video(work, self.info.path, self.info.fingerprint)
+        if not os.path.isdir(jd):
+            self.statusBar().showMessage("No intermediate chunks found for this video.")
+            return
+        size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(jd) for f in fs) / 2 ** 20
+        if self.ask_confirm(f"Delete {size:.0f} MB of intermediate chunks?\nThe result video and logs are kept, but re-processing will then start from scratch."):
+            import shutil
+            shutil.rmtree(jd, ignore_errors=True)
+            self.statusBar().showMessage(f"Deleted {size:.0f} MB of intermediate chunks.")
+
     # ------------------------------------------------------------------ processing jobs
     def open_path(self, path: Optional[str]):
         if path:
@@ -207,6 +376,8 @@ class MainWindow(QMainWindow):
         self.act_cancel.setEnabled(running)
         self.act_open_video.setEnabled(not running)
         self.act_open_points.setEnabled(not running)
+        self.act_reprocess.setEnabled(not running)
+        self.act_cleanup.setEnabled(not running)
 
     def start_processing_dialog(self):
         if self.info is None:
@@ -273,6 +444,8 @@ class MainWindow(QMainWindow):
         self._set_job_running(False)
         self.panel.on_finished(res)
         self.statusBar().showMessage(f"Processing {res.get('status')}: " + (res.get("reason") or res.get("output") or ""))
+        if res.get("review_log") and os.path.isfile(res["review_log"]):
+            self.load_review(res["review_log"], quiet=True)
 
     # ------------------------------------------------------------------ dialogs (overridable for tests)
     def show_error(self, text: str):
@@ -325,6 +498,9 @@ class MainWindow(QMainWindow):
         if self.server is not None:
             self.server.close()
         self.info = info
+        self.review = None
+        self.review_panel.set_data(None)
+        self.slider.set_flags([])
         self.store = PointStore()
         self.points_path = default_points_path(info.path)
         self.dirty = False
@@ -458,6 +634,7 @@ class MainWindow(QMainWindow):
 
     def _points_changed(self):
         self.dirty = True
+        self._refresh_stale_banner()
         self._refresh_objects()
         self._update_title()
         self.view.update()
@@ -539,6 +716,7 @@ class MainWindow(QMainWindow):
         self.points_path = path
         self.dirty = False
         self._update_title()
+        self._refresh_stale_banner()
         self.statusBar().showMessage(f"Saved {len(self.store.points)} points to {path}")
         return True
 

@@ -57,11 +57,12 @@ class ProcessSettings:
     encoder: str = "libx264"
     device: str = "cuda"
     allow_vfr: bool = False
+    keep_chunks: bool = True    # keep intermediate chunks after success: enables fast re-processing after re-clicks (uses disk)
     work_dir: str = ""          # empty = project default (temp/)
     log_dir: str = ""           # empty = project default (logs/)
 
 
-def build_args(video: str, points_path: Optional[str], st: ProcessSettings, cancel_file: str) -> List[str]:
+def build_args(video: str, points_path: Optional[str], st: ProcessSettings, cancel_file: str, plan_only: bool = False) -> List[str]:
     """Arguments for censor_video.py (without the interpreter and script path)."""
     a = [video, "--progress-json", "--cancel-file", cancel_file, "-o", st.output,
          "--chunk-size", str(st.chunk_size), "--analysis-width", str(st.analysis_width),
@@ -81,11 +82,21 @@ def build_args(video: str, points_path: Optional[str], st: ProcessSettings, canc
         a.append("--resume")
     if st.allow_vfr:
         a.append("--allow-vfr")
+    if st.keep_chunks:
+        a.append("--keep-temp")
+    if plan_only:
+        a.append("--plan-only")
     if st.work_dir:
         a += ["--work-dir", st.work_dir]
     if st.log_dir:
         a += ["--log-dir", st.log_dir]
     return a
+
+
+def job_dir_for_video(work_dir: str, video_path: str, fingerprint: str) -> str:
+    """Same location the pipeline uses for a video's intermediate chunks (src.pipeline.job_dir_for)."""
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(work_dir or os.path.join(PROJECT_ROOT, "temp"), f"{stem}_{fingerprint[:10]}")
 
 
 def overall_fraction(ev: dict) -> Optional[float]:

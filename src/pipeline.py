@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple
 
@@ -89,17 +90,95 @@ class Config:
     extra: dict = field(default_factory=dict)   # recorded in the job file (e.g. detector settings)
 
 
-NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output"}
+NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points"}
+NON_HASHED_EXTRA = {"keep_temp"}
 
 
-def config_hash(cfg: Config, info: VideoInfo, points_path: Optional[str]) -> str:
+def config_hash(cfg: Config, info: VideoInfo) -> str:
+    """Hash of everything that changes chunk results EXCEPT the clicked points (those are tracked per chunk, see
+    prompt_signatures) and pure bookkeeping options. A mismatch makes a job non-resumable."""
     d = {k: v for k, v in asdict(cfg).items() if k not in NON_HASHED}
+    d["extra"] = {k: v for k, v in (cfg.extra or {}).items() if k not in NON_HASHED_EXTRA}
     d["input_fp"] = info.fingerprint
     d["code"] = CODE_VERSION
-    if points_path:
-        with open(points_path, "rb") as f:
-            d["points_sha"] = hashlib.sha256(f.read()).hexdigest()
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+
+def file_sha(path: Optional[str]) -> Optional[str]:
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def prompt_signatures(prompts: Prompts, chunks) -> List[str]:
+    """One signature per chunk over the clicks that fall into it.
+
+    Tracking only runs forward and every chunk is re-seeded from the previous one, so the result of chunk c depends on the
+    clicks in chunks 0..c and on nothing later. Changing a click therefore invalidates its own chunk and everything after it,
+    and nothing before it."""
+    sigs = []
+    for s_, e_ in chunks:
+        items = []
+        for oid in sorted(prompts):
+            for fr in sorted(prompts[oid]):
+                if s_ <= fr < e_:
+                    pts, labs = prompts[oid][fr]
+                    items.append([oid, fr, [[round(x, 2), round(y, 2)] for x, y in pts], list(labs)])
+        sigs.append(hashlib.sha256(json.dumps(items).encode()).hexdigest()[:16])
+    return sigs
+
+
+def job_dir_for(cfg: Config, info: VideoInfo) -> str:
+    stem = os.path.splitext(os.path.basename(cfg.input))[0]
+    return os.path.join(cfg.work_dir, f"{stem}_{info.fingerprint[:10]}")      # per input; settings are checked via config_hash
+
+
+def plan_reprocess(cfg: Config) -> dict:
+    """What a '--resume' run would reuse, without touching anything (cheap: probe + points + job.json)."""
+    info = probe_video(cfg.input)
+    total = min(info.nb_frames, cfg.max_frames) if cfg.max_frames else info.nb_frames
+    chunks = [(s, min(s + cfg.chunk_size, total)) for s in range(0, total, cfg.chunk_size)]
+    prompts = load_points(cfg.points, info, cfg.allow_points_mismatch) if cfg.points else {}
+    sigs = prompt_signatures(prompts, chunks)
+    jd = job_dir_for(cfg, info)
+    plan = {"total_chunks": len(chunks), "total_frames": total, "job_found": False, "can_resume": False, "reusable_chunks": 0,
+            "frames_reused": 0, "first_changed_chunk": None, "reason": ""}
+    jp = os.path.join(jd, "job.json")
+    if not os.path.isfile(jp):
+        plan["reason"] = "no kept intermediate chunks were found, so everything will be processed"
+        return plan
+    plan["job_found"] = True
+    with open(jp, encoding="utf-8") as f:
+        old = json.load(f)
+    if old.get("config_hash") != config_hash(cfg, info):
+        plan["reason"] = "the settings or the video differ from the earlier run, so everything will be processed from scratch"
+        return plan
+    plan["can_resume"] = True
+    limit = first_changed_chunk(old.get("chunk_prompt_sigs"), sigs)
+    plan["first_changed_chunk"] = limit if limit < len(chunks) else None
+    good = 0
+    for ci in range(min(limit, len(chunks))):
+        c = old.get("chunks", {}).get(str(ci))
+        if not (c and c.get("status") == "done" and all(os.path.isfile(os.path.join(jd, f"{k}_{ci:05d}.{x}"))
+                                                         for k, x in (("seg", "mp4"), ("state", "json"), ("qc", "json")))):
+            break
+        good = ci + 1
+    plan["reusable_chunks"] = good
+    plan["frames_reused"] = chunks[good - 1][1] if good else 0
+    plan["reason"] = ("nothing changed: only the final video is rebuilt" if good == len(chunks) else
+                      f"chunks 1-{good} are reused, the rest is re-processed" if good else "no chunk can be reused")
+    return plan
+
+
+def first_changed_chunk(old_sigs: Optional[List[str]], new_sigs: List[str]) -> int:
+    """Index of the first chunk whose clicks differ (len(new_sigs) when nothing changed)."""
+    if not old_sigs:
+        return 0
+    for i, new in enumerate(new_sigs):
+        if i >= len(old_sigs) or old_sigs[i] != new:
+            return i
+    return len(new_sigs)
 
 
 def _atomic_json(path: str, obj):
@@ -227,12 +306,17 @@ class Pipeline:
 
         cs = cfg.chunk_size
         chunks = [(s, min(s + cs, total)) for s in range(0, total, cs)]
-        h = config_hash(cfg, info, cfg.points)
-        job_dir = os.path.join(cfg.work_dir, f"{self.stem}_{info.fingerprint[:10]}")   # per input; settings are checked via config_hash
+        h = config_hash(cfg, info)
+        self._points_changed, self._reused = False, 0
+        self._sigs = prompt_signatures(prompts, chunks)
+        job_dir = job_dir_for(cfg, info)
         self.job_dir = job_dir
         job_path = os.path.join(job_dir, "job.json")
+        self.run_id = uuid.uuid4().hex[:12]
+        self.points_sha = file_sha(cfg.points)
         job = {"config_hash": h, "input": info.to_json_dict(), "config": asdict(cfg), "total_frames": total,
-               "chunks": {}, "analysis_size": [aw, ah], "created": time.strftime("%F %T")}
+               "chunks": {}, "analysis_size": [aw, ah], "created": time.strftime("%F %T"),
+               "chunk_prompt_sigs": self._sigs, "points_sha": self.points_sha, "run_id": self.run_id}
         start_ci = 0
         self.monitor = qc.ObjectMonitor(self.shape, qc.QCParams(jump_ratio=cfg.jump_ratio))
         self.objstate: Dict[int, dict] = {}
@@ -253,7 +337,10 @@ class Pipeline:
             os.makedirs(job_dir)
         _atomic_json(job_path, job)
         if start_ci:
-            log.info("resuming at chunk %d/%d (frame %d)", start_ci, len(chunks), chunks[start_ci][0])
+            if start_ci < len(chunks):
+                log.info("resuming at chunk %d/%d (frame %d)", start_ci, len(chunks), chunks[start_ci][0])
+            else:
+                log.info("all %d chunks are valid and reused; only the final video is rebuilt", len(chunks))
             for ci in range(start_ci):
                 with open(os.path.join(job_dir, f"qc_{ci:05d}.json"), encoding="utf-8") as f:
                     events += json.load(f)["events"]
@@ -262,7 +349,8 @@ class Pipeline:
         s0 = chunks[start_ci][0] if start_ci < len(chunks) else total
         self._nchunks, self._done_frames = len(chunks), s0
         self._emit(event="start", total_frames=total, chunks=len(chunks), chunk_size=cfg.chunk_size,
-                   resume_from_chunk=start_ci, done_frames=s0, width=W, height=H, fps=info.fps)
+                   resume_from_chunk=start_ci, done_frames=s0, width=W, height=H, fps=info.fps,
+                   reused_chunks=self._reused, points_changed=self._points_changed)
         self.ring = os.path.join(job_dir, "ring")
         shutil.rmtree(self.ring, ignore_errors=True)
         os.makedirs(self.ring)
@@ -316,11 +404,15 @@ class Pipeline:
         with open(job_path, encoding="utf-8") as f:
             old = json.load(f)
         if old.get("config_hash") != job["config_hash"]:
-            raise JobFailed("resume refused: settings, points file or input differ from the interrupted run "
-                            "(config hash mismatch). Re-run without --resume to start over.")
+            raise JobFailed("resume refused: settings or input differ from the earlier run (config hash mismatch). "
+                            "Only the clicked points may change between a run and its resume. Re-run without --resume to start over.")
         job.update({k: old[k] for k in ("created",) if k in old})
+        limit = first_changed_chunk(old.get("chunk_prompt_sigs"), job["chunk_prompt_sigs"])
+        self._points_changed = limit < len(chunks)
+        if self._points_changed:
+            log.info("points changed: chunks 0-%d are reused, chunk %d onwards is re-processed", limit - 1, limit)
         ok = 0
-        for ci in range(len(chunks)):
+        for ci in range(min(limit, len(chunks))):
             c = old["chunks"].get(str(ci))
             seg = os.path.join(self.job_dir, f"seg_{ci:05d}.mp4")
             st = os.path.join(self.job_dir, f"state_{ci:05d}.json")
@@ -336,6 +428,7 @@ class Pipeline:
                 break
             job["chunks"][str(ci)] = c
             ok = ci + 1
+        self._reused = ok
         if ok:
             self._load_state(ok - 1)
         # drop anything after the last valid chunk (incomplete work is never treated as done)
@@ -639,7 +732,12 @@ class Pipeline:
             qlog.add(-1, qc.OUTPUT_INVALID, "error", None, p, action="output_not_finalised")
         meta = {"input": info.to_json_dict(), "total_frames": total, "chunks": len(chunks), "chunk_size": cfg.chunk_size,
                 "fail_closed": cfg.fail_closed, "tracker": self.tracker.describe() if self.tracker else None,
-                "config": asdict(cfg)}
+                "config": asdict(cfg), "run_id": self.run_id, "points_sha": self.points_sha,
+                "points_path": os.path.abspath(cfg.points) if cfg.points else None,
+                "reused_chunks": self._reused, "reprocessed_chunks": list(range(self._reused, len(chunks))),
+                "created": time.strftime("%F %T"),
+                "output": None if problems else {"path": os.path.abspath(out_final), "size": os.path.getsize(partial),
+                                                 "mtime": round(os.path.getmtime(partial), 3)}}
         review_json = os.path.join(cfg.log_dir, f"{self.stem}_review.json")
         qlog.save(review_json, os.path.join(cfg.log_dir, f"{self.stem}_review.csv"), meta)
         with open(os.path.join(cfg.log_dir, f"{self.stem}_detections.csv"), "w", encoding="utf-8-sig", newline="") as f:

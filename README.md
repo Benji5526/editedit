@@ -24,7 +24,7 @@ Then download a SAM 2.1 checkpoint into `models/` – see [models/README.md](mod
 Check the environment: `python -c "import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` must print `True`.
 `censor_video.py` refuses to silently fall back to CPU.
 
-## Desktop app (in progress: stages 1-3 of 6)
+## Desktop app (in progress: stages 1-4 of 6)
 ```powershell
 python app.py [video]        # or double-click run_app.bat (no console window)
 ```
@@ -45,8 +45,21 @@ fail-closed, mosaic block/padding, audio, encoder, test run on the first N frame
 * While a job runs, opening files and editing points are locked; closing the window asks to cancel the job first.
 * Before starting, unsaved points must be saved (the worker reads the saved file); a missing checkpoint, an unusable output path or "nothing to do" is refused up front.
 
-**Not yet in the app (still command line):** the review screen (use `pick_points.py --review` below), re-processing only the affected chunks after re-clicks
-(a changed points file means a fresh run today), the SQLite job database (state lives in `temp/<job>/job.json` and `logs/*_status.json`), EXE packaging.
+**Stage 4 (review, re-click, re-process):** the **Review** tab (next to Targets) lists the flagged segments of the last run's review log (opened automatically when a job
+finishes, or via `File > Open review log`): filter by severity/object, hide reviewed, select a flag to jump to its frame and object (`M`/`B` = next/previous flag, `R` = mark reviewed),
+red/amber ticks on the frame slider show where the unreviewed flags are. Re-click the object on a frame where it is visible, save, then `Process > Re-process with edited points`
+(`Ctrl+Shift+R`): a dry run first shows how many frames are reused and how many are recomputed, then the job runs.
+
+*Re-processing after edits.* Tracking runs forward only and every chunk is re-seeded from the previous one, so a chunk depends on the clicks in itself and in earlier chunks only.
+Each job stores a signature of the clicks per chunk (`temp/<job>/job.json`); a re-run reuses all chunks before the first changed one (segments, tracker state, detector state and
+review events), recomputes everything after it, and refuses to reuse anything when the settings, the video or the code version differ. Intermediate chunks are kept after success
+(option "Keep intermediate chunks", disk use about the size of the output; `Process > Delete intermediate chunks`) - without them a re-process starts from scratch.
+
+*Review log consistency.* Every run writes `run_id`, the sha256 of the points file it used and the size/mtime of the output video into the review log. The Review tab shows a red
+banner when the current points file or the output video no longer match the log. "Reviewed" marks are stored next to the log (`*_review_state.json`); after a re-process they are kept
+only for flags in reused chunks and reset for recomputed ones. "Reviewed" means a human looked at it, not that the frame is correct.
+
+**Not yet:** the SQLite job database (state lives in `temp/<job>/job.json` and `logs/*_status.json`), EXE packaging, a negative-only click on a frame (every clicked frame needs a positive point).
 Worker protocol (stdout lines `@@PROGRESS {json}`: `stage`, `start`, `progress`, `chunk_done`, `finished`) is documented in `src/app/job_runner.py`.
 
 ## Usage (command line)
@@ -73,8 +86,7 @@ Worker protocol (stdout lines `@@PROGRESS {json}`: `stage`, `start`, `progress`,
    ```
    `m` / `b` jump to the next / previous flagged frame (start and end of each flagged segment, severity warn and above; `--review-min-severity info` for all). The object named
    by the flag becomes the current object, and the banner lists the flags at that frame. Left-click the object on a frame where it is visible again, press `s`, then re-run
-   `censor_video.py` with the same `points.json` (a changed points file means a fresh run, not `--resume`). On the synthetic clip this workflow took the IoU of the frames after
-   a full occlusion from ~0.1 to a mean of 0.93 (see Tests).
+   `censor_video.py` with the same `points.json` and `--resume --keep-temp`: only the chunks from the first changed click onwards are recomputed (see "Re-processing after edits").
 
 Exit code: `0` finished, `2` finished but error-level review events exist, `1` failed (no final file is produced), `3` cancelled (resumable).
 
@@ -158,13 +170,16 @@ python -m pytest tests -q
   |---|---|---|
   | 20-69 | clicked at 20, tracked across the boundary at frame 40 | mean IoU 0.91 (min 0.89) |
   | 70-85 | object hidden for 16 frames (boundary at 80 falls inside) | `tracking_lost_mid_frame` at 70, 16 frames of fail-closed mosaic |
-  | 86-118 | object reappears (and moved 80 px meanwhile) | SAM 2 produced a mask again at 86 (`tracking_recovered`, **warn**) but at the wrong/lagging place: IoU 0.0-0.1 |
-  | 122-143 | after the next chunk boundary re-seeded from that mask | IoU 0.84-0.95 |
+  | 86-142 | object reappears (and moved 80 px meanwhile) | SAM 2 finds it again at frame 86: IoU 0.84-0.95, mean 0.92 (identical in 3 runs); `tracking_recovered` is logged as **warn** ("verify it is the same object") |
 
-  Takeaway: the square is an easy target and SAM 2 small followed it well until it was occluded. After a full occlusion it re-found the object late and wrongly; the
-  review log shows the loss and flags the recovery for verification, but the frames 86-118 were mosaicked in the wrong place (the real target was uncovered).
-  Re-click the object after occlusions (the log tells you where; use `pick_points.py --review`): clicking it again at frame 90 raised the IoU of frames 90-142 to a mean of 0.93 (min 0.82).
-  Expect real footage to be harder than this.
+  Takeaway: on this easy target, re-running SAM 2 from the object's last good frame through the hidden frames (see "Chunk boundaries") recovers the object right when it reappears.
+  An earlier version that injected the stale mask at the boundary instead produced a mask in the wrong place (IoU about 0 for the rest of the clip) - that is why the current design exists.
+  The log still marks the recovery as unverified, because the code cannot tell "same object" from "something that looks similar". Expect real footage to be harder than this.
+  (A first version of this table was wrong: the measuring code assumed a 1-frame prefix and compared one chunk's masks with ground truth shifted by 10 frames. Fixed and re-measured.)
+
+  `test_incremental.py` / `test_plan_and_sam2_incremental.py` check re-processing after re-clicks: only the chunks from the first changed click onwards are recomputed, and the
+  result equals a from-scratch run with the same points. With the real checkpoint, adding a click at frame 90 reused 2 of 4 chunks; the IoU of frames 90-142 stayed at about 0.93
+  because the object was already tracked correctly there - the re-click mechanics are verified, an accuracy gain from re-clicking is not demonstrated on this clip.
 
 Neither the test double nor the synthetic clip says anything about NudeNet's detection quality or about SAM 2 on real footage.
 

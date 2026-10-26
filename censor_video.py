@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 
-from src.pipeline import Config, Pipeline
+from src.pipeline import Config, Pipeline, plan_reprocess
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--keep-temp", action="store_true", help="keep job directory after success")
     g.add_argument("--progress-json", action="store_true",
                    help="print machine-readable progress lines ('@@PROGRESS {json}') on stdout (used by the desktop app)")
+    g.add_argument("--plan-only", action="store_true",
+                   help="print what a --resume run would reuse (event 'plan') and exit without processing")
     g.add_argument("--cancel-file", help="stop safely at the next checkpoint when this file appears (exit code 3, resumable)")
     g = p.add_argument_group("SAM 2")
     g.add_argument("--sam2-checkpoint", help="e.g. models/sam2.1_hiera_small.pt (official download, see models/README.md)")
@@ -115,6 +117,17 @@ def main(argv=None) -> int:
             print("@@PROGRESS " + json.dumps(ev), flush=True)
 
     cancel_check = (lambda: os.path.exists(a.cancel_file)) if a.cancel_file else None
+    if a.plan_only:
+        try:
+            plan = plan_reprocess(cfg)
+        except Exception as e:  # noqa: BLE001
+            emit({"event": "finished", "exit_code": 1, "status": "failed", "reason": f"cannot plan: {e}"})
+            return 1
+        emit({"event": "plan", **plan})
+        emit({"event": "finished", "exit_code": 0, "status": "planned"})
+        if not a.progress_json:
+            print(json.dumps(plan, indent=1))
+        return 0
     tracker = detector = None
     emit({"event": "stage", "stage": "loading_models"})
     try:
