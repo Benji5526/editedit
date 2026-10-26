@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# model weights, videos, intermediates and results can contain private footage: never commit
+models/*
+!models/README.md
+input/*
+output/*
+logs/*
+temp/*
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.pt
+*.pth
+*.onnx
+*.partial
+points*.json
+!config.example.json
