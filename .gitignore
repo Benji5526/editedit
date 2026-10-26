@@ -24,3 +24,7 @@ points*.json
 *.points.json
 
 config/last_settings.json
+
+# test media and example logs (synthetic); only the folder README is tracked
+samples/*
+!samples/README.md

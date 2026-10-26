@@ -10,6 +10,29 @@ Safety-first, chunked, restartable mosaic tool for long (e.g. 40 min 4K60) video
 > of them conservatively. It cannot prove that nothing was missed. Always spot-check the output, starting with the segments in the
 > review log. Review flags are heuristics (see [Limitations](#limitations)).
 
+## Project layout
+```
+app.py, run_app.bat        desktop app launcher (double-click run_app.bat)
+censor_video.py            command-line processing (also the worker process the app starts)
+pick_points.py             command-line click picker with --review
+config.example.json        safety-first default options for a long 4K60 video
+requirements.txt
+src/
+  video_io.py              FFprobe/FFmpeg: probing, timestamps, frame reader, segment writer, mux, output verification
+  tracking.py              SAM 2 per chunk (+ re-seeding at chunk boundaries)
+  detection.py             NudeNet auxiliary detector + temporal gap filling
+  mosaic.py                mask utilities and pixelation
+  quality_control.py       review events, heuristics, review log JSON/CSV
+  pipeline.py              chunked, restartable pipeline; progress, cancel, incremental re-processing
+  points_io.py, review.py, review_data.py    clicked-points file, review navigation, review marks/consistency checks
+  app/                     PySide6 desktop app (main window, preview, job runner, dialogs, review panel)
+tests/                     pytest suite (unit, pipeline with a stand-in tracker, GUI offscreen, real SAM 2)
+models/                    checkpoints go here (not tracked; see models/README.md)
+samples/                   synthetic test videos, example points and logs (not tracked; see samples/README.md)
+input/  output/            your videos and results (kept empty, not tracked)
+logs/   temp/              run logs, review logs, status; intermediate chunks (not tracked)
+```
+
 ## Install (Windows 11)
 Requirements: Python 3.10+ (tested 3.12), NVIDIA GPU + driver, FFmpeg and FFprobe on `PATH`, Git (optional).
 ```powershell
