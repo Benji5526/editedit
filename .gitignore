@@ -28,3 +28,8 @@ config/last_settings.json
 # test media and example logs (synthetic); only the folder README is tracked
 samples/*
 !samples/README.md
+
+# backups and archives (large, may contain private footage)
+backups/
+*.zip
+*.7z
