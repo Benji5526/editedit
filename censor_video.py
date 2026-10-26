@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -16,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Track user-selected objects with SAM 2 and (optionally) detect NudeNet classes, "
                     "then mosaic them in a long video using chunked streaming. Flags are heuristics; "
-                    "always review the log. Exit code: 0 ok, 2 finished with error-level review events, 1 failed.")
+                    "always review the log. Exit code: 0 ok, 2 finished with error-level review events, 1 failed, 3 cancelled (resumable).")
     p.add_argument("input", help="input video")
     p.add_argument("-o", "--output", help="final output path (default output/<name>_censored.mp4)")
     p.add_argument("--points", help="selection JSON from pick_points.py (SAM 2 targets)")
@@ -29,6 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--log-dir", default="logs")
     g.add_argument("--resume", action="store_true", help="continue an interrupted run (validates completed chunks first)")
     g.add_argument("--keep-temp", action="store_true", help="keep job directory after success")
+    g.add_argument("--progress-json", action="store_true",
+                   help="print machine-readable progress lines ('@@PROGRESS {json}') on stdout (used by the desktop app)")
+    g.add_argument("--cancel-file", help="stop safely at the next checkpoint when this file appears (exit code 3, resumable)")
     g = p.add_argument_group("SAM 2")
     g.add_argument("--sam2-checkpoint", help="e.g. models/sam2.1_hiera_small.pt (official download, see models/README.md)")
     g.add_argument("--sam2-config", help="e.g. configs/sam2.1/sam2.1_hiera_s.yaml (inferred from checkpoint name if omitted)")
@@ -76,7 +80,6 @@ def main(argv=None) -> int:
     parser = build_parser()
     pre, _ = parser.parse_known_args(argv)
     if pre.config:
-        import json
         with open(pre.config, encoding="utf-8") as f:
             defaults = {k.replace("-", "_"): v for k, v in json.load(f).items() if not k.startswith("_")}
         valid = {a.dest for a in parser._actions}
@@ -107,7 +110,13 @@ def main(argv=None) -> int:
                "nudenet_model": a.nudenet_model, "nudenet_res": a.nudenet_res, "nudenet_tiles": a.nudenet_tiles,
                "sam2_checkpoint": os.path.basename(a.sam2_checkpoint or ""), "device": a.device},
     )
+    def emit(ev: dict):
+        if a.progress_json:
+            print("@@PROGRESS " + json.dumps(ev), flush=True)
+
+    cancel_check = (lambda: os.path.exists(a.cancel_file)) if a.cancel_file else None
     tracker = detector = None
+    emit({"event": "stage", "stage": "loading_models"})
     try:
         if a.points:
             from src.tracking import SAM2Tracker, TrackerError
@@ -123,12 +132,21 @@ def main(argv=None) -> int:
                          nudenet_version(), detector.classes, a.det_threshold)
     except Exception as e:  # noqa: BLE001
         logging.error("model setup failed: %s", e)
+        emit({"event": "finished", "exit_code": 1, "status": "failed", "reason": f"model setup failed: {e}"})
         return 1
-    rc = Pipeline(cfg, tracker, detector).run()
-    if rc == 0:
+    emit({"event": "stage", "stage": "processing"})
+    rc = Pipeline(cfg, tracker, detector, progress=emit, cancel_check=cancel_check).run()
+    stem = os.path.splitext(os.path.basename(a.input))[0]
+    status = {}
+    try:
+        with open(os.path.join(a.log_dir, f"{stem}_status.json"), encoding="utf-8") as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        pass
+    emit({"event": "finished", "exit_code": rc, **{k: status.get(k) for k in ("status", "reason", "output", "review_log", "error_events", "warn_events", "problems")}})
+    if rc == 0 and not a.progress_json:
         print("finished. Review flags can still exist (warn/info) - open the review log.")
     return rc
-
 
 if __name__ == "__main__":
     sys.exit(main())

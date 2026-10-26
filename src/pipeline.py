@@ -42,6 +42,10 @@ class JobFailed(RuntimeError):
     pass
 
 
+class JobCancelled(RuntimeError):
+    """Raised at a safe point when the user asked to stop. Completed chunks stay valid for --resume."""
+
+
 @dataclass
 class Config:
     input: str = ""
@@ -123,9 +127,33 @@ def _mem_snapshot() -> dict:
 
 
 class Pipeline:
-    def __init__(self, cfg: Config, tracker: Optional[Tracker], detector=None):
+    def __init__(self, cfg: Config, tracker: Optional[Tracker], detector=None, progress=None, cancel_check=None):
+        """progress(dict) receives machine-readable progress events; cancel_check() -> bool is polled at safe points."""
         self.cfg, self.tracker, self.detector = cfg, tracker, detector
         self.stem = os.path.splitext(os.path.basename(cfg.input))[0]
+        self.progress, self.cancel_check = progress, cancel_check
+        self._ci = self._nchunks = self._done_frames = 0
+
+    # ------------------------------------------------------------------ progress / cancel
+    def _emit(self, **ev):
+        if self.progress is not None:
+            try:
+                self.progress(ev)
+            except Exception:  # noqa: BLE001  (a broken listener must never break processing)
+                log.exception("progress callback failed")
+
+    def _check_cancel(self):
+        if self.cancel_check is not None and self.cancel_check():
+            raise JobCancelled("cancelled by the user")
+
+    _STAGE = {"analyze": (0.0, 0.5), "track": (0.5, 0.1), "render": (0.6, 0.4)}
+
+    def _tick(self, stage: str, i: int, n: int):
+        self._check_cancel()
+        base, span = self._STAGE[stage]
+        self._emit(event="progress", stage=stage, chunk=self._ci, chunks=self._nchunks,
+                   chunk_frac=round(base + span * i / max(1, n), 4), done_frames=self._done_frames,
+                   chunk_frames=n, total_frames=self.total)
 
     # ------------------------------------------------------------------ setup
     def _check_input(self, info: VideoInfo):
@@ -153,6 +181,11 @@ class Pipeline:
         status_path = os.path.join(cfg.log_dir, f"{self.stem}_status.json")
         try:
             return self._run(status_path)
+        except JobCancelled as e:
+            log.warning("JOB CANCELLED: %s", e)
+            _atomic_json(status_path, {"status": "cancelled", "reason": str(e), "time": time.strftime("%F %T"),
+                                       "note": "completed chunks are kept; run again with --resume to continue"})
+            return 3
         except (JobFailed, VideoError) as e:
             log.error("JOB FAILED: %s", e)
             _atomic_json(status_path, {"status": "failed", "reason": str(e), "time": time.strftime("%F %T")})
@@ -227,6 +260,9 @@ class Pipeline:
         self.events_so_far = events
 
         s0 = chunks[start_ci][0] if start_ci < len(chunks) else total
+        self._nchunks, self._done_frames = len(chunks), s0
+        self._emit(event="start", total_frames=total, chunks=len(chunks), chunk_size=cfg.chunk_size,
+                   resume_from_chunk=start_ci, done_frames=s0, width=W, height=H, fps=info.fps)
         self.ring = os.path.join(job_dir, "ring")
         shutil.rmtree(self.ring, ignore_errors=True)
         os.makedirs(self.ring)
@@ -252,13 +288,18 @@ class Pipeline:
             for ci in range(start_ci, len(chunks)):
                 s, e = chunks[ci]
                 t0 = time.time()
+                self._ci, self._done_frames = ci, s
+                self._check_cancel()
                 chunk_events = self._process_chunk(ci, s, e, a_reader, f_reader, prompts)
+                self._done_frames = e
                 events += chunk_events
                 mem = _mem_snapshot()
                 job["chunks"][str(ci)] = {"status": "done", "start": s, "end": e, "frames": e - s,
                                           "segment": f"seg_{ci:05d}.mp4", "seconds": round(time.time() - t0, 1), **mem,
                                           "last_frame_md5": hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest()}
                 _atomic_json(job_path, job)
+                self._emit(event="chunk_done", chunk=ci, chunks=len(chunks), start=s, end=e, done_frames=e, total_frames=total,
+                           seconds=round(time.time() - t0, 2), events=len(chunk_events), **mem)
                 el = time.time() - t_start
                 done = e
                 log.info("chunk %d/%d frames %d-%d done in %.1fs  mem=%s  eta=%.0fs", ci + 1, len(chunks), s, e - 1,
@@ -381,6 +422,8 @@ class Pipeline:
         last = None
         use_ring = self.tracker is not None and cfg.stale_prefix_frames > 0
         for i in range(n):
+            if i % 4 == 0:
+                self._tick("analyze", i, n)
             fa = a_reader.read()
             if fa is None:
                 qlog.add(s + i, qc.FRAME_ERROR, "error", None, "analysis reader ended early", action="job_aborted")
@@ -415,6 +458,7 @@ class Pipeline:
                     inits.append(Init(oid, L + k - s, [(x * self.sx, y * self.sy) for x, y in pts], list(labs), source="points"))
                     started_here.setdefault(oid, L + k - s)
                     st.update(known=True, retired=False)
+        self._tick("track", 0, n)
         model_error: Optional[str] = None
         masks: Dict[int, Dict[int, np.ndarray]] = {}
         if inits:
@@ -427,6 +471,7 @@ class Pipeline:
                     qlog.add(s + i, qc.MODEL_ERROR, "error", None, model_error[:300],
                              action="fail_closed_full_frame" if cfg.fail_closed else "none_original_passthrough_for_tracked_objects")
         shutil.rmtree(frame_dir, ignore_errors=True)
+        self._tick("track", n, n)
 
         # ---- 3. QC per frame (sequential: the monitor is stateful)
         fc_regions: List[List[tuple]] = [[] for _ in range(n)]
@@ -495,6 +540,8 @@ class Pipeline:
         fc_run: Dict[str, int] = {}
         try:
             for i in range(n):
+                if i % 4 == 0:
+                    self._tick("render", i, n)
                 full = f_reader.read()
                 if full is None:
                     qlog.add(s + i, qc.FRAME_ERROR, "error", None, "full-resolution reader ended early", action="job_aborted")

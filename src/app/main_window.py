@@ -6,15 +6,21 @@ import os
 from collections import OrderedDict
 from typing import Optional
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
-from PySide6.QtWidgets import (QDockWidget, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+import dataclasses
+import time
+
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap
+from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from src.points_io import PointStore, PointsError, load_points, save_points
 from src.video_io import VideoInfo, is_hdr, probe_video
 
 from .frame_server import FrameServer
+from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args
+from .process_dialog import ProcessDialog, validate_settings
+from .process_panel import ProcessPanel
 from .video_view import VideoView, object_color
 
 log = logging.getLogger("app")
@@ -63,6 +69,10 @@ class MainWindow(QMainWindow):
         self.playing = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._play_tick)
+        self.runner = JobRunner(self)
+        self.job_running = False
+        self.last_settings: Optional[ProcessSettings] = None
+        self.last_result: Optional[dict] = None
 
         self.view = VideoView()
         self.view.set_provider(self._points_on_frame, lambda: self.store.current)
@@ -101,7 +111,11 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         self.setCentralWidget(central)
         self._build_side_panel()
+        self._build_process_dock()
         self._build_menu()
+        self.runner.progress.connect(self._on_job_progress)
+        self.runner.log_line.connect(self.panel.add_log)
+        self.runner.job_finished.connect(self._on_job_finished)
         self.statusBar().showMessage("Open a video to start (Ctrl+O). Left-click = this is the object, right-click = this is NOT.")
 
     # ------------------------------------------------------------------ UI construction
@@ -115,12 +129,20 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         act = self._act
         m = self.menuBar().addMenu("&File")
-        m.addAction(act("Open video...", "Ctrl+O", self.open_video_dialog))
-        m.addAction(act("Open points...", "Ctrl+L", self.open_points_dialog))
+        self.act_open_video = act("Open video...", "Ctrl+O", self.open_video_dialog)
+        self.act_open_points = act("Open points...", "Ctrl+L", self.open_points_dialog)
+        m.addAction(self.act_open_video)
+        m.addAction(self.act_open_points)
         m.addAction(act("Save points", "Ctrl+S", self.save_points))
         m.addAction(act("Save points as...", "Ctrl+Shift+S", self.save_points_as))
         m.addSeparator()
         m.addAction(act("Quit", "Ctrl+Q", self.close))
+        pm = self.menuBar().addMenu("&Process")
+        self.act_start = act("Start processing...", "Ctrl+R", self.start_processing_dialog)
+        self.act_cancel = act("Cancel processing", "Ctrl+.", self.cancel_processing)
+        self.act_cancel.setEnabled(False)
+        pm.addAction(self.act_start)
+        pm.addAction(self.act_cancel)
         e = self.menuBar().addMenu("&Edit")
         e.addAction(act("Undo last point on this frame", "U", self.undo_point))
         e.addAction(act("Delete this object's points on this frame", "X", self.clear_frame_points))
@@ -156,6 +178,101 @@ class MainWindow(QMainWindow):
         dock.setMinimumWidth(300)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._refresh_objects()
+
+    def _build_process_dock(self):
+        self.panel = ProcessPanel()
+        self.panel.cancel_requested.connect(self.cancel_processing)
+        self.panel.resume_requested.connect(self.resume_processing)
+        self.panel.open_output_requested.connect(lambda: self.open_path(self._result_output()))
+        self.panel.open_logs_requested.connect(lambda: self.open_path(os.path.join(PROJECT_ROOT, "logs")))
+        self.process_dock = QDockWidget("Processing", self)
+        self.process_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        self.process_dock.setWidget(self.panel)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.process_dock)
+        self.process_dock.hide()
+
+    # ------------------------------------------------------------------ processing jobs
+    def open_path(self, path: Optional[str]):
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _result_output(self) -> Optional[str]:
+        if self.last_result and self.last_result.get("output"):
+            return self.last_result["output"]
+        return self.last_settings.output if self.last_settings else None
+
+    def _set_job_running(self, running: bool):
+        self.job_running = running
+        self.act_start.setEnabled(not running)
+        self.act_cancel.setEnabled(running)
+        self.act_open_video.setEnabled(not running)
+        self.act_open_points.setEnabled(not running)
+
+    def start_processing_dialog(self):
+        if self.info is None:
+            self.show_error("Open a video first.")
+            return
+        if self.job_running:
+            return
+        if self.dirty:
+            choice = self.ask_save_changes()
+            if choice == "cancel":
+                return
+            if choice == "save" and not self.save_points():
+                return
+        needs_sam2 = self._points_for_job() is not None
+        dlg = ProcessDialog(self, self.info.path, needs_sam2, self.info.nb_frames)
+        if dlg.exec():
+            self.start_processing(dlg.settings())
+
+    def _points_for_job(self) -> Optional[str]:
+        """The saved points file to hand to the worker, or None when nothing was clicked."""
+        if self.store.points and self.points_path and os.path.isfile(self.points_path) and not self.store.valid():
+            return self.points_path
+        return None
+
+    def start_processing(self, settings: ProcessSettings) -> bool:
+        """Start the worker process. Returns False (with an error shown) when it cannot start."""
+        if self.info is None or self.job_running:
+            return False
+        if self.dirty:
+            self.show_error("Save the points first (Ctrl+S): the worker reads the saved file.")
+            return False
+        points = self._points_for_job()
+        probs = validate_settings(settings, self.info.path, points is not None)
+        if probs:
+            self.show_error("\n".join(probs))
+            return False
+        self.last_settings, self.last_result = settings, None
+        cancel_file = self.runner.new_cancel_file()
+        self.panel.begin()
+        self.process_dock.show()
+        self._set_job_running(True)
+        self._stop_play()
+        self.statusBar().showMessage("Processing ... (Process > Cancel to stop; completed chunks are kept)")
+        if not self.runner.start(build_args(self.info.path, points, settings, cancel_file), cancel_file):
+            self._set_job_running(False)
+            return False
+        return True
+
+    def cancel_processing(self):
+        if self.job_running:
+            self.panel.cancel_btn.setEnabled(False)
+            self.panel.stage.setText("Cancelling - finishing the current step ...")
+            self.runner.cancel()
+
+    def resume_processing(self):
+        if self.last_settings is not None and not self.job_running:
+            self.start_processing(dataclasses.replace(self.last_settings, resume=True))
+
+    def _on_job_progress(self, ev: dict):
+        self.panel.on_progress(ev)
+
+    def _on_job_finished(self, res: dict):
+        self.last_result = res
+        self._set_job_running(False)
+        self.panel.on_finished(res)
+        self.statusBar().showMessage(f"Processing {res.get('status')}: " + (res.get("reason") or res.get("output") or ""))
 
     # ------------------------------------------------------------------ dialogs (overridable for tests)
     def show_error(self, text: str):
@@ -332,6 +449,9 @@ class MainWindow(QMainWindow):
     def on_click(self, fx: float, fy: float, label: int):
         if self.info is None:
             return
+        if self.job_running:
+            self.statusBar().showMessage("A job is running: points are locked until it finishes or is cancelled.")
+            return
         self._stop_play()
         self.store.add(self.frame_idx, fx, fy, label)
         self._points_changed()
@@ -459,6 +579,15 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ shutdown
     def closeEvent(self, e):
+        if self.job_running:
+            if not self.ask_confirm("A processing job is running. Cancel it and quit? (completed chunks are kept for resume)"):
+                e.ignore()
+                return
+            self.cancel_processing()
+            end = time.time() + self.runner.grace_ms / 1000 + 10
+            while self.job_running and time.time() < end:
+                QApplication.processEvents()
+                time.sleep(0.02)
         if not self._maybe_save_before_leaving():
             e.ignore()
             return

@@ -24,19 +24,30 @@ Then download a SAM 2.1 checkpoint into `models/` – see [models/README.md](mod
 Check the environment: `python -c "import torch;print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"` must print `True`.
 `censor_video.py` refuses to silently fall back to CPU.
 
-## Desktop app (in progress: stage 1-2 of 6)
+## Desktop app (in progress: stages 1-3 of 6)
 ```powershell
 python app.py [video]        # or double-click run_app.bat (no console window)
 ```
-Implemented and tested: open a video (analysed in the background), preview with frame stepping (±1, ±10, ±1 s, slider, play/pause), click targets
+**Stage 1-2 (selection):** open a video (analysed in the background), preview with frame stepping (+-1, +-10, +-1 s, slider, play/pause), click targets
 (left = positive, right = negative, several objects with their own colour/ID, undo, clear, delete), save/load the points file
 (`<video>.points.json` next to the video, auto-loaded when it matches the file's fingerprint, size, fps and frame count), unsaved-change prompts.
 Clicks are converted from widget to full-resolution frame coordinates with letterbox handling (clicks on the black bars are ignored, not clamped);
 the preview is decoded by FFmpeg (same decoder, rotation and frame numbering as the processing pipeline) and never blocks the UI thread.
 
-**Not yet in the app (still command line):** starting/cancelling processing with progress, the review screen, re-processing after re-clicks, EXE packaging.
-Use `censor_video.py` and `pick_points.py --review` below for those until the next stages land.
-Preview text rendering was checked on a real desktop window only for start-up (title, no errors); layout/fonts were inspected from an offscreen capture.
+**Stage 3 (processing):** `Process > Start processing... (Ctrl+R)` opens the settings (SAM 2 checkpoint, output, chunk size, analysis width, NudeNet,
+fail-closed, mosaic block/padding, audio, encoder, test run on the first N frames, resume). The job runs in a **separate worker process**
+(`censor_video.py --progress-json`), so the UI stays responsive and a crash/out-of-memory in the worker cannot take the app down. The panel shows the stage
+(reading+detecting / tracking / mosaic+encoding), chunk n/N, overall progress, elapsed and estimated remaining time, per-chunk memory (RSS, GPU peak) and the log.
+* **Cancel** (`Ctrl+.`): the worker stops at the next safe point (between frames/stages), discards the chunk in flight, keeps completed chunks and writes status
+  `cancelled` (exit code 3). If it does not stop within 60 s the whole process tree is killed. **Resume** continues from the completed chunks (same input, points and settings).
+* **Failure**: a failed job shows the reason in red, leaves no final file (a failed verification keeps `*.partial`, which is not a valid result) and offers Resume.
+* **Result**: `completed_no_flags` or `completed_with_review_required` (error/warning counts; check the review log before using the video), with buttons to open the result and the logs folder.
+* While a job runs, opening files and editing points are locked; closing the window asks to cancel the job first.
+* Before starting, unsaved points must be saved (the worker reads the saved file); a missing checkpoint, an unusable output path or "nothing to do" is refused up front.
+
+**Not yet in the app (still command line):** the review screen (use `pick_points.py --review` below), re-processing only the affected chunks after re-clicks
+(a changed points file means a fresh run today), the SQLite job database (state lives in `temp/<job>/job.json` and `logs/*_status.json`), EXE packaging.
+Worker protocol (stdout lines `@@PROGRESS {json}`: `stage`, `start`, `progress`, `chunk_done`, `finished`) is documented in `src/app/job_runner.py`.
 
 ## Usage (command line)
 1. **Pick targets** (OpenCV window; left click = this is the object, right click = this is NOT; `n` new object, `a/d` ±1 frame, `q/e` ±10, `z/c` ±1 s, trackbar, `u` undo, `s` save – full key list in `pick_points.py --help`/docstring):
@@ -65,7 +76,7 @@ Preview text rendering was checked on a real desktop window only for start-up (t
    `censor_video.py` with the same `points.json` (a changed points file means a fresh run, not `--resume`). On the synthetic clip this workflow took the IoU of the frames after
    a full occlusion from ~0.1 to a mean of 0.93 (see Tests).
 
-Exit code: `0` finished, `2` finished but error-level review events exist, `1` failed (no final file is produced).
+Exit code: `0` finished, `2` finished but error-level review events exist, `1` failed (no final file is produced), `3` cancelled (resumable).
 
 ## Outputs
 | file | content |

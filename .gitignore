@@ -22,3 +22,5 @@ points*.json
 
 # per-video click files written by the desktop app
 *.points.json
+
+config/last_settings.json
