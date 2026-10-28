@@ -64,6 +64,29 @@ def test_crashed_worker_is_detected_as_interrupted(db):
     assert d["status"] == "interrupted" and "disappeared" in d["error"] and d["chunks_done"] == 1 and d["chunks_failed"] == 1
 
 
+def test_a_reused_process_id_does_not_keep_a_dead_job_alive(db):
+    """Windows hands a crashed worker's process id to another process quickly; the creation time tells them apart."""
+    mk_job(db, "ghost", fp="g", pid=os.getpid())                      # an id that exists right now...
+    db.update_job("ghost", pid_ctime=1.0)                             # ...but whose process was created at another time (long ago)
+    assert db.recover_interrupted() == 1 and db.get_job("ghost")["status"] == "interrupted"
+    mk_job(db, "real", fp="r")                                        # a real job records this process's own creation time
+    assert db.get_job("real")["pid_ctime"] is not None and db.recover_interrupted() == 0
+
+
+def test_registry_from_an_older_version_is_migrated(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.sqlite")
+    c = sqlite3.connect(path)
+    c.executescript("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, created TEXT, updated TEXT, pid INTEGER, input_path TEXT, input_fp TEXT, "
+                    "points_sha TEXT, config_hash TEXT, model_sig TEXT, versions TEXT, total_frames INTEGER, chunk_size INTEGER, n_chunks INTEGER, "
+                    "reused_chunks INTEGER DEFAULT 0, status TEXT, error TEXT, output_path TEXT, review_log TEXT, job_dir TEXT, resume INTEGER DEFAULT 0);"
+                    "INSERT INTO jobs (job_id, status, pid, input_fp) VALUES ('old', 'running', 2000000000, 'fp');")
+    c.commit()
+    c.close()
+    db = JobDB(path)                                                  # opens, adds the column, keeps the rows
+    assert db.recover_interrupted() == 1 and db.get_job("old")["status"] == "interrupted"
+
+
 def test_latest_resumable_rules(db):
     assert db.latest_resumable("none") is None
     mk_job(db, "a", fp="f")

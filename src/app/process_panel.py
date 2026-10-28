@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar,
 
 from .job_runner import overall_fraction
 
-STAGE_TEXT = {"loading_models": "Loading models ...", "processing": "Starting ...", "analyze": "Reading + detecting",
+STAGE_TEXT = {"loading_models": "Loading models ...", "processing": "Starting ...", "finalizing": "Merging chunks, attaching audio, verifying the result ...", "analyze": "Reading + detecting",
               "track": "Tracking (SAM 2)", "render": "Applying mosaic + encoding"}
 
 
@@ -82,6 +82,9 @@ class ProcessPanel(QWidget):
 
     def on_progress(self, ev: dict):
         kind = ev.get("event")
+        if kind == "warning":
+            self.add_log("WARNING: " + str(ev.get("text")))
+            return
         if kind == "stage":
             self.stage.setText(STAGE_TEXT.get(ev.get("stage"), str(ev.get("stage"))))
             return

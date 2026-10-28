@@ -102,6 +102,8 @@ def job_dir_for_video(work_dir: str, video_path: str, fingerprint: str) -> str:
 
 def overall_fraction(ev: dict) -> Optional[float]:
     """0..1 overall progress from a progress/start/chunk_done event."""
+    if ev.get("overall") is not None:                     # the pipeline's monotonic value (analysis and render overlap)
+        return min(1.0, float(ev["overall"]))
     total = ev.get("total_frames") or 0
     if total <= 0:
         return None

@@ -439,7 +439,7 @@ def audio_md5(path: str) -> Optional[str]:
 
 
 def concat_and_mux(segments: List[str], source: Optional[VideoInfo], out_path: str, list_path: str,
-                   copy_audio: bool = True) -> str:
+                   copy_audio: bool = True, faststart: bool = False) -> str:
     """Concatenate encoded segments (stream copy) and attach the original audio untouched.
 
     Returns "copy" (audio packets copied bit-for-bit), "aac" (the source audio codec cannot be stored in MP4, so it was re-encoded to AAC)
@@ -448,7 +448,9 @@ def concat_and_mux(segments: List[str], source: Optional[VideoInfo], out_path: s
         for s in segments:
             f.write("file '" + os.path.abspath(s).replace("\\", "/").replace("'", "'\\''") + "'\n")
     base = [find_tool("ffmpeg"), "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
-    tail = ["-movflags", "+faststart", "-f", "mp4", out_path]
+    # +faststart moves the index to the front by rewriting the WHOLE file after muxing (minutes for a long 4K result, much longer on an HDD).
+    # It only matters for progressive web streaming, not for local playback, so it is opt-in.
+    tail = (["-movflags", "+faststart"] if faststart else []) + ["-f", "mp4", out_path]
     if not (copy_audio and source is not None and source.has_audio):
         _run(base + ["-map", "0:v:0", "-c", "copy"] + tail)
         return "none"

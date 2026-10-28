@@ -25,16 +25,16 @@ from src.video_io import audio_md5, probe_video, read_frame_at, verify_output  #
 
 W, H, FPS = 3840, 2160, 60
 BOX = 300
-SPEED = 200            # px per second, the box wraps at x = 3400
+SPEED = 200            # px per second; the box bounces between x = 0 and x = 3400 (a triangle wave, no jumps: the tracker never loses it)
 
 
 def box_x(t_frame: int) -> int:
-    return int((t_frame / FPS * SPEED) % 3400)
+    return int(abs((t_frame / FPS * SPEED) % 6800 - 3400))
 
 
 def make_video(path: str, seconds: int):
     fc = (f"color=c=0x303030:s={W}x{H}:r={FPS}:d={seconds}[bg];color=c=0xff00ff:s={BOX}x{BOX}:r={FPS}:d={seconds}[box];"
-          f"[bg][box]overlay=x='mod(t*{SPEED}\\,3400)':y=900:eval=frame,noise=alls=12:allf=t[v]")
+          f"[bg][box]overlay=x='abs(mod(t*{SPEED}\\,6800)-3400)':y=900:eval=frame,noise=alls=12:allf=t[v]")
     cmd = ["ffmpeg", "-v", "error", "-y", "-filter_complex", fc, "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={seconds}",
            "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-c:a", "aac", "-b:a", "128k", path]
@@ -90,7 +90,7 @@ def main():
     a.dir = os.path.join(ROOT, "samples", "soak")
     os.makedirs(a.dir, exist_ok=True)
     seconds = int(a.minutes * 60)
-    video = os.path.join(a.dir, f"soak_4k60_{seconds}s.mp4")
+    video = os.path.join(a.dir, f"soak_4k60_{seconds}s_bounce.mp4")
     if not os.path.isfile(video):
         print(f"generating {seconds} s of 4K60 test footage ...", flush=True)
         t = time.time()
@@ -127,7 +127,12 @@ def main():
     report["run1"] = {"killed": killed, "exit_code": rc1, "chunks_done": len(cd1), "seconds": round(dt1)}
     assert killed and not os.path.exists(out), "run 1 should have been killed before producing a result"
     db = JobDB(db_path_for(logs))
-    j = db.latest_resumable(info.fingerprint)
+    j = None
+    for _ in range(30):                              # taskkill /T returns before the whole tree is gone: wait until the worker has disappeared
+        j = db.latest_resumable(info.fingerprint)
+        if j is not None:
+            break
+        time.sleep(1)
     report["registry_after_kill"] = {"status": j and j["status"], "chunks_done": j and j["chunks_done"], "chunks_failed": j and j["chunks_failed"]}
     print("registry after the kill:", report["registry_after_kill"], flush=True)
     assert j is not None and j["status"] == "interrupted"
@@ -174,25 +179,38 @@ def main():
     jobs = db.jobs_for_input(info.fingerprint)
     report["jobs"] = [{"status": x["status"], "chunks_done": x["chunks_done"], "reused": x["reused_chunks"], "error": x["error"]} for x in jobs]
 
-    # ---- spot checks against the analytic position of the box (far from where it wraps/leaves the frame)
+    # ---- spot checks at the analytic position of the box: its 32 px block must have lost its texture (pixelated, a flat box with noise
+    # becomes perfectly flat) while a background block keeps it. Frames before AND after the kill are covered.
+    def tex(img, y, x, b=32):
+        y0, x0 = y // b * b, x // b * b
+        return float(img[y0:y0 + b, x0:x0 + b].astype(float).reshape(-1, 3).std(axis=0).mean())
+
     spots = []
-    for fr in np.linspace(f0 + 100, info.nb_frames - 100, 6).astype(int):
+    kill_frame = kill_after * a.chunk_size
+    for fr in sorted(set(np.linspace(f0 + 100, info.nb_frames - 100, 8).astype(int).tolist() + [kill_frame - 200, kill_frame + 200])):
         bx = box_x(int(fr))
-        if bx > 3400 - 400 or bx < 150:
+        if bx > 3400 - 400 or bx < 150 or not (0 <= fr < info.nb_frames):
             continue
         src_f, out_f = read_frame_at(info, int(fr)), read_frame_at(oinfo, int(fr))
-        inside = np.s_[900 + 60:900 + BOX - 60, bx + 60:bx + BOX - 60]
-        outside = np.s_[100:400, 100:600] if bx > 800 else np.s_[1500:1800, 100:600]
-        d_in = float(np.abs(out_f[inside].astype(int) - src_f[inside].astype(int)).mean())
-        d_out = float(np.abs(out_f[outside].astype(int) - src_f[outside].astype(int)).mean())
-        spots.append({"frame": int(fr), "box_x": bx, "inside_diff": round(d_in, 1), "outside_diff": round(d_out, 2)})
+        y, x = 900 + BOX // 2 - 16, bx + BOX // 2 - 16
+        bgx = 200 if bx > 900 else 3000
+        t_s, t_o = tex(src_f, y, x), tex(out_f, y, x)
+        b_s, b_o = tex(src_f, 1700, bgx), tex(out_f, 1700, bgx)
+        spots.append({"frame": int(fr), "after_resume": bool(fr >= kill_frame), "box_x": bx, "box_texture_src": round(t_s, 1),
+                      "box_texture_out": round(t_o, 1), "background_ratio": round(b_o / max(b_s, 1e-6), 2),
+                      "mosaicked": bool(t_o < 0.35 * t_s and b_o > 0.5 * b_s)})
     report["spot_checks"] = spots
-    print("spot checks:", spots, flush=True)
+    n_ok = sum(x["mosaicked"] for x in spots)
+    print(f"spot checks: {n_ok}/{len(spots)} frames mosaicked at the box (before the kill: "
+          f"{sum(x['mosaicked'] for x in spots if not x['after_resume'])}/{sum(not x['after_resume'] for x in spots)}, after the resume: "
+          f"{sum(x['mosaicked'] for x in spots if x['after_resume'])}/{sum(x['after_resume'] for x in spots)})", flush=True)
+    print(spots, flush=True)
 
     report["finished"] = time.strftime("%F %T")
     with open(os.path.join(a.dir, "soak_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)
-    ok = not problems and report["output"]["audio_identical"] and report["output"]["max_timestamp_deviation_ms"] < 1.0
+    ok = (not problems and report["output"]["audio_identical"] and report["output"]["max_timestamp_deviation_ms"] < 1.0
+          and bool(spots) and n_ok == len(spots))
     print("SOAK RESULT:", "PASS" if ok else "FAIL", flush=True)
     if not a.keep:
         import shutil

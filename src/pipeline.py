@@ -15,8 +15,11 @@ import json
 import logging
 import os
 import shutil
+import copy
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple
 
@@ -47,6 +50,30 @@ class JobFailed(RuntimeError):
 
 class JobCancelled(RuntimeError):
     """Raised at a safe point when the user asked to stop. Completed chunks stay valid for --resume."""
+
+
+@dataclass
+class RenderJob:
+    """Everything the render stage of one chunk needs, produced by the analysis/tracking/QC stage.
+
+    The two stages run on different threads (render of chunk c overlaps analysis+tracking of chunk c+1). They are independent because
+    tracking depends on the previous chunk's *tracking state*, never on its rendered video. ``snapshot`` is the tracking state as it was
+    at the end of THIS chunk's QC; it is what gets checkpointed with the chunk, even though the analysis of the next chunk has already
+    changed the live state by the time the render finishes."""
+    ci: int
+    s: int
+    e: int
+    n: int
+    qlog: "qc.QCLog"
+    packed: dict
+    fc_regions: list
+    fc_full: list
+    fc_reason: list
+    filled: list
+    snapshot: dict
+    chunk_dets: list
+    last_md5: str
+    timing: dict
 
 
 @dataclass
@@ -90,11 +117,12 @@ class Config:
     allow_hdr: bool = False
     allow_points_mismatch: bool = False
     skip_disk_check: bool = False
+    faststart: bool = False              # opt-in: rewrite the final file to put the index first (web streaming)
     resume: bool = False
     extra: dict = field(default_factory=dict)   # recorded in the job file (e.g. detector settings)
 
 
-NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points", "skip_disk_check"}
+NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points", "skip_disk_check", "faststart"}
 NON_HASHED_EXTRA = {"keep_temp"}
 
 
@@ -228,6 +256,8 @@ class Pipeline:
         self._ci = self._nchunks = self._done_frames = 0
         self.db: Optional[JobDB] = None
         self.run_id: Optional[str] = None
+        self._prog = {"a": 0.0, "r": 0.0}
+        self._prog_lock = threading.Lock()
 
     def _db_call(self, name: str, *a, **k):
         """Registry writes are best effort: a broken registry must never stop or corrupt a job."""
@@ -251,13 +281,27 @@ class Pipeline:
             raise JobCancelled("cancelled by the user")
 
     _STAGE = {"analyze": (0.0, 0.5), "track": (0.5, 0.1), "render": (0.6, 0.4)}
+    _A_SHARE = 0.25        # of the analysis+tracking stage: reading frames and detection; the rest is SAM 2 tracking
+    _W_ANALYSIS = 0.6      # weight of the analysis+tracking stage in the overall progress; the render stage gets the rest
 
-    def _tick(self, stage: str, i: int, n: int):
+    def _overall(self) -> float:
+        """Overall progress 0..1: analysis/tracking and rendering are two pipeline stages, each only ever moves forward."""
+        return min(1.0, (self._W_ANALYSIS * self._prog["a"] + (1 - self._W_ANALYSIS) * self._prog["r"]) / max(1, self.total))
+
+    def _tick(self, stage: str, i: int, n: int, ci: int, start: int):
         self._check_cancel()
         base, span = self._STAGE[stage]
-        self._emit(event="progress", stage=stage, chunk=self._ci, chunks=self._nchunks,
+        with self._prog_lock:
+            if stage == "analyze":
+                self._prog["a"] = max(self._prog["a"], start + n * self._A_SHARE * i / max(1, n))
+            elif stage == "track":
+                self._prog["a"] = max(self._prog["a"], start + n * (self._A_SHARE + (1 - self._A_SHARE) * i / max(1, n)))
+            else:
+                self._prog["r"] = max(self._prog["r"], start + i)
+            overall = self._overall()
+        self._emit(event="progress", stage=stage, chunk=ci, chunks=self._nchunks,
                    chunk_frac=round(base + span * i / max(1, n), 4), done_frames=self._done_frames,
-                   chunk_frames=n, total_frames=self.total)
+                   chunk_frames=n, total_frames=self.total, overall=round(overall, 4))
 
     # ------------------------------------------------------------------ setup
     def _check_input(self, info: VideoInfo):
@@ -331,7 +375,8 @@ class Pipeline:
         if not cfg.skip_disk_check:
             dc = disk_check(info.file_size, cfg.output or os.path.join("output", f"{self.stem}_censored.mp4"), cfg.work_dir)
             for w_ in dc["warnings"]:
-                log.warning("disk space: %s", w_)
+                log.warning("disk: %s", w_)
+                self._emit(event="warning", text=w_)
             if dc["problems"]:
                 raise JobFailed(" ".join(dc["problems"]))
         W, H = info.width, info.height
@@ -413,6 +458,9 @@ class Pipeline:
         if start_ci < len(chunks):
             a_reader = FrameReader(info, start_frame=a_start, max_frames=total - a_start, scale_to=(aw, ah))
             f_reader = PrefetchReader(FrameReader(info, start_frame=s0, max_frames=total - s0), depth=3)
+        renderer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="render")
+        with self._prog_lock:
+            self._prog["a"] = self._prog["r"] = float(s0)
         try:
             if s0 > 0 and start_ci < len(chunks):
                 for g in range(a_start, s0):      # rebuild the ring buffer; the last frame must match the checkpoint
@@ -426,36 +474,72 @@ class Pipeline:
                 if self.prev_last_analysis is None or hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest() != want:
                     raise JobFailed("resume: seeked analysis frame does not match the checkpoint (seek not frame-exact). "
                                     "Re-run without --resume.")
-            for ci in range(start_ci, len(chunks)):
-                s, e = chunks[ci]
-                t0 = time.time()
-                self._ci, self._done_frames = ci, s
-                self._check_cancel()
-                self._db_call("set_chunk", ci, "running", start_frame=s, end_frame=e)
-                try:
-                    chunk_events = self._process_chunk(ci, s, e, a_reader, f_reader, prompts)
-                except JobCancelled:
-                    raise
-                except BaseException as ex:
-                    self._db_call("set_chunk", ci, "failed", start_frame=s, end_frame=e, error=f"{type(ex).__name__}: {ex}"[:500])
-                    raise
-                self._done_frames = e
-                events += chunk_events
+            last_finish = [time.time()]
+
+            def finish(rj_: RenderJob, chunk_events: List[dict], render_s: float):
+                """Bookkeeping when a chunk is complete (segment verified, state checkpointed). Main thread only."""
+                ci_, s_, e_ = rj_.ci, rj_.s, rj_.e
+                self._done_frames = e_
+                events.extend(chunk_events)
                 mem = _mem_snapshot()
-                job["chunks"][str(ci)] = {"status": "done", "start": s, "end": e, "frames": e - s,
-                                          "segment": f"seg_{ci:05d}.mp4", "seconds": round(time.time() - t0, 1), **mem,
-                                          "timing": getattr(self, "_last_timing", None),
-                                          "last_frame_md5": hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest()}
+                now = time.time()
+                seconds = round(now - last_finish[0], 1)          # wall time between completions = throughput (stages overlap)
+                last_finish[0] = now
+                timing = dict(rj_.timing, render_s=render_s)
+                job["chunks"][str(ci_)] = {"status": "done", "start": s_, "end": e_, "frames": e_ - s_, "segment": f"seg_{ci_:05d}.mp4",
+                                           "seconds": seconds, **mem, "timing": timing, "last_frame_md5": rj_.last_md5}
                 _atomic_json(job_path, job)
-                self._db_call("set_chunk", ci, "done", start_frame=s, end_frame=e, seconds=round(time.time() - t0, 1),
+                self._db_call("set_chunk", ci_, "done", start_frame=s_, end_frame=e_, seconds=seconds,
                               rss_mb=mem.get("rss_mb"), cuda_peak_mb=mem.get("cuda_peak_mb"))
-                self._emit(event="chunk_done", chunk=ci, chunks=len(chunks), start=s, end=e, done_frames=e, total_frames=total,
-                           seconds=round(time.time() - t0, 2), events=len(chunk_events), timing=getattr(self, "_last_timing", None), **mem)
-                el = time.time() - t_start
-                done = e
-                log.info("chunk %d/%d frames %d-%d done in %.1fs  mem=%s  eta=%.0fs", ci + 1, len(chunks), s, e - 1,
-                         time.time() - t0, mem, el / max(1, done - (chunks[start_ci][0])) * (total - done) if done > chunks[start_ci][0] else 0)
+                with self._prog_lock:
+                    self._prog["a"], self._prog["r"] = max(self._prog["a"], e_), max(self._prog["r"], e_)
+                    overall = self._overall()
+                self._emit(event="chunk_done", chunk=ci_, chunks=len(chunks), start=s_, end=e_, done_frames=e_, total_frames=total,
+                           seconds=seconds, events=len(chunk_events), timing=timing, overall=round(overall, 4), **mem)
+                first = chunks[start_ci][0]
+                log.info("chunk %d/%d frames %d-%d done  +%.1fs  timing=%s  mem=%s  eta=%.0fs", ci_ + 1, len(chunks), s_, e_ - 1, seconds,
+                         timing, mem, (now - t_start) / max(1, e_ - first) * (total - e_) if e_ > first else 0)
+
+            def collect(item):
+                rj_, fut = item
+                try:
+                    chunk_events, render_s = fut.result()
+                except BaseException as ex:
+                    if not isinstance(ex, JobCancelled):
+                        self._db_call("set_chunk", rj_.ci, "failed", start_frame=rj_.s, end_frame=rj_.e, error=f"{type(ex).__name__}: {ex}"[:500])
+                    raise
+                finish(rj_, chunk_events, render_s)
+
+            pending = None
+            try:
+                for ci in range(start_ci, len(chunks)):
+                    s, e = chunks[ci]
+                    self._ci = ci
+                    self._check_cancel()
+                    self._db_call("set_chunk", ci, "running", start_frame=s, end_frame=e)
+                    try:
+                        rj = self._analyze_chunk(ci, s, e, a_reader, prompts)         # overlaps with the render of the previous chunk
+                    except JobCancelled:
+                        raise
+                    except BaseException as ex:
+                        self._db_call("set_chunk", ci, "failed", start_frame=s, end_frame=e, error=f"{type(ex).__name__}: {ex}"[:500])
+                        raise
+                    if pending is not None:
+                        item, pending = pending, None
+                        collect(item)                                                 # waits for that render; raises its error, if any
+                    pending = (rj, renderer.submit(self._render_chunk, rj, f_reader))
+                if pending is not None:
+                    item, pending = pending, None
+                    collect(item)
+            except BaseException:
+                if pending is not None:                                               # keep a render that did complete, drop the rest
+                    try:
+                        collect(pending)
+                    except BaseException:  # noqa: BLE001
+                        pass
+                raise
         finally:
+            renderer.shutdown(wait=True)
             for r in (a_reader, f_reader):
                 if r is not None:
                     r.close()
@@ -506,16 +590,11 @@ class Pipeline:
                     shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
         return ok
 
-    def _save_state(self, ci: int, chunk_events: List[dict]):
-        st = {"monitor": self.monitor.state_dict(), "objstate": {str(k): v for k, v in self.objstate.items()},
-              "det_carry": self.det_carry, "det_records_tail": []}
+    def _save_state(self, ci: int, chunk_events: List[dict], snapshot: dict, chunk_dets: List[dict]):
+        st = {"monitor": snapshot["monitor"], "objstate": snapshot["objstate"], "det_carry": snapshot["det_carry"], "det_records_tail": []}
         _atomic_json(os.path.join(self.job_dir, f"state_{ci:05d}.json"), st)
-        arrs = {f"m{k}": v for k, v in self.last_good.items()}
-        if self.prev_last_analysis is not None:
-            pass
-        np.savez(os.path.join(self.job_dir, f"state_{ci:05d}.npz"), **arrs)
-        _atomic_json(os.path.join(self.job_dir, f"qc_{ci:05d}.json"),
-                     {"events": chunk_events, "detections": self._chunk_dets})
+        np.savez(os.path.join(self.job_dir, f"state_{ci:05d}.npz"), **{f"m{k}": v for k, v in snapshot["last_good"].items()})
+        _atomic_json(os.path.join(self.job_dir, f"qc_{ci:05d}.json"), {"events": chunk_events, "detections": chunk_dets})
 
     def _load_state(self, ci: int):
         with open(os.path.join(self.job_dir, f"state_{ci:05d}.json"), encoding="utf-8") as f:
@@ -530,8 +609,8 @@ class Pipeline:
                 self.det_records += json.load(f).get("detections", [])
 
     # ------------------------------------------------------------------ chunk
-    def _process_chunk(self, ci: int, s: int, e: int, a_reader: FrameReader, f_reader: FrameReader,
-                       prompts: Prompts) -> List[dict]:
+    def _analyze_chunk(self, ci: int, s: int, e: int, a_reader: FrameReader, prompts: Prompts) -> RenderJob:
+        """Stage 1 (main thread): read analysis frames, detect, track with SAM 2, run the QC heuristics. Updates the live tracking state."""
         cfg, info = self.cfg, self.info
         n = e - s
         qlog = qc.QCLog(info.timestamp_of)
@@ -580,7 +659,7 @@ class Pipeline:
         use_ring = self.tracker is not None and cfg.stale_prefix_frames > 0
         for i in range(n):
             if i % 4 == 0:
-                self._tick("analyze", i, n)
+                self._tick("analyze", i, n, ci, s)
             fa = a_reader.read()
             if fa is None:
                 qlog.add(s + i, qc.FRAME_ERROR, "error", None, "analysis reader ended early", action="job_aborted")
@@ -618,7 +697,7 @@ class Pipeline:
                     inits.append(Init(oid, L + k - s, [(x * self.sx, y * self.sy) for x, y in pts], list(labs), source="points"))
                     started_here.setdefault(oid, L + k - s)
                     st.update(known=True, retired=False)
-        self._tick("track", 0, n)
+        self._tick("track", 0, n, ci, s)
         model_error: Optional[str] = None
         masks: Dict[int, Dict[int, np.ndarray]] = {}
         if inits:
@@ -631,7 +710,7 @@ class Pipeline:
                     qlog.add(s + i, qc.MODEL_ERROR, "error", None, model_error[:300],
                              action="fail_closed_full_frame" if cfg.fail_closed else "none_original_passthrough_for_tracked_objects")
         shutil.rmtree(frame_dir, ignore_errors=True)
-        self._tick("track", n, n)
+        self._tick("track", n, n, ci, s)
 
         tm2 = time.perf_counter()
         # ---- 3. QC per frame (sequential: the monitor is stateful)
@@ -694,6 +773,28 @@ class Pipeline:
         self.det_records += self._chunk_dets
 
         tm3 = time.perf_counter()
+        rj = RenderJob(ci=ci, s=s, e=e, n=n, qlog=qlog, packed=packed, fc_regions=fc_regions, fc_full=fc_full, fc_reason=fc_reason,
+                       filled=filled, snapshot=self._snapshot_state(), chunk_dets=self._chunk_dets,
+                       last_md5=hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest(),
+                       timing={"analysis_s": round(tm1 - tm0 - t_det, 2), "detect_s": round(t_det, 2), "track_s": round(tm2 - tm1, 2),
+                               "qc_s": round(tm3 - tm2, 2)})
+        del masks, raw_dets
+        gc.collect()
+        return rj
+
+    def _snapshot_state(self) -> dict:
+        """Copy of the tracking state to checkpoint with a chunk (the live state moves on while that chunk is still being rendered)."""
+        return {"monitor": copy.deepcopy(self.monitor.state_dict()), "objstate": copy.deepcopy({str(k): v for k, v in self.objstate.items()}),
+                "det_carry": copy.deepcopy(self.det_carry), "last_good": dict(self.last_good)}
+
+    def _render_chunk(self, rj: RenderJob, f_reader) -> tuple:
+        """Stage 2 (render thread): mosaic on full-resolution frames, encode the segment, verify it, checkpoint. Touches no live state."""
+        cfg, info = self.cfg, self.info
+        ci, s, n, qlog = rj.ci, rj.s, rj.n, rj.qlog
+        packed, fc_regions, fc_full, fc_reason, filled = rj.packed, rj.fc_regions, rj.fc_full, rj.fc_reason, rj.filled
+        shape = self.shape
+        self._check_cancel()                      # before the encoder (and its output file) exists
+        tm3 = time.perf_counter()
         # ---- 4. render at full resolution
         seg_path = os.path.join(self.job_dir, f"seg_{ci:05d}.mp4")
         writer = SegmentWriter(seg_path, info, cfg.encoder, cfg.crf, cfg.preset)
@@ -703,7 +804,7 @@ class Pipeline:
         try:
             for i in range(n):
                 if i % 4 == 0:
-                    self._tick("render", i, n)
+                    self._tick("render", i, n, ci, s)
                 full = f_reader.read()
                 if full is None:
                     qlog.add(s + i, qc.FRAME_ERROR, "error", None, "full-resolution reader ended early", action="job_aborted")
@@ -747,13 +848,11 @@ class Pipeline:
             qlog.add(s, qc.COUNT_MISMATCH, "error", None, f"chunk {ci}: wrote {n} frames, segment has {got}", action="job_aborted")
             raise JobFailed(f"segment {ci} has {got} frames, expected {n}")
 
-        self._last_timing = {"analysis_s": round(tm1 - tm0 - t_det, 2), "detect_s": round(t_det, 2), "track_s": round(tm2 - tm1, 2),
-                             "qc_s": round(tm3 - tm2, 2), "render_s": round(time.perf_counter() - tm3, 2)}
+        render_s = round(time.perf_counter() - tm3, 2)
         chunk_events = [asdict(ev) for ev in qlog.events]
-        self._save_state(ci, chunk_events)
-        del packed, masks, raw_dets, filled
-        gc.collect()
-        return chunk_events
+        self._save_state(ci, chunk_events, rj.snapshot, rj.chunk_dets)
+        del packed, filled
+        return chunk_events, render_s
 
     def _plan_carry(self, oid: int, s: int, qlog: qc.QCLog):
         """Decide how to re-seed an object at the chunk boundary (see tracking.py docstring).
@@ -794,7 +893,8 @@ class Pipeline:
         partial = out_final + ".partial"
         if os.path.exists(partial):
             os.remove(partial)
-        audio_mode = concat_and_mux(segs, info, partial, os.path.join(self.job_dir, "concat.txt"), cfg.keep_audio)
+        self._emit(event="stage", stage="finalizing")
+        audio_mode = concat_and_mux(segs, info, partial, os.path.join(self.job_dir, "concat.txt"), cfg.keep_audio, faststart=cfg.faststart)
         if audio_mode == "aac":
             qlog.add(-1, qc.AUDIO_REENCODED, "warn", None, f"the source audio codec ({info.audio_codec}) cannot be stored in MP4 as is; it was "
                      "re-encoded to AAC 256 kbit/s. Video and timing are unaffected.", action="audio_reencoded_to_aac")

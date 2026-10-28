@@ -18,7 +18,7 @@ ACTIVE = "running"
 RESUMABLE_STATES = ("cancelled", "failed", "interrupted")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-  job_id TEXT PRIMARY KEY, created TEXT, updated TEXT, pid INTEGER,
+  job_id TEXT PRIMARY KEY, created TEXT, updated TEXT, pid INTEGER, pid_ctime REAL,
   input_path TEXT, input_fp TEXT, points_sha TEXT, config_hash TEXT, model_sig TEXT, versions TEXT,
   total_frames INTEGER, chunk_size INTEGER, n_chunks INTEGER, reused_chunks INTEGER DEFAULT 0,
   status TEXT, error TEXT, output_path TEXT, review_log TEXT, job_dir TEXT, resume INTEGER DEFAULT 0
@@ -35,12 +35,26 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def pid_alive(pid: Optional[int]) -> bool:
+def process_ctime(pid: int) -> Optional[float]:
+    try:
+        import psutil
+        return psutil.Process(int(pid)).create_time()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pid_alive(pid: Optional[int], ctime: Optional[float] = None) -> bool:
+    """Is the process that started a job still running? Windows reuses process ids quickly, so when the creation time was recorded
+    the process must also have been created at that time; a different process that merely got the same id does not count."""
     if not pid:
         return False
     try:
         import psutil
-        return psutil.pid_exists(int(pid))
+        if not psutil.pid_exists(int(pid)):
+            return False
+        if ctime is not None:
+            return abs(psutil.Process(int(pid)).create_time() - ctime) < 2.0
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -51,6 +65,9 @@ class JobDB:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with self._conn() as c:
             c.executescript(SCHEMA)
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "pid_ctime" not in cols:                                   # registry created by an older version
+                c.execute("ALTER TABLE jobs ADD COLUMN pid_ctime REAL")
 
     @contextmanager
     def _conn(self):
@@ -65,8 +82,8 @@ class JobDB:
 
     # ---- writes (worker process)
     def start_job(self, job_id: str, **f) -> None:
-        cols = ["job_id", "created", "updated", "pid", "status"] + list(f)
-        vals = [job_id, _now(), _now(), os.getpid(), ACTIVE] + [json.dumps(v) if isinstance(v, (dict, list)) else v for v in f.values()]
+        cols = ["job_id", "created", "updated", "pid", "pid_ctime", "status"] + list(f)
+        vals = [job_id, _now(), _now(), os.getpid(), process_ctime(os.getpid()), ACTIVE] + [json.dumps(v) if isinstance(v, (dict, list)) else v for v in f.values()]
         with self._conn() as c:
             c.execute(f"INSERT OR REPLACE INTO jobs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
 
@@ -87,7 +104,7 @@ class JobDB:
                    review_log: Optional[str] = None) -> None:
         with self._conn() as c:
             c.execute("UPDATE jobs SET status=?, error=?, output_path=COALESCE(?, output_path), review_log=COALESCE(?, review_log), "
-                      "updated=?, pid=NULL WHERE job_id=?", (status, error, output_path, review_log, _now(), job_id))
+                      "updated=?, pid=NULL, pid_ctime=NULL WHERE job_id=?", (status, error, output_path, review_log, _now(), job_id))
             if status in ("cancelled", "failed", "interrupted"):       # a chunk that was in flight did not finish
                 c.execute("UPDATE chunks SET status='failed', error=COALESCE(error, ?), updated=? WHERE job_id=? AND status='running'",
                           (f"job {status}", _now(), job_id))
@@ -97,9 +114,9 @@ class JobDB:
         """Jobs still marked running whose process is gone (crash, kill, power loss) become 'interrupted'."""
         n = 0
         with self._conn() as c:
-            for r in c.execute("SELECT job_id, pid FROM jobs WHERE status=?", (ACTIVE,)).fetchall():
-                if not pid_alive(r["pid"]):
-                    c.execute("UPDATE jobs SET status='interrupted', error=COALESCE(error,'worker process disappeared'), pid=NULL, updated=? "
+            for r in c.execute("SELECT job_id, pid, pid_ctime FROM jobs WHERE status=?", (ACTIVE,)).fetchall():
+                if not pid_alive(r["pid"], r["pid_ctime"]):
+                    c.execute("UPDATE jobs SET status='interrupted', error=COALESCE(error,'worker process disappeared'), pid=NULL, pid_ctime=NULL, updated=? "
                               "WHERE job_id=?", (_now(), r["job_id"]))
                     c.execute("UPDATE chunks SET status='failed', error='worker process disappeared', updated=? WHERE job_id=? AND status='running'",
                               (_now(), r["job_id"]))

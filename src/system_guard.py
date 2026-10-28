@@ -49,7 +49,30 @@ def _existing_parent(path: str) -> str:
     return p
 
 
-def disk_check(source_bytes: int, output_path: str, work_dir: str) -> Dict[str, object]:
+_MEDIA_CACHE: Dict[str, str] = {}
+
+
+def media_type(path: str) -> str:
+    """'SSD', 'HDD' or '' (unknown) for the drive holding ``path``. Best effort: asks Windows via PowerShell, never raises."""
+    if sys.platform != "win32":
+        return ""
+    drive = os.path.splitdrive(os.path.abspath(path))[0][:1].upper()
+    if not drive:
+        return ""
+    if drive not in _MEDIA_CACHE:
+        try:
+            import subprocess
+            cmd = f"(Get-PhysicalDisk -DeviceNumber (Get-Partition -DriveLetter {drive}).DiskNumber).MediaType"
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=20,
+                               creationflags=0x08000000)
+            out = r.stdout.strip().upper()
+            _MEDIA_CACHE[drive] = out if out in ("SSD", "HDD") else ""
+        except Exception:  # noqa: BLE001
+            _MEDIA_CACHE[drive] = ""
+    return _MEDIA_CACHE[drive]
+
+
+def disk_check(source_bytes: int, output_path: str, work_dir: str, check_media: bool = True) -> Dict[str, object]:
     """Estimate the space a job needs and compare with what is free.
 
     Needed: the intermediate chunks in ``work_dir`` and the final video next to ``output_path`` (each about OUTPUT_FACTOR x the source;
@@ -73,4 +96,10 @@ def disk_check(source_bytes: int, output_path: str, work_dir: str) -> Dict[str, 
                             f"and the result, {gb(free)} are free. Free some space, choose another work/output folder, or pass --skip-disk-check.")
         elif free < 2 * need:
             warnings.append(f"free space on {_drive(path) or path} is only {gb(free)} (about {gb(need)} are needed)")
+    if check_media:
+        for label, path in (("work folder (intermediate chunks)", work), ("output folder", out_dir)):
+            if media_type(path) == "HDD":
+                warnings.append(f"the {label} is on a hard disk drive (HDD). Reading and writing gigabytes of video at the same time is slow there "
+                                "(measured ~20 MB/s for the final merge of a 12 GB result); put --work-dir on an SSD if you have one.")
+        warnings = list(dict.fromkeys(warnings))
     return {"problems": problems, "warnings": warnings, "need": needs, "free": free_info, "same_drive": same}

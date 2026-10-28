@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import threading
 
 from src.job_manager import file_signature
 from src.pipeline import Config, Pipeline, plan_reprocess
@@ -77,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--deep-verify", action="store_true", help="decode the whole output to count frames (slow)")
     g.add_argument("--allow-vfr", action="store_true", help="accept variable-frame-rate input (timing becomes constant-rate)")
     g.add_argument("--allow-hdr", action="store_true", help="accept HDR/10-bit input (converted to 8-bit SDR)")
+    g.add_argument("--faststart", action="store_true", help="put the MP4 index at the start of the result (web streaming); rewrites the whole file once more")
     g.add_argument("--skip-disk-check", action="store_true", help="do not refuse to start when the free disk space looks too small")
     g.add_argument("--allow-points-mismatch", action="store_true", help="accept points from a different file with same size/frames")
     return p
@@ -111,15 +113,19 @@ def main(argv=None) -> int:
         temporal_radius=a.temporal_radius, fail_closed=a.fail_closed, fail_closed_mode=a.fail_closed_mode,
         fail_closed_expand=a.fail_closed_expand, fail_closed_max_frames=a.fail_closed_max_frames,
         encoder=a.encoder, crf=a.crf, preset=a.preset, keep_audio=not a.no_audio, deep_verify=a.deep_verify,
-        allow_vfr=a.allow_vfr, allow_hdr=a.allow_hdr, allow_points_mismatch=a.allow_points_mismatch, skip_disk_check=a.skip_disk_check, resume=a.resume,
+        allow_vfr=a.allow_vfr, allow_hdr=a.allow_hdr, allow_points_mismatch=a.allow_points_mismatch, skip_disk_check=a.skip_disk_check, faststart=a.faststart, resume=a.resume,
         extra={"keep_temp": a.keep_temp, "nudenet": not a.no_nudenet, "det_classes": a.det_classes,
                "nudenet_model": a.nudenet_model, "nudenet_res": a.nudenet_res, "nudenet_tiles": a.nudenet_tiles,
                "sam2_ckpt_sig": file_signature(a.sam2_checkpoint) if a.sam2_checkpoint and os.path.isfile(a.sam2_checkpoint) else "",
                "device": a.device},
     )
+    emit_lock = threading.Lock()
+
     def emit(ev: dict):
         if a.progress_json:
-            print("@@PROGRESS " + json.dumps(ev), flush=True)
+            with emit_lock:                                   # progress comes from the analysis and the render thread
+                sys.stdout.write("@@PROGRESS " + json.dumps(ev) + "\n")
+                sys.stdout.flush()
 
     cancel_check = (lambda: os.path.exists(a.cancel_file)) if a.cancel_file else None
     if a.plan_only:

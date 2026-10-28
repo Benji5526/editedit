@@ -106,12 +106,12 @@ def test_disk_check_levels(monkeypatch, tmp_path):
     out, work = str(tmp_path / "o" / "r.mp4"), str(tmp_path / "w")
     src = 10 * GB                                                   # same drive: needs 2 x 1.5 x 10 = 30 GB
     fake_usage(monkeypatch, lambda p: 100 * GB)
-    r = disk_check(src, out, work)
+    r = disk_check(src, out, work, check_media=False)
     assert r["problems"] == [] and r["warnings"] == [] and r["same_drive"]
     fake_usage(monkeypatch, lambda p: 45 * GB)
-    assert disk_check(src, out, work)["warnings"] and not disk_check(src, out, work)["problems"]
+    assert disk_check(src, out, work, check_media=False)["warnings"] and not disk_check(src, out, work, check_media=False)["problems"]
     fake_usage(monkeypatch, lambda p: 20 * GB)
-    r = disk_check(src, out, work)
+    r = disk_check(src, out, work, check_media=False)
     assert r["problems"] and "not enough free disk space" in r["problems"][0] and "--skip-disk-check" in r["problems"][0]
 
 
@@ -119,7 +119,7 @@ def test_disk_check_separate_drives_are_checked_separately(monkeypatch):
     monkeypatch.setattr(system_guard, "_drive", lambda p: "d:" if str(p).startswith("D") else "c:")
     monkeypatch.setattr(system_guard, "_existing_parent", lambda p: p)
     fake_usage(monkeypatch, lambda p: 5 * GB if str(p).startswith("C") else 500 * GB)
-    r = disk_check(10 * GB, "D:\\out\\r.mp4", "C:\\work")
+    r = disk_check(10 * GB, "D:\\out\\r.mp4", "C:\\work", check_media=False)
     assert not r["same_drive"] and len(r["problems"]) == 1 and "c:" in r["problems"][0]          # only the work drive is short
 
 
