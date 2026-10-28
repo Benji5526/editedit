@@ -25,12 +25,13 @@ import numpy as np
 
 from . import quality_control as qc
 from .job_manager import JobDB, db_path_for
+from .system_guard import disk_check, keep_awake
 from .detection import Det, fill_detections
 from .mosaic import (STYLES, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
 from .points_io import Prompts, load_points
 from .tracking import Init, Tracker, TrackerError, pack_mask, unpack_mask
-from .video_io import (FrameReader, SegmentWriter, VideoError, VideoInfo, concat_and_mux, count_packets,
+from .video_io import (FrameReader, PrefetchReader, SegmentWriter, VideoError, VideoInfo, concat_and_mux, count_packets,
                        is_hdr, probe_video, verify_output)
 
 CODE_VERSION = "1"
@@ -88,11 +89,12 @@ class Config:
     allow_vfr: bool = False
     allow_hdr: bool = False
     allow_points_mismatch: bool = False
+    skip_disk_check: bool = False
     resume: bool = False
     extra: dict = field(default_factory=dict)   # recorded in the job file (e.g. detector settings)
 
 
-NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points"}
+NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points", "skip_disk_check"}
 NON_HASHED_EXTRA = {"keep_temp"}
 
 
@@ -181,6 +183,16 @@ def first_changed_chunk(old_sigs: Optional[List[str]], new_sigs: List[str]) -> i
         if i >= len(old_sigs) or old_sigs[i] != new:
             return i
     return len(new_sigs)
+
+
+def write_jpeg(path: str, img: np.ndarray, quality: int = 95) -> None:
+    """cv2.imwrite cannot open non-ASCII paths on Windows and fails silently (returns False, no file), so encode in memory and
+    write with Python file I/O. A failed write raises instead of leaving a missing frame for SAM 2 to trip over later."""
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise JobFailed(f"could not JPEG-encode a frame for {path}")
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
 
 
 def _atomic_json(path: str, obj):
@@ -280,7 +292,8 @@ class Pipeline:
             self.db = None
             log.warning("job registry unavailable; continuing without it", exc_info=True)
         try:
-            return self._run(status_path)
+            with keep_awake():
+                return self._run(status_path)
         except JobCancelled as e:
             self._db_call("finish_job", "cancelled", str(e))
             log.warning("JOB CANCELLED: %s", e)
@@ -315,6 +328,12 @@ class Pipeline:
                       chunk_size=cfg.chunk_size, output_path=os.path.abspath(cfg.output) if cfg.output else None,
                       job_dir=None, resume=int(cfg.resume), model_sig=(cfg.extra or {}).get("sam2_ckpt_sig"))
         self._check_input(info)
+        if not cfg.skip_disk_check:
+            dc = disk_check(info.file_size, cfg.output or os.path.join("output", f"{self.stem}_censored.mp4"), cfg.work_dir)
+            for w_ in dc["warnings"]:
+                log.warning("disk space: %s", w_)
+            if dc["problems"]:
+                raise JobFailed(" ".join(dc["problems"]))
         W, H = info.width, info.height
         total = min(info.nb_frames, cfg.max_frames) if cfg.max_frames else info.nb_frames
         sc = min(1.0, cfg.analysis_width / W)
@@ -393,7 +412,7 @@ class Pipeline:
         a_reader = f_reader = None
         if start_ci < len(chunks):
             a_reader = FrameReader(info, start_frame=a_start, max_frames=total - a_start, scale_to=(aw, ah))
-            f_reader = FrameReader(info, start_frame=s0, max_frames=total - s0)
+            f_reader = PrefetchReader(FrameReader(info, start_frame=s0, max_frames=total - s0), depth=3)
         try:
             if s0 > 0 and start_ci < len(chunks):
                 for g in range(a_start, s0):      # rebuild the ring buffer; the last frame must match the checkpoint
@@ -401,7 +420,7 @@ class Pipeline:
                     if fa is None:
                         raise JobFailed("resume: could not read analysis frames before the resume point")
                     if g < s0 - 1 and cap:
-                        cv2.imwrite(os.path.join(self.ring, f"{g}.jpg"), fa, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        write_jpeg(os.path.join(self.ring, f"{g}.jpg"), fa)
                     self.prev_last_analysis = fa
                 want = job["chunks"][str(start_ci - 1)]["last_frame_md5"]
                 if self.prev_last_analysis is None or hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest() != want:
@@ -425,12 +444,13 @@ class Pipeline:
                 mem = _mem_snapshot()
                 job["chunks"][str(ci)] = {"status": "done", "start": s, "end": e, "frames": e - s,
                                           "segment": f"seg_{ci:05d}.mp4", "seconds": round(time.time() - t0, 1), **mem,
+                                          "timing": getattr(self, "_last_timing", None),
                                           "last_frame_md5": hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest()}
                 _atomic_json(job_path, job)
                 self._db_call("set_chunk", ci, "done", start_frame=s, end_frame=e, seconds=round(time.time() - t0, 1),
                               rss_mb=mem.get("rss_mb"), cuda_peak_mb=mem.get("cuda_peak_mb"))
                 self._emit(event="chunk_done", chunk=ci, chunks=len(chunks), start=s, end=e, done_frames=e, total_frames=total,
-                           seconds=round(time.time() - t0, 2), events=len(chunk_events), **mem)
+                           seconds=round(time.time() - t0, 2), events=len(chunk_events), timing=getattr(self, "_last_timing", None), **mem)
                 el = time.time() - t_start
                 done = e
                 log.info("chunk %d/%d frames %d-%d done in %.1fs  mem=%s  eta=%.0fs", ci + 1, len(chunks), s, e - 1,
@@ -515,6 +535,7 @@ class Pipeline:
         cfg, info = self.cfg, self.info
         n = e - s
         qlog = qc.QCLog(info.timestamp_of)
+        tm0, t_det = time.perf_counter(), 0.0
         frame_dir = os.path.join(self.job_dir, f"frames_{ci:05d}")
         shutil.rmtree(frame_dir, ignore_errors=True)
         os.makedirs(frame_dir)
@@ -548,7 +569,7 @@ class Pipeline:
         for j, g in enumerate(range(g0, s)):
             src = os.path.join(self.ring, f"{g}.jpg")
             if g == s - 1:
-                cv2.imwrite(os.path.join(frame_dir, f"{j}.jpg"), self.prev_last_analysis, jpg_q)
+                write_jpeg(os.path.join(frame_dir, f"{j}.jpg"), self.prev_last_analysis)
             elif os.path.isfile(src):
                 shutil.copyfile(src, os.path.join(frame_dir, f"{j}.jpg"))
             else:
@@ -574,7 +595,9 @@ class Pipeline:
                     fh.write(data)
             if self.detector is not None and (s + i) % cfg.detect_every == 0:
                 try:
+                    td = time.perf_counter()
                     raw_dets[i] = self.detector.detect(fa)
+                    t_det += time.perf_counter() - td
                 except Exception as ex:  # noqa: BLE001
                     det_failed[i] = True
                     qlog.add(s + i, DET_ERROR, "error", None, f"{type(ex).__name__}: {ex}",
@@ -585,6 +608,7 @@ class Pipeline:
             if int(name.split(".")[0]) < e - 1 - cfg.stale_prefix_frames:
                 os.remove(os.path.join(self.ring, name))
 
+        tm1 = time.perf_counter()
         # ---- 2. tracking
         for oid in self.obj_ids:
             st = self.objstate[oid]
@@ -609,6 +633,7 @@ class Pipeline:
         shutil.rmtree(frame_dir, ignore_errors=True)
         self._tick("track", n, n)
 
+        tm2 = time.perf_counter()
         # ---- 3. QC per frame (sequential: the monitor is stateful)
         fc_regions: List[List[tuple]] = [[] for _ in range(n)]
         fc_full = [False] * n
@@ -668,6 +693,7 @@ class Pipeline:
                                          "score": round(d.score, 4), "box": [round(v, 1) for v in d.box], "filled": d.filled})
         self.det_records += self._chunk_dets
 
+        tm3 = time.perf_counter()
         # ---- 4. render at full resolution
         seg_path = os.path.join(self.job_dir, f"seg_{ci:05d}.mp4")
         writer = SegmentWriter(seg_path, info, cfg.encoder, cfg.crf, cfg.preset)
@@ -721,6 +747,8 @@ class Pipeline:
             qlog.add(s, qc.COUNT_MISMATCH, "error", None, f"chunk {ci}: wrote {n} frames, segment has {got}", action="job_aborted")
             raise JobFailed(f"segment {ci} has {got} frames, expected {n}")
 
+        self._last_timing = {"analysis_s": round(tm1 - tm0 - t_det, 2), "detect_s": round(t_det, 2), "track_s": round(tm2 - tm1, 2),
+                             "qc_s": round(tm3 - tm2, 2), "render_s": round(time.perf_counter() - tm3, 2)}
         chunk_events = [asdict(ev) for ev in qlog.events]
         self._save_state(ci, chunk_events)
         del packed, masks, raw_dets, filled
@@ -766,9 +794,13 @@ class Pipeline:
         partial = out_final + ".partial"
         if os.path.exists(partial):
             os.remove(partial)
-        concat_and_mux(segs, info, partial, os.path.join(self.job_dir, "concat.txt"), cfg.keep_audio)
+        audio_mode = concat_and_mux(segs, info, partial, os.path.join(self.job_dir, "concat.txt"), cfg.keep_audio)
+        if audio_mode == "aac":
+            qlog.add(-1, qc.AUDIO_REENCODED, "warn", None, f"the source audio codec ({info.audio_codec}) cannot be stored in MP4 as is; it was "
+                     "re-encoded to AAC 256 kbit/s. Video and timing are unaffected.", action="audio_reencoded_to_aac")
         problems = verify_output(partial, info, total, expect_audio=cfg.keep_audio and info.has_audio, deep=cfg.deep_verify,
-                                 audio_tol=0.25 if not cfg.max_frames else max(0.5, 2.0))
+                                 audio_tol=0.25 if not cfg.max_frames else max(0.5, 2.0),
+                                 audio_identical=(audio_mode == "copy" and not cfg.max_frames))
         if cfg.max_frames and info.has_audio:
             problems = [p for p in problems if "audio" not in p]   # audio is not trimmed in --max-frames test runs
         for p in problems:

@@ -220,18 +220,27 @@ class FrameReader:
         if scale_to:
             cmd += ["-vf", f"scale={self.out_w}:{self.out_h}:flags=area"]
         cmd += ["-pix_fmt", "bgr24", "-f", "rawvideo", "-"]
-        self._p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   bufsize=self.frame_bytes * 2, creationflags=CREATE_NO_WINDOW)
+        # bufsize=0: unbuffered pipe. Reading a 25 MB 4K frame through a BufferedReader and copying it again cost ~64 ms per frame;
+        # reading straight into a freshly allocated array takes ~18 ms (measured, see tools/ and the README).
+        self._p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, creationflags=CREATE_NO_WINDOW)
         self.frames_read = 0
 
     def read(self) -> Optional[np.ndarray]:
-        buf = self._p.stdout.read(self.frame_bytes)
-        if not buf:
+        """Next frame as a new, writable BGR array (the caller owns it), or None at the end of the stream."""
+        arr = np.empty((self.out_h, self.out_w, 3), np.uint8)
+        mv = memoryview(arr).cast("B")
+        got, total = 0, self.frame_bytes
+        while got < total:
+            k = self._p.stdout.readinto(mv[got:])
+            if not k:
+                break
+            got += k
+        if got == 0:
             return None
-        if len(buf) < self.frame_bytes:
+        if got < total:
             raise VideoError(f"truncated frame after {self.frames_read} frames: {self._stderr()}")
         self.frames_read += 1
-        return np.frombuffer(buf, np.uint8).reshape(self.out_h, self.out_w, 3).copy()
+        return arr
 
     def __iter__(self) -> Iterator[np.ndarray]:
         while True:
@@ -264,6 +273,79 @@ class FrameReader:
         self.close()
 
 
+class PrefetchReader:
+    """Wraps a FrameReader and reads ahead on a background thread (a few frames), so decoding/piping the next 4K frame overlaps with
+    the caller's processing of the current one. Same interface as FrameReader.read(); frame order and error behaviour are unchanged
+    (a read error is raised from read() at the position where it happened). Memory is bounded by ``depth`` frames."""
+
+    _END = object()
+
+    def __init__(self, reader: "FrameReader", depth: int = 3):
+        import queue
+        import threading
+        self._reader, self._q, self._stop = reader, queue.Queue(maxsize=max(1, depth)), threading.Event()
+        self._done = False
+        self.out_w, self.out_h = reader.out_w, reader.out_h
+        self._t = threading.Thread(target=self._run, name="PrefetchReader", daemon=True)
+        self._t.start()
+
+    def _put(self, item) -> bool:
+        import queue
+        while not self._stop.is_set():
+            try:
+                self._q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                f = self._reader.read()
+                if f is None:
+                    self._put(self._END)
+                    return
+                if not self._put(f):
+                    return
+        except BaseException as e:  # noqa: BLE001  (delivered to the consumer in order)
+            self._put(e)
+
+    @property
+    def frames_read(self) -> int:
+        return self._reader.frames_read
+
+    def read(self) -> Optional[np.ndarray]:
+        if self._done:
+            return None
+        item = self._q.get()
+        if item is self._END:
+            self._done = True
+            return None
+        if isinstance(item, BaseException):
+            self._done = True
+            raise item
+        return item
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        while True:
+            f = self.read()
+            if f is None:
+                return
+            yield f
+
+    def close(self):
+        self._stop.set()
+        self._reader.close()            # also unblocks a read that is waiting on the pipe
+        self._t.join(timeout=5)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
 def read_frame_at(info: VideoInfo, frame_idx: int, scale_to=None) -> np.ndarray:
     with FrameReader(info, start_frame=frame_idx, max_frames=1, scale_to=scale_to) as r:
         f = r.read()
@@ -278,6 +360,18 @@ def nvenc_available() -> bool:
         return "h264_nvenc" in out
     except Exception:
         return False
+
+
+def frame_exact_timescale(fps_rational: str) -> int:
+    """Container timescale in which one frame lasts a whole number of ticks.
+
+    Segments are concatenated by stream copy, so their durations add up in container ticks. With the usual 90000 a 59.94 fps frame
+    lasts 1501.5 ticks, every segment with an odd frame count is rounded by half a tick, and the error grows with the number of
+    chunks (about 7 ms after 1200 odd-sized chunks, nearly half a frame). Using a multiple of the fps numerator (>= 10000 for
+    player compatibility) makes every frame an exact number of ticks, so no rounding happens at all."""
+    n, d = (int(x) for x in fps_rational.split("/"))
+    k = max(1, -(-10000 // n))
+    return n * k
 
 
 class SegmentWriter:
@@ -295,7 +389,7 @@ class SegmentWriter:
         else:
             cmd += ["-c:v", encoder, "-crf", str(crf), "-preset", preset]
         cmd += ["-colorspace", cs_tag, "-color_primaries", "bt709" if cs_tag == "bt709" else cs_tag,
-                "-color_trc", trc_tag, "-pix_fmt", "yuv420p", "-video_track_timescale", "90000", path]
+                "-color_trc", trc_tag, "-pix_fmt", "yuv420p", "-video_track_timescale", str(frame_exact_timescale(info.fps_rational)), path]
         self._cmd = cmd
         self._p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
         self.frames_written = 0
@@ -305,7 +399,7 @@ class SegmentWriter:
         if frame.shape != self._shape or frame.dtype != np.uint8:
             raise VideoError(f"frame shape/dtype mismatch: {frame.shape} {frame.dtype} != {self._shape}")
         try:
-            self._p.stdin.write(np.ascontiguousarray(frame).tobytes())
+            self._p.stdin.write(memoryview(np.ascontiguousarray(frame)).cast("B"))      # no extra 25 MB copy
         except (BrokenPipeError, OSError) as e:
             raise VideoError(f"encoder pipe broke at frame {self.frames_written}: {self._p.stderr.read().decode(errors='replace')[-800:]}") from e
         self.frames_written += 1
@@ -337,23 +431,38 @@ def count_packets(path: str) -> int:
     return int(out.strip().strip(",") or 0)
 
 
+def audio_md5(path: str) -> Optional[str]:
+    """MD5 over the first audio stream's packets, read without decoding (stream copy). Equal hashes mean the audio data is bit-identical."""
+    out = _run([find_tool("ffmpeg"), "-v", "error", "-nostdin", "-i", path, "-map", "0:a:0", "-c", "copy", "-f", "md5", "-"])
+    line = out.strip().splitlines()[-1] if out.strip() else ""
+    return line.split("=", 1)[1] if line.startswith("MD5=") else None
+
+
 def concat_and_mux(segments: List[str], source: Optional[VideoInfo], out_path: str, list_path: str,
-                   copy_audio: bool = True):
-    """Concatenate encoded segments (stream copy) and attach the original audio untouched."""
+                   copy_audio: bool = True) -> str:
+    """Concatenate encoded segments (stream copy) and attach the original audio untouched.
+
+    Returns "copy" (audio packets copied bit-for-bit), "aac" (the source audio codec cannot be stored in MP4, so it was re-encoded to AAC)
+    or "none" (no audio attached)."""
     with open(list_path, "w", encoding="utf-8") as f:
         for s in segments:
             f.write("file '" + os.path.abspath(s).replace("\\", "/").replace("'", "'\\''") + "'\n")
-    cmd = [find_tool("ffmpeg"), "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
-    if copy_audio and source is not None and source.has_audio:
-        cmd += ["-i", source.path, "-map", "0:v:0", "-map", "1:a", "-c", "copy"]
-    else:
-        cmd += ["-map", "0:v:0", "-c", "copy"]
-    cmd += ["-movflags", "+faststart", "-f", "mp4", out_path]
-    _run(cmd)
+    base = [find_tool("ffmpeg"), "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
+    tail = ["-movflags", "+faststart", "-f", "mp4", out_path]
+    if not (copy_audio and source is not None and source.has_audio):
+        _run(base + ["-map", "0:v:0", "-c", "copy"] + tail)
+        return "none"
+    try:
+        _run(base + ["-i", source.path, "-map", "0:v:0", "-map", "1:a", "-c", "copy"] + tail)
+        return "copy"
+    except VideoError:
+        # most often: the source audio codec has no MP4 mapping. Keep the audio, change only its codec.
+        _run(base + ["-i", source.path, "-map", "0:v:0", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k"] + tail)
+        return "aac"
 
 
 def verify_output(path: str, src: VideoInfo, expected_frames: int, expect_audio: bool, deep: bool = False,
-                  audio_tol: float = 0.25) -> List[str]:
+                  audio_tol: float = 0.25, audio_identical: bool = False) -> List[str]:
     """Return list of problems (empty = verified). Checks frames, size, duration, CFR timestamps, audio."""
     problems: List[str] = []
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -390,4 +499,10 @@ def verify_output(path: str, src: VideoInfo, expected_frames: int, expect_audio:
                 problems.append(f"audio duration {out.audio_duration:.3f}s vs source {a_ref:.3f}s")
             if out.duration and abs(out.audio_duration - out.duration) > max(audio_tol, abs((src.audio_duration or 0) - src.duration) + audio_tol):
                 problems.append(f"audio/video duration differ by {abs(out.audio_duration - out.duration):.3f}s (A/V sync risk)")
+            if audio_identical:
+                try:
+                    if audio_md5(src.path) != audio_md5(path):
+                        problems.append("audio stream differs from the source (expected bit-identical stream copy)")
+                except VideoError as e:
+                    problems.append(f"could not compare the audio streams: {e}")
     return problems

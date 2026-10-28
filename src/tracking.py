@@ -99,6 +99,7 @@ class SAM2Tracker(Tracker):
             raise TrackerError("CUDA requested but torch.cuda.is_available() is False; refusing to silently fall back to CPU. "
                                "Use --device cpu explicitly (very slow).")
         from sam2.build_sam import build_sam2_video_predictor
+        self.parallel_loading = install_parallel_frame_loader()
         self.torch = torch
         self.device = device
         self.config = config or guess_config(checkpoint)
@@ -164,6 +165,61 @@ class SAM2Tracker(Tracker):
                 if self.device.startswith("cuda"):
                     torch.cuda.empty_cache()
         return out
+
+
+def parallel_load_video_frames(video_path, image_size, offload_video_to_cpu, img_mean=(0.485, 0.456, 0.406),
+                               img_std=(0.229, 0.224, 0.225), async_loading_frames=False, compute_device=None, workers=None):
+    """Drop-in replacement for sam2.utils.misc.load_video_frames (directory of JPEGs) that decodes and resizes the frames on several
+    threads. It produces exactly the same tensors (same per-frame function, same normalisation); only the single-threaded loop is
+    replaced, which took ~36 ms per 1080p frame (2.2 s per 61-frame chunk). Anything else is delegated to the original function."""
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
+    from sam2.utils import misc
+
+    if compute_device is None:
+        compute_device = torch.device("cuda")
+    if async_loading_frames or not (isinstance(video_path, str) and os.path.isdir(video_path)):
+        return misc.load_video_frames(video_path, image_size, offload_video_to_cpu, img_mean, img_std, async_loading_frames, compute_device)
+    names = [n for n in os.listdir(video_path) if os.path.splitext(n)[-1] in (".jpg", ".jpeg", ".JPG", ".JPEG")]
+    names.sort(key=lambda n: int(os.path.splitext(n)[0]))
+    if not names:
+        raise RuntimeError(f"no images found in {video_path}")
+    paths = [os.path.join(video_path, n) for n in names]
+    mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+    std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+    images = torch.zeros(len(paths), 3, image_size, image_size, dtype=torch.float32)
+    inference = torch.is_inference_mode_enabled()
+    n_workers = workers or min(8, (os.cpu_count() or 4))     # 8: 3.8x faster than 1 thread; 16 only adds peak memory
+
+    def load_into(n):
+        # Each worker decodes its frame AND copies it into its own slice of the output, so the 25 MB float64 intermediate is allocated and
+        # freed on the same thread. Handing results to the main thread instead made Windows keep up to ~1.5 GB of freed blocks resident
+        # (peak +3.0 GB instead of +1.5 GB for 121 frames; measured, and erratic between runs). Slices are disjoint: thread-safe.
+        img, h, w = misc._load_img_as_tensor(paths[n], image_size)
+        with torch.inference_mode(inference):            # inference mode is per thread: SAM 2 calls this inside inference_mode(), so
+            images[n].copy_(img)                         # `images` is an inference tensor that other threads may only update in that mode
+        return h, w
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        sizes = list(ex.map(load_into, range(len(paths))))
+    video_height, video_width = sizes[-1]
+    if not offload_video_to_cpu:
+        images, mean, std = images.to(compute_device), mean.to(compute_device), std.to(compute_device)
+    images -= mean
+    images /= std
+    return images, video_height, video_width
+
+
+def install_parallel_frame_loader() -> bool:
+    """Make SAM2VideoPredictor.init_state use parallel_load_video_frames. Returns False if sam2 has an unexpected layout."""
+    try:
+        import sam2.sam2_video_predictor as svp
+        if getattr(svp, "load_video_frames", None) is None:
+            return False
+        svp.load_video_frames = parallel_load_video_frames
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class _nullctx:

@@ -32,6 +32,7 @@ COUNT_MISMATCH = "frame_count_mismatch"
 OUTPUT_INVALID = "output_verification_failed"
 FAIL_CLOSED_APPLIED = "fail_closed_mosaic_applied"
 TIMESTAMP_WARNING = "timestamp_warning"
+AUDIO_REENCODED = "audio_reencoded"
 
 SEVERITY_ORDER = {"info": 0, "warn": 1, "error": 2}
 

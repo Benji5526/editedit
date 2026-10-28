@@ -57,10 +57,13 @@ def read_frame_code(img: np.ndarray) -> int:
     return v
 
 
-def make_video(path: str, n_frames: int = 160, audio: bool = True, vfr: bool = False, rotate: int = 0):
-    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-"]
+def make_video(path: str, n_frames: int = 160, audio: bool = True, vfr: bool = False, rotate: int = 0, fps="30"):
+    """fps may be a fraction such as "60000/1001"."""
+    from fractions import Fraction
+    dur = n_frames / float(Fraction(str(fps)))
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-"]
     if audio:
-        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={n_frames / FPS}"]
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={dur}"]
     vf = r"select=mod(n\,5)" if vfr else None   # drop every 5th frame => irregular intervals
     cmd += ["-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-g", "30",
             "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
@@ -110,7 +113,7 @@ class ColorTracker(Tracker):
         if k in self.empty_chunks:
             return out
         for li in range(n_frames):
-            img = cv2.imread(os.path.join(frame_dir, f"{li}.jpg"))
+            img = cv2.imdecode(np.fromfile(os.path.join(frame_dir, f"{li}.jpg"), np.uint8), cv2.IMREAD_COLOR)   # unicode-safe
             m = (img[..., 0] > 170) & (img[..., 1] < 100) & (img[..., 2] > 170)
             n, lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8))
             if n > 1 and stats[1:, cv2.CC_STAT_AREA].max() >= 150:     # keep the largest blob, drop noise specks
