@@ -127,3 +127,47 @@ def test_style_change_invalidates_kept_chunks(video, tmp_path):
                       chunk_size=40, analysis_width=320, preset="ultrafast", mosaic_style=style, resume=resume, extra={"keep_temp": True})
     assert Pipeline(cfg("pixelate"), ColorTracker((180, 320)), None).run() == 0
     assert Pipeline(cfg("solid", resume=True), ColorTracker((180, 320)), None).run() == 1          # chunks were rendered with another style
+
+
+# ------------------------------------------------------------------ strength: automatic choice, slider and preview in the settings dialog
+def test_recommended_block_scales_with_resolution():
+    from src.mosaic import recommended_block
+    assert [recommended_block(w, h) for w, h in ((1280, 720), (1920, 1080), (3840, 2160))] == [20, 32, 64]
+    assert recommended_block(1080, 1920) == 32                      # portrait: the longer side counts
+    assert recommended_block(10, 10) == 4 and recommended_block(100000, 10) == 256
+
+
+def test_dialog_auto_strength_slider_and_preview(video, monkeypatch, tmp_path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from src.app import process_dialog
+    from src.video_io import probe_video
+    monkeypatch.setattr(process_dialog, "LAST_SETTINGS_PATH", str(tmp_path / "last.json"))
+    app = QApplication.instance() or QApplication([])
+    info = probe_video(video)
+    dlg = process_dialog.ProcessDialog(None, video, False, info.nb_frames, info=info)
+    assert dlg.block_auto.isChecked() and dlg.block.value() == process_dialog.recommended_block(info.width, info.height)
+    assert not dlg.block.isEnabled() and not dlg.preview.pixmap().isNull()
+    dlg.block_auto.setChecked(False)
+    dlg.block_slider.setValue(80)                                    # the slider drives the spin box and the settings
+    assert dlg.block.value() == 80 and dlg.settings().block == 80 and dlg.settings().block_auto is False
+    first = dlg.preview.pixmap().toImage()
+    dlg.block.setValue(8)
+    assert dlg.preview.pixmap().toImage() != first                   # the preview follows the strength
+    dlg.style.setCurrentText("solid")
+    assert not dlg.preview.pixmap().isNull()
+    dlg.block_auto.setChecked(True)
+    assert dlg.settings().block == process_dialog.recommended_block(info.width, info.height)
+    del app
+
+
+def test_dialog_without_video_info_has_no_auto(video):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from src.app import process_dialog
+    app = QApplication.instance() or QApplication([])
+    dlg = process_dialog.ProcessDialog(None, video, False, 10)
+    assert not dlg.block_auto.isChecked() and not dlg.block_auto.isEnabled() and dlg.block.isEnabled()
+    del app

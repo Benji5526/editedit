@@ -179,6 +179,8 @@ Without the flag the same events are logged but the frames pass through as compu
 * The final file is made by concatenating segments (stream copy) + original audio into `*.partial`, verifying it, and only then renaming it.
 * Mosaic style (`--mosaic-style`, `--block` = strength in full-resolution px): `pixelate` (default, block grid anchored to the image), `solid` (black; nothing of the original survives) or
   `blur` (Gaussian, sigma = block/2; the weakest of the three, prefer pixelate or solid for sensitive content).
+  In the app's settings dialog the strength has an **auto** mode (about 1/60 of the video's longer side: 1920 -> 32, 3840 -> 64; a rule of thumb), a slider, and a **preview** on a real frame of the video
+  (the same `apply_mosaic` code as the worker, on an ellipse in the middle). The worker still receives one number (`--block`).
 * Mosaic area = union of (all objects' masks over ±`--temporal-radius` frames, grown by `--mask-pad-px`) ∪ (NudeNet boxes grown by `--det-expand`/`--det-pad-px`, with short gaps bridged and boxes held `--det-hold` frames) ∪ fail-closed regions. A union cannot lose one of its members. The pixel grid is anchored to the image so blocks do not shimmer as masks move.
 * NudeNet: model output is post-processed here with a configurable `--det-threshold` (the library's own `detect()` hard-codes a 0.2/0.25 floor). Lowering the threshold gives more detections and more false positives, not guaranteed recall. `--nudenet-tiles 2` additionally scans overlapping crops (small regions get more resolution; slower). It runs on CPU unless you install `onnxruntime-gpu` yourself.
 

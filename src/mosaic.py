@@ -111,6 +111,12 @@ def pixelate_region(frame: np.ndarray, mask: np.ndarray, block: int) -> np.ndarr
 STYLES = ("pixelate", "blur", "solid")
 
 
+def recommended_block(width: int, height: int) -> int:
+    """Strength that scales with the video: about 1/60 of the longer side, in multiples of 4 (1280 -> 20, 1920 -> 32, 3840 -> 64).
+    A rule of thumb, not a measurement: look at the preview and adjust for the footage."""
+    return int(min(256, max(4, round(max(width, height) / 60 / 4) * 4)))
+
+
 def blur_region(frame: np.ndarray, mask: np.ndarray, strength: int) -> np.ndarray:
     """Gaussian blur inside the mask (sigma = strength / 2). Pixels just outside the mask bleed into the border of the
     blurred area, which is fine; the pixels outside the mask are never modified. Returns the same array."""

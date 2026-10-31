@@ -7,10 +7,14 @@ import os
 from dataclasses import asdict
 from typing import Optional
 
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (QSlider, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from src.video_io import nvenc_available
+from src.mosaic import apply_mosaic, recommended_block
+from src.video_io import nvenc_available, read_frame_at
 
 from .job_runner import PROJECT_ROOT, ProcessSettings
 
@@ -49,8 +53,10 @@ def save_last_settings(st: ProcessSettings):
 
 
 class ProcessDialog(QDialog):
-    def __init__(self, parent, video_path: str, needs_sam2: bool, n_frames: int, defaults: Optional[ProcessSettings] = None):
+    def __init__(self, parent, video_path: str, needs_sam2: bool, n_frames: int, defaults: Optional[ProcessSettings] = None, info=None):
         super().__init__(parent)
+        self.info = info
+        self._frame = None
         self.setWindowTitle("Process video")
         self.video_path, self.needs_sam2, self.n_frames = video_path, needs_sam2, n_frames
         st = defaults or load_last_settings()
@@ -113,10 +119,34 @@ class ProcessDialog(QDialog):
         self.style.setCurrentText(st.mosaic_style)
         self.style.setToolTip("pixelate and solid destroy the content; blur is the weakest")
         form.addRow("Mosaic style", self.style)
+        self.block_auto = QCheckBox("Auto: choose the strength from the video resolution")
+        self.block_auto.setChecked(st.block_auto and info is not None)
+        self.block_auto.setEnabled(info is not None)
+        self.block_auto.setToolTip("About 1/60 of the longer side (1920 -> 32, 3840 -> 64). A rule of thumb: check the preview.")
+        form.addRow(self.block_auto)
         self.block = QSpinBox()
         self.block.setRange(4, 256)
         self.block.setValue(st.block)
-        form.addRow("Mosaic strength (block size / blur, px)", self.block)
+        self.block_slider = QSlider(Qt.Orientation.Horizontal)
+        self.block_slider.setRange(4, 256)
+        self.block_slider.setValue(st.block)
+        sw = QWidget()
+        sh = QHBoxLayout(sw)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.addWidget(self.block_slider, 1)
+        sh.addWidget(self.block)
+        form.addRow("Mosaic strength (block size / blur, px)", sw)
+        self.preview = QLabel("")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(180 if info is not None else 0)
+        self.preview.setStyleSheet("background: #222; color: #bbb")
+        form.addRow(self.preview)
+        self.block_slider.valueChanged.connect(self.block.setValue)
+        self.block.valueChanged.connect(self.block_slider.setValue)
+        self.block.valueChanged.connect(self._update_preview)
+        self.style.currentTextChanged.connect(self._update_preview)
+        self.block_auto.toggled.connect(self._auto_toggled)
+        self._auto_toggled(self.block_auto.isChecked())
         self.pad = QSpinBox()
         self.pad.setRange(0, 500)
         self.pad.setValue(int(st.mask_pad_px))
@@ -154,6 +184,36 @@ class ProcessDialog(QDialog):
         lay.addWidget(bb)
         self.setMinimumWidth(560)
 
+    def _auto_toggled(self, on: bool):
+        if on and self.info is not None:
+            self.block.setValue(recommended_block(self.info.width, self.info.height))
+        self.block.setEnabled(not on)
+        self.block_slider.setEnabled(not on)
+        self._update_preview()
+
+    def _update_preview(self, *_):
+        """Show the chosen style and strength on a real frame of this video (an ellipse in the middle stands in for a target).
+        Same code as the worker (src.mosaic.apply_mosaic), applied at the video's full resolution, then cropped for display."""
+        if self.info is None:
+            return
+        try:
+            if self._frame is None:
+                self._frame = read_frame_at(self.info, min(self.info.nb_frames - 1, max(0, self.info.nb_frames // 10)))
+            frame = self._frame.copy()
+            h, w = frame.shape[:2]
+            mask = np.zeros((h, w), bool)
+            cy, cx = h // 2, w // 2
+            ry, rx = max(8, h // 8), max(8, h // 10)
+            yy, xx = np.ogrid[:h, :w]
+            mask[((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0] = True
+            apply_mosaic(frame, mask, self.style.currentText(), self.block.value())
+            y0, y1, x0, x1 = max(0, cy - 2 * ry), min(h, cy + 2 * ry), max(0, cx - 3 * rx), min(w, cx + 3 * rx)
+            crop = np.ascontiguousarray(frame[y0:y1, x0:x1][:, :, ::-1])             # decoded frames are BGR
+            img = QImage(crop.data, crop.shape[1], crop.shape[0], crop.strides[0], QImage.Format.Format_RGB888)
+            self.preview.setPixmap(QPixmap.fromImage(img).scaled(520, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        except Exception as e:  # noqa: BLE001
+            self.preview.setText(f"preview unavailable: {e}")
+
     def _browse_ckpt(self):
         p, _ = QFileDialog.getOpenFileName(self, "SAM 2 checkpoint", os.path.join(PROJECT_ROOT, "models"), "Checkpoint (*.pt)")
         if p:
@@ -169,7 +229,7 @@ class ProcessDialog(QDialog):
             sam2_checkpoint=self.ckpt.text().strip(), output=self.out.text().strip(), chunk_size=self.chunk.value(),
             analysis_width=int(self.aw.currentData()), use_nudenet=self.nude.isChecked(), detect_every=self.every.value(),
             det_threshold=round(self.thr.value(), 3), fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
-            block=self.block.value(), mosaic_style=self.style.currentText(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
+            block=self.block.value(), block_auto=self.block_auto.isChecked(), mosaic_style=self.style.currentText(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
             max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentText(),
             keep_chunks=self.keep.isChecked())
 

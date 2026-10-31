@@ -321,7 +321,7 @@ class MainWindow(QMainWindow):
                 return
         settings = self.last_settings
         if settings is None:
-            dlg = ProcessDialog(self, self.info.path, self._points_for_job() is not None, self.info.nb_frames)
+            dlg = ProcessDialog(self, self.info.path, self._points_for_job() is not None, self.info.nb_frames, info=self.info)
             dlg.resume.setChecked(True)
             if not dlg.exec():
                 return
@@ -438,7 +438,7 @@ class MainWindow(QMainWindow):
             if choice == "save" and not self.save_points():
                 return
         needs_sam2 = self._points_for_job() is not None
-        dlg = ProcessDialog(self, self.info.path, needs_sam2, self.info.nb_frames)
+        dlg = ProcessDialog(self, self.info.path, needs_sam2, self.info.nb_frames, info=self.info)
         if dlg.exec():
             self.start_processing(dlg.settings())
 

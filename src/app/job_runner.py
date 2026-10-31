@@ -52,6 +52,7 @@ class ProcessSettings:
     fail_closed: bool = True
     fail_closed_mode: str = "bbox"
     block: int = 32
+    block_auto: bool = True     # GUI only: choose block from the video resolution (the worker always receives the resulting number)
     mosaic_style: str = "pixelate"
     mask_pad_px: float = 24.0
     keep_audio: bool = True

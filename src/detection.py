@@ -19,10 +19,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-DEFAULT_CLASSES = [
-    "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED",
-    "BUTTOCKS_EXPOSED", "ANUS_EXPOSED",
-]
+DEFAULT_CLASSES = ["FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED"]
 
 
 def supported_labels() -> List[str]:

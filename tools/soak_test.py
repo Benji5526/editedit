@@ -45,10 +45,22 @@ def kill_tree(pid: int):
     subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
 
 
+def dir_gb(path: str) -> float:
+    total = 0
+    for r, _, fs in os.walk(path):
+        for f in fs:
+            try:
+                total += os.path.getsize(os.path.join(r, f))
+            except OSError:
+                pass
+    return total / 2 ** 30
+
+
 def run_job(args, env, kill_after_chunk=None, label=""):
     """Run censor_video.py, collect progress events; optionally kill the whole process tree after a chunk."""
     errf = open(os.path.join(args.dir, f"stderr_{label}.txt"), "w", encoding="utf-8")
-    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "censor_video.py"), *args.cmd], cwd=ROOT, stdout=subprocess.PIPE, stderr=errf,
+    prog = [args.worker] if args.worker else [sys.executable, os.path.join(ROOT, "censor_video.py")]
+    p = subprocess.Popen([*prog, *args.cmd], cwd=os.path.dirname(args.worker) if args.worker else ROOT, stdout=subprocess.PIPE, stderr=errf,
                          text=True, encoding="utf-8", env=env)
     events, killed = [], False
     t0 = time.time()
@@ -59,6 +71,8 @@ def run_job(args, env, kill_after_chunk=None, label=""):
         events.append(ev)
         if ev["event"] == "chunk_done":
             done = ev["chunk"] + 1
+            if done % 5 == 0:
+                args.work_gb.append((label, done, round(dir_gb(args.work_dir), 3)))
             if done % 10 == 0 or done == ev["chunks"]:
                 print(f"[{label}] chunk {done}/{ev['chunks']}  rss={ev.get('rss_mb')} MB  gpu_peak={ev.get('cuda_peak_mb')} MB  "
                       f"{ev['seconds']}s/chunk  elapsed {time.time() - t0:.0f}s", flush=True)
@@ -83,6 +97,7 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=120)
     ap.add_argument("--kill-at-fraction", type=float, default=0.3, help="hard-kill the worker after this fraction of the chunks")
     ap.add_argument("--sam2-checkpoint", default=os.path.join(ROOT, "models", "sam2.1_hiera_small.pt"))
+    ap.add_argument("--worker", help="run this VideoCensorWorker.exe (packaged build) instead of python censor_video.py")
     ap.add_argument("--no-nudenet", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the intermediate chunks and the generated video")
     a = ap.parse_args()
@@ -105,6 +120,7 @@ def main():
     save_points(pts, info, [{"obj_id": 1, "frame_idx": f0, "x": box_x(f0) + BOX / 2, "y": 900 + BOX / 2, "label": 1}])
     out = os.path.join(a.dir, "soak_out.mp4")
     work, logs = os.path.join(a.dir, "work"), os.path.join(a.dir, "logs")
+    a.work_dir, a.work_gb = work, []
     for d in (work, logs):
         if os.path.isdir(d):
             import shutil
@@ -112,14 +128,19 @@ def main():
     if os.path.exists(out):
         os.remove(out)
     a.cmd = [video, "--progress-json", "--points", pts, "--sam2-checkpoint", a.sam2_checkpoint, "-o", out, "--work-dir", work, "--log-dir", logs,
-             "--chunk-size", str(a.chunk_size), "--fail-closed", "--preset", "veryfast", "--keep-temp"]
+             "--chunk-size", str(a.chunk_size), "--fail-closed", "--preset", "veryfast"]
+    if a.keep:
+        a.cmd.append("--keep-temp")
     if a.no_nudenet:
         a.cmd.append("--no-nudenet")
     env = dict(os.environ, PYTHONUNBUFFERED="1", TQDM_DISABLE="1")
+    if a.worker:                                     # packaged run: no Python anywhere on PATH, like a user's machine
+        env = {k: v for k, v in env.items() if not k.upper().startswith("PYTHON") or k == "PYTHONUNBUFFERED"}
+        env["PATH"] = os.pathsep.join(d for d in env["PATH"].split(os.pathsep) if d and not os.path.isfile(os.path.join(d, "python.exe")))
     n_chunks = -(-info.nb_frames // a.chunk_size)
     kill_after = max(2, int(n_chunks * a.kill_at_fraction))
     report = {"seconds": seconds, "frames": info.nb_frames, "chunks": n_chunks, "chunk_size": a.chunk_size,
-              "nudenet": not a.no_nudenet, "started": time.strftime("%F %T")}
+              "nudenet": not a.no_nudenet, "worker": a.worker or "python censor_video.py", "started": time.strftime("%F %T")}
 
     # ---- run 1: killed hard
     rc1, ev1, killed, dt1 = run_job(a, env, kill_after_chunk=kill_after, label="run1")
@@ -200,6 +221,9 @@ def main():
                       "box_texture_out": round(t_o, 1), "background_ratio": round(b_o / max(b_s, 1e-6), 2),
                       "mosaicked": bool(t_o < 0.35 * t_s and b_o > 0.5 * b_s)})
     report["spot_checks"] = spots
+    report["work_dir_gb_samples"] = a.work_gb
+    report["work_dir_gb_max"] = max((g for _, _, g in a.work_gb), default=None)
+    print(f"work dir size while running: max {report['work_dir_gb_max']} GB (keep-temp={a.keep}); samples {a.work_gb[::6]}", flush=True)
     n_ok = sum(x["mosaicked"] for x in spots)
     print(f"spot checks: {n_ok}/{len(spots)} frames mosaicked at the box (before the kill: "
           f"{sum(x['mosaicked'] for x in spots if not x['after_resume'])}/{sum(not x['after_resume'] for x in spots)}, after the resume: "
