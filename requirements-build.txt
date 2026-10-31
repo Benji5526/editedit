@@ -1,0 +1,3 @@
+# Only needed to build the Windows application (python tools/build_exe.py)
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

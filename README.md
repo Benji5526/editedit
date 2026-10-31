@@ -278,6 +278,36 @@ python -m pytest tests -q
 
 Neither the test double nor the synthetic clip says anything about NudeNet's detection quality or about SAM 2 on real footage.
 
+## Packaging (Stage 6: Windows EXE)
+
+Build (from the project virtual environment, `pip install -r requirements-build.txt` once):
+
+    python tools/build_exe.py            # add --clean for a fresh build; output: dist\VideoCensor
+    python tools/verify_build.py         # smoke test of the built folder (31 checks, ~2 min, needs models\sam2.1_hiera_small.pt)
+
+* **Two executables, one folder (onedir)**: `VideoCensor.exe` (windowed GUI, no torch/onnxruntime) starts `VideoCensorWorker.exe` (console, SAM 2 + NudeNet)
+  as a separate process, like the source checkout starts `censor_video.py`. Onedir was chosen over onefile so start-up does not unpack ~4 GB each time.
+* Size of the last build: **4.35 GB** (dominated by the CUDA libraries of the PyTorch wheel).
+* Next to the exes (created by the build, never inside `_internal`): `models\`, `input\`, `output\`, `logs\`, `temp\`, `config\`, `ffmpegin\`.
+* **Not bundled**: model weights (download `sam2.1_hiera_small.pt` into `models\`), videos, and FFmpeg/FFprobe (put them in `ffmpegin\` or on PATH).
+  The target PC needs only an NVIDIA driver, no Python or CUDA toolkit. End-user text: `packaging\READ_ME_FIRST.txt`; licenses: `THIRD_PARTY_NOTICES.md`.
+* The exes are **unsigned**; Windows SmartScreen may warn on first start.
+* Uninstall = delete the folder.
+
+Verified on this machine (Windows 11, RTX 4070 Ti): layout, GUI start, worker `--help` and a real SAM 2 job in an environment with no Python on PATH, the GUI exe
+running jobs through the worker exe (NudeNet-only and SAM 2, via `VideoCensor.exe <video> --selftest-job report.json`), frame count, bit-identical audio, review log.
+**Not verified**: a clean machine without development tools, other GPUs/drivers, WSL2, long videos in the packaged build, antivirus interaction.
+
+### SAM 2 package provenance
+
+`requirements.txt` pins `sam2==1.1.0` from PyPI. That PyPI project is **not published by Meta** (author in its metadata: Jorge Insua).
+**Compared on 2026-10-31** against a shallow clone of <https://github.com/facebookresearch/sam2> at commit `2b90b9f` (2024-12-15, current `main` of the clone):
+every file under `sam2/` (all `.py`, the `.cu` source and all `.yaml` configs, 39 files differed byte-wise) is **identical after ignoring line endings**
+(the clone had CRLF from Windows checkout). The four `sam2/sam2_hiera_*.yaml` files are symlinks in the official repo; the installed copies equal the configs they point to.
+Not covered by this comparison: other commits/tags of the official repo, the compiled `sam2._C` extension (not built on Windows), the package's dependencies, and the
+`dist-info` metadata; the check was a text diff, not a security audit. The weights are downloaded from the official source. To remove the third-party hop anyway,
+install from the official repository (`pip install git+https://github.com/facebookresearch/sam2.git`) and re-run the tests and `tools/verify_build.py`.
+
 ## Limitations
 * Real SAM 2 tracking was verified only on synthetic clips (a flat box on a noisy background). On your footage it is **unverified**; occlusion, fast motion, scale change, look-alike objects and re-entry are the usual weak spots, and a recovery after a long loss is always logged as "verify it is the same object".
 * SAM 2 `sam2._C` (hole-filling post-processing) is not built on Windows with the PyPI wheel; SAM 2 runs without it (upstream says this rarely matters).

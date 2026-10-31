@@ -26,9 +26,16 @@ class VideoError(RuntimeError):
 
 
 def find_tool(name: str) -> str:
+    """ffmpeg/ffprobe: first in a folder next to the application (ffmpeg\\bin), then on the PATH."""
+    from .paths import bundled_tool_dirs
+    for d in bundled_tool_dirs():
+        for cand in (os.path.join(d, name + ".exe"), os.path.join(d, name)):
+            if os.path.isfile(cand):
+                return cand
     path = shutil.which(name)
     if not path:
-        raise VideoError(f"'{name}' not found on PATH. Install FFmpeg (includes ffprobe) and retry.")
+        raise VideoError(f"'{name}' not found. Put FFmpeg (ffmpeg.exe and ffprobe.exe) in the 'ffmpeg\\bin' folder next to the application "
+                         f"or install it and add it to the PATH.")
     return path
 
 

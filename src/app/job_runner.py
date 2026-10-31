@@ -18,7 +18,9 @@ from typing import List, Optional
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 PROGRESS_PREFIX = "@@PROGRESS "
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.paths import app_root, worker_command
+
+PROJECT_ROOT = app_root()          # project folder, or the folder of the exe when packaged (models/, logs/, temp/, output/ live there)
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -184,10 +186,9 @@ class JobRunner(QObject):
         p.finished.connect(self._on_finished)
         p.errorOccurred.connect(self._on_error)
         self._proc = p
-        if command:
-            p.start(command[0], list(command[1:]))
-        else:
-            p.start(child_python(), [os.path.join(PROJECT_ROOT, "censor_video.py")] + args)
+        cmd = list(command) if command else worker_command() + args       # source: python censor_video.py ...; packaged: VideoCensorWorker.exe ...
+        self._program = cmd[0]
+        p.start(cmd[0], cmd[1:])
         return True
 
     def cancel(self):
@@ -234,7 +235,7 @@ class JobRunner(QObject):
 
     def _on_error(self, err):
         if err == QProcess.ProcessError.FailedToStart and self._proc is not None:
-            self._finish({"exit_code": -1, "status": "failed", "reason": f"could not start the worker process ({child_python()})"})
+            self._finish({"exit_code": -1, "status": "failed", "reason": f"could not start the worker process ({getattr(self, '_program', None) or worker_command()[0]})"})
 
     def _on_finished(self, code, _status):
         self._read()

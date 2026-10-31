@@ -33,3 +33,7 @@ samples/*
 backups/
 *.zip
 *.7z
+
+# PyInstaller output (rebuilt by tools/build_exe.py)
+build/
+dist/
