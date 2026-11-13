@@ -53,6 +53,8 @@ Logs and review files contain local file paths and file names; keep them private
 `censor_video.py` refuses to silently fall back to CPU.
 
 ## Desktop app (in progress: stages 1-4 of 6)
+
+**The app's interface is in Korean** (menus, buttons, dialogs, hints, error messages) with a dark, editor-style layout: a toolbar on top, the objects (`대상`) on the left, the preview with transport controls and the timeline in the middle, properties (`속성`) and review (`검수`) as tabs on the right, the processing panel (`처리`) at the bottom. The English names used below map to: Process = `처리`, Start processing = `처리 시작`, Targets = `대상`, Review = `검수`, View = `보기`, Keep intermediate chunks = `중간 청크 보관`, Resume / reuse an earlier run = `이전 실행을 이어하기 / 재사용`. Still English: failure reasons reported by the worker process, the review event type names, and this README.
 ```powershell
 python app.py [video]        # or double-click run_app.bat (no console window)
 ```

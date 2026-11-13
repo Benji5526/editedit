@@ -6,7 +6,7 @@ from typing import List
 
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox, QLabel, QTableWidget, QTableWidgetItem, QVBoxLayout)
 
-HEADERS = ["Started", "Status", "Chunks", "Reused", "Points", "Output", "Error"]
+HEADERS = ["시작 시각", "상태", "청크", "재사용", "포인트", "결과 파일", "오류"]
 
 
 def job_rows(jobs: List[dict]) -> List[List[str]]:
@@ -22,7 +22,7 @@ def job_rows(jobs: List[dict]) -> List[List[str]]:
 class JobsDialog(QDialog):
     def __init__(self, parent, jobs: List[dict], video_name: str):
         super().__init__(parent)
-        self.setWindowTitle(f"Processing jobs - {video_name}")
+        self.setWindowTitle(f"처리 작업 기록 - {video_name}")
         rows = job_rows(jobs)
         self.table = QTableWidget(len(rows), len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
@@ -34,8 +34,8 @@ class JobsDialog(QDialog):
                 self.table.setItem(r, c, QTableWidgetItem(v))
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
-        note = QLabel("Newest first. This list is an index kept in logs/jobs.sqlite; whether chunks can really be reused is checked "
-                      "from the files in temp/ when a job is resumed." if rows else "No jobs recorded for this video yet.")
+        note = QLabel("최신 작업이 위에 있습니다. 이 목록은 logs/jobs.sqlite에 보관되는 색인이며, 청크를 실제로 재사용할 수 있는지는 "
+                      "작업을 이어할 때 temp/ 폴더의 파일로 다시 확인합니다." if rows else "이 영상으로 기록된 작업이 아직 없습니다.")
         note.setWordWrap(True)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.reject)

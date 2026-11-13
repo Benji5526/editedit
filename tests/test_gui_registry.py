@@ -39,7 +39,7 @@ def test_cancelled_job_is_offered_for_resume_and_listed(win, tmp_path):
     j = win.resumable_job
     assert j is not None and j["status"] == "cancelled" and 0 < j["chunks_done"] < 16 and j["n_chunks"] == 16
     assert win.act_resume_job.isEnabled()
-    assert "Interrupted job found" in win.statusBar().currentMessage()
+    assert "중단된 작업이 있습니다" in win.statusBar().currentMessage()
 
     jobs = JobDB(db_path_for(st.log_dir)).jobs_for_input(win.info.fingerprint)
     rows = job_rows(jobs)
@@ -51,7 +51,7 @@ def test_cancelled_job_is_offered_for_resume_and_listed(win, tmp_path):
     texts = []
     win.ask_confirm = lambda t: texts.append(t) or True
     win.act_resume_job.trigger()
-    assert pump(lambda: bool(texts), 60) and "frames are reused" in texts[0]
+    assert pump(lambda: bool(texts), 60) and "프레임은 재사용" in texts[0]
     win.last_result = None
     assert finish(win)
     assert win.last_result["status"] == "completed_no_flags"
@@ -74,7 +74,7 @@ def test_interrupted_job_is_found_again_when_the_video_is_reopened(win, tmp_path
     w2.last_settings = st
     try:
         open_clip(w2, win.test_video)
-        assert w2.resumable_job is not None and "Interrupted job found" in w2.statusBar().currentMessage()
+        assert w2.resumable_job is not None and "중단된 작업이 있습니다" in w2.statusBar().currentMessage()
     finally:
         w2.close()
 

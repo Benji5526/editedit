@@ -57,7 +57,7 @@ class ProcessDialog(QDialog):
         super().__init__(parent)
         self.info = info
         self._frame = None
-        self.setWindowTitle("Process video")
+        self.setWindowTitle("영상 처리 설정")
         self.video_path, self.needs_sam2, self.n_frames = video_path, needs_sam2, n_frames
         st = defaults or load_last_settings()
         if not st.sam2_checkpoint:
@@ -77,71 +77,71 @@ class ProcessDialog(QDialog):
 
         self.ckpt = QLineEdit(st.sam2_checkpoint)
         self.ckpt.setEnabled(needs_sam2)
-        form.addRow("SAM 2 checkpoint", path_row(self.ckpt, self._browse_ckpt))
+        form.addRow("SAM 2 체크포인트", path_row(self.ckpt, self._browse_ckpt))
         self.out = QLineEdit(st.output)
-        form.addRow("Output file", path_row(self.out, self._browse_out))
+        form.addRow("결과 파일", path_row(self.out, self._browse_out))
 
         self.chunk = QSpinBox()
         self.chunk.setRange(10, 1000)
         self.chunk.setValue(st.chunk_size)
-        self.chunk.setToolTip("Frames per chunk. 120-240 recommended; larger = fewer boundaries but more RAM/VRAM.")
-        form.addRow("Chunk size (frames)", self.chunk)
+        self.chunk.setToolTip("청크 하나의 프레임 수입니다. 120-240을 권장합니다. 클수록 청크 경계는 줄지만 RAM/VRAM을 더 씁니다.")
+        form.addRow("청크 크기 (프레임)", self.chunk)
         self.aw = QComboBox()
         for w in (1280, 1920, 2560, 3840):
             self.aw.addItem(str(w), w)
         self.aw.setCurrentText(str(st.analysis_width))
-        form.addRow("Analysis width (px)", self.aw)
+        form.addRow("분석 너비 (px)", self.aw)
 
-        self.nude = QCheckBox("Also detect with NudeNet (supported classes only)")
+        self.nude = QCheckBox("NudeNet으로도 탐지 (지원하는 종류만)")
         self.nude.setChecked(st.use_nudenet)
         form.addRow(self.nude)
         self.every = QSpinBox()
         self.every.setRange(1, 60)
         self.every.setValue(st.detect_every)
-        form.addRow("  detect every N frames (1 = all)", self.every)
+        form.addRow("  N프레임마다 탐지 (1 = 매 프레임)", self.every)
         self.thr = QDoubleSpinBox()
         self.thr.setRange(0.05, 0.95)
         self.thr.setSingleStep(0.05)
         self.thr.setValue(st.det_threshold)
-        form.addRow("  threshold", self.thr)
+        form.addRow("  임계값", self.thr)
         self.tiles = QSpinBox()
         self.tiles.setRange(1, 4)
         self.tiles.setValue(st.nudenet_tiles)
-        self.tiles.setToolTip("1 = whole frame only. N > 1 also scans an N x N grid of overlapping crops, so small regions get more "
-                              "resolution. Slower: about 1 + N x N detector runs per frame.")
-        form.addRow("  tiles (N x N extra crops, 1 = off)", self.tiles)
+        self.tiles.setToolTip("1 = 프레임 전체만 봅니다. N이 1보다 크면 겹치는 N x N 조각도 추가로 살펴서 작은 영역을 더 높은 "
+                              "해상도로 봅니다. 느려집니다: 프레임당 탐지를 약 1 + N x N 번 실행합니다.")
+        form.addRow("  타일 (N x N 조각 추가, 1 = 끔)", self.tiles)
         self.nmodel = QLineEdit(st.nudenet_model)
-        self.nmodel.setPlaceholderText("bundled 320 px model")
-        self.nmodel.setToolTip("Leave empty for the model that ships with NudeNet. To use a larger one (e.g. 640m), download its "
-                               ".onnx into models/ and select it here, then set its input size below.")
-        form.addRow("  model file (.onnx, optional)", path_row(self.nmodel, self._browse_nmodel))
+        self.nmodel.setPlaceholderText("기본 내장 320 px 모델")
+        self.nmodel.setToolTip("비워 두면 NudeNet에 들어 있는 기본 모델을 씁니다. 더 큰 모델(예: 640m)을 쓰려면 .onnx 파일을 "
+                               "models/ 폴더에 받아 여기서 고르고, 아래에서 입력 크기를 맞춰 주세요.")
+        form.addRow("  모델 파일 (.onnx, 선택)", path_row(self.nmodel, self._browse_nmodel))
         self.nres = QComboBox()
         for r in (320, 640):
             self.nres.addItem(str(r), r)
         self.nres.setCurrentText(str(st.nudenet_res) if st.nudenet_model else "320")
-        self.nres.setToolTip("Input size the selected model was exported for. Ignored (320) when no model file is selected.")
-        form.addRow("  model input size (px)", self.nres)
+        self.nres.setToolTip("선택한 모델이 만들어진 입력 크기입니다. 모델 파일을 고르지 않으면 무시되고 320으로 고정됩니다.")
+        form.addRow("  모델 입력 크기 (px)", self.nres)
         self.nmodel.textChanged.connect(lambda t: self.nres.setEnabled(bool(t.strip())))
         self.nres.setEnabled(bool(st.nudenet_model))
 
-        self.fc = QCheckBox("Fail-closed: cover uncertain frames conservatively")
+        self.fc = QCheckBox("안전 모드(fail-closed): 불확실한 프레임은 넓게 가리기")
         self.fc.setChecked(st.fail_closed)
         form.addRow(self.fc)
         self.fcm = QComboBox()
         self.fcm.addItems(["bbox", "full"])
         self.fcm.setCurrentText(st.fail_closed_mode)
-        form.addRow("  uncertain region", self.fcm)
-        form.addRow(QLabel("  Fail-closed can cover more than the target (up to whole frames). It does not catch objects no model sees."))
+        form.addRow("  불확실할 때 가릴 범위", self.fcm)
+        form.addRow(QLabel("  안전 모드는 대상보다 넓게(최대 화면 전체) 가릴 수 있습니다. 모델이 아예 못 본 대상은 잡지 못합니다."))
 
         self.style = QComboBox()
         self.style.addItems(["pixelate", "blur", "solid"])
         self.style.setCurrentText(st.mosaic_style)
-        self.style.setToolTip("pixelate and solid destroy the content; blur is the weakest")
-        form.addRow("Mosaic style", self.style)
-        self.block_auto = QCheckBox("Auto: choose the strength from the video resolution")
+        self.style.setToolTip("pixelate(픽셀)와 solid(단색)는 내용을 완전히 없앱니다. blur(흐림)가 가장 약합니다.")
+        form.addRow("모자이크 형태", self.style)
+        self.block_auto = QCheckBox("자동: 영상 해상도에 맞춰 강도 선택")
         self.block_auto.setChecked(st.block_auto and info is not None)
         self.block_auto.setEnabled(info is not None)
-        self.block_auto.setToolTip("About 1/60 of the longer side (1920 -> 32, 3840 -> 64). A rule of thumb: check the preview.")
+        self.block_auto.setToolTip("긴 변의 약 1/60입니다 (1920 -> 32, 3840 -> 64). 어림값이므로 미리보기로 확인하세요.")
         form.addRow(self.block_auto)
         self.block = QSpinBox()
         self.block.setRange(4, 256)
@@ -154,7 +154,7 @@ class ProcessDialog(QDialog):
         sh.setContentsMargins(0, 0, 0, 0)
         sh.addWidget(self.block_slider, 1)
         sh.addWidget(self.block)
-        form.addRow("Mosaic strength (block size / blur, px)", sw)
+        form.addRow("모자이크 강도 (블록 크기 / 흐림, px)", sw)
         self.preview = QLabel("")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setMinimumHeight(180 if info is not None else 0)
@@ -169,8 +169,8 @@ class ProcessDialog(QDialog):
         self.pad = QSpinBox()
         self.pad.setRange(0, 500)
         self.pad.setValue(int(st.mask_pad_px))
-        form.addRow("Mask padding (px)", self.pad)
-        self.audio = QCheckBox("Keep audio")
+        form.addRow("마스크 여백 (px)", self.pad)
+        self.audio = QCheckBox("오디오 유지")
         self.audio.setChecked(st.keep_audio)
         form.addRow(self.audio)
         self.enc = QComboBox()
@@ -178,26 +178,26 @@ class ProcessDialog(QDialog):
         if nvenc_available():
             self.enc.addItem("h264_nvenc")
         self.enc.setCurrentText(st.encoder if self.enc.findText(st.encoder) >= 0 else "libx264")
-        form.addRow("Encoder", self.enc)
+        form.addRow("인코더", self.enc)
         self.test_n = QSpinBox()
         self.test_n.setRange(0, max(1, n_frames))
-        self.test_n.setSpecialValueText("all frames")
+        self.test_n.setSpecialValueText("전체 프레임")
         self.test_n.setValue(0)
-        form.addRow("Only the first N frames (test run)", self.test_n)
-        self.keep = QCheckBox("Keep intermediate chunks (fast re-processing after re-clicks; needs disk space ~ output size)")
+        form.addRow("앞의 N프레임만 처리 (시험 실행)", self.test_n)
+        self.keep = QCheckBox("중간 청크 보관 (수정 후 빠른 재처리, 결과 영상 크기만큼 디스크 필요)")
         self.keep.setChecked(st.keep_chunks)
         form.addRow(self.keep)
-        self.resume = QCheckBox("Resume / reuse an earlier run of this video (changed points redo the affected chunks; "
-                                "changed mosaic style, strength, padding or encoder only redo the mosaic)")
-        self.resume.setToolTip("Needs the intermediate chunks of the earlier run (\"Keep intermediate chunks\"). Other settings "
-                               "(chunk size, analysis width, NudeNet, fail-closed on/off, model) must be the same.")
+        self.resume = QCheckBox("이 영상의 이전 실행을 이어하기 / 재사용 (포인트를 바꾸면 해당 청크부터 다시 처리, "
+                                "모자이크 형태·강도·여백·인코더만 바꾸면 모자이크만 다시 적용)")
+        self.resume.setToolTip("이전 실행의 중간 청크가 있어야 합니다 (\"중간 청크 보관\"). 그 밖의 설정"
+                               "(청크 크기, 분석 너비, NudeNet, 안전 모드 켬/끔, 모델)은 같아야 합니다.")
         form.addRow(self.resume)
 
         self.error = QLabel("")
-        self.error.setStyleSheet("color: #c0392b")
+        self.error.setStyleSheet("color: #ff6b6b")
         self.error.setWordWrap(True)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Start")
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("시작")
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         lay = QVBoxLayout(self)
@@ -234,20 +234,20 @@ class ProcessDialog(QDialog):
             img = QImage(crop.data, crop.shape[1], crop.shape[0], crop.strides[0], QImage.Format.Format_RGB888)
             self.preview.setPixmap(QPixmap.fromImage(img).scaled(520, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         except Exception as e:  # noqa: BLE001
-            self.preview.setText(f"preview unavailable: {e}")
+            self.preview.setText(f"미리보기를 표시할 수 없습니다: {e}")
 
     def _browse_ckpt(self):
-        p, _ = QFileDialog.getOpenFileName(self, "SAM 2 checkpoint", os.path.join(PROJECT_ROOT, "models"), "Checkpoint (*.pt)")
+        p, _ = QFileDialog.getOpenFileName(self, "SAM 2 체크포인트", os.path.join(PROJECT_ROOT, "models"), "체크포인트 (*.pt)")
         if p:
             self.ckpt.setText(p)
 
     def _browse_nmodel(self):
-        p, _ = QFileDialog.getOpenFileName(self, "NudeNet model", os.path.join(PROJECT_ROOT, "models"), "ONNX model (*.onnx)")
+        p, _ = QFileDialog.getOpenFileName(self, "NudeNet 모델", os.path.join(PROJECT_ROOT, "models"), "ONNX 모델 (*.onnx)")
         if p:
             self.nmodel.setText(p)
 
     def _browse_out(self):
-        p, _ = QFileDialog.getSaveFileName(self, "Output file", self.out.text(), "MP4 (*.mp4)")
+        p, _ = QFileDialog.getSaveFileName(self, "결과 파일", self.out.text(), "MP4 (*.mp4)")
         if p:
             self.out.setText(p)
 
@@ -276,25 +276,25 @@ class ProcessDialog(QDialog):
 def validate_settings(st: ProcessSettings, video_path: str, needs_sam2: bool) -> list:
     probs = []
     if needs_sam2 and not os.path.isfile(st.sam2_checkpoint):
-        probs.append("SAM 2 checkpoint not found. Download one into models/ (see models/README.md) and select it.")
+        probs.append("SAM 2 체크포인트를 찾을 수 없습니다. models/ 폴더에 받아서(models/README.md 참고) 선택하세요.")
     if not st.output:
-        probs.append("Choose an output file.")
+        probs.append("결과 파일을 지정하세요.")
     elif os.path.abspath(st.output) == os.path.abspath(video_path):
-        probs.append("The output must not be the input file.")
+        probs.append("결과 파일이 원본 영상과 같으면 안 됩니다.")
     elif not os.path.isdir(os.path.dirname(os.path.abspath(st.output))):
         try:
             os.makedirs(os.path.dirname(os.path.abspath(st.output)), exist_ok=True)
         except OSError as e:
-            probs.append(f"Cannot create the output folder: {e}")
+            probs.append(f"결과 폴더를 만들 수 없습니다: {e}")
     if not needs_sam2 and not st.use_nudenet:
-        probs.append("Nothing to do: no targets were clicked and NudeNet is off.")
+        probs.append("할 일이 없습니다: 클릭한 대상이 없고 NudeNet도 꺼져 있습니다.")
     if st.use_nudenet:
         if st.nudenet_model and not os.path.isfile(st.nudenet_model):
-            probs.append("NudeNet model file not found. Clear the field to use the bundled model, or select an existing .onnx file.")
+            probs.append("NudeNet 모델 파일을 찾을 수 없습니다. 칸을 비워 기본 모델을 쓰거나, 있는 .onnx 파일을 선택하세요.")
         if not st.nudenet_model and st.nudenet_res != 320:
-            probs.append("The bundled NudeNet model only works at 320 px. Select a model file for another input size.")
+            probs.append("기본 NudeNet 모델은 320 px에서만 동작합니다. 다른 입력 크기를 쓰려면 모델 파일을 선택하세요.")
         if not (1 <= st.nudenet_tiles <= 4):
-            probs.append("NudeNet tiles must be 1-4.")
+            probs.append("NudeNet 타일은 1-4여야 합니다.")
     if not (10 <= st.chunk_size <= 1000):
-        probs.append("Chunk size must be 10-1000 frames.")
+        probs.append("청크 크기는 10-1000프레임이어야 합니다.")
     return probs

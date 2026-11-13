@@ -56,11 +56,13 @@ def main(argv=None) -> int:
     from src.app.main_window import MainWindow
 
     app = QApplication(argv[:1])
+    from src.app.theme import apply_theme
+    apply_theme(app)
 
     def hook(t, v, tb):
         text = "".join(traceback.format_exception(t, v, tb))
         logging.error("unhandled exception:\n%s", text)
-        QMessageBox.critical(None, "Video Censor - unexpected error", f"{v}\n\nDetails were written to logs/app.log")
+        QMessageBox.critical(None, "Video Censor - 예기치 않은 오류", f"{v}\n\n자세한 내용은 logs/app.log에 기록했습니다.")
 
     sys.excepthook = hook
     win = MainWindow()

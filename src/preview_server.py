@@ -52,9 +52,9 @@ def preview_masks(tracker, info, size: Tuple[int, int], frame: int, objects: dic
         oid = int(key)
         pts, labs = o.get("points") or [], [int(v) for v in (o.get("labels") or [])]
         if len(pts) != len(labs) or not pts:
-            skipped[oid] = "no points"
+            skipped[oid] = "점이 없습니다"
         elif 1 not in labs:
-            skipped[oid] = "needs at least one positive (left-click) point"
+            skipped[oid] = "긍정(왼쪽 클릭) 점이 하나 이상 필요합니다"
         else:
             inits.append(Init(oid, 0, [(float(x) * sx, float(y) * sy) for x, y in pts], labs, source="points"))
     if not inits:
@@ -68,7 +68,7 @@ def preview_masks(tracker, info, size: Tuple[int, int], frame: int, objects: dic
     masks = {oid: frames[0] for oid, frames in out.items() if 0 in frames}
     for it in inits:
         if it.obj_id not in masks:
-            skipped[it.obj_id] = "the model returned no mask"
+            skipped[it.obj_id] = "모델이 마스크를 만들지 못했습니다"
     return masks, skipped
 
 

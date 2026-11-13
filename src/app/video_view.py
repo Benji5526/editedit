@@ -38,7 +38,7 @@ class VideoView(QWidget):
         self._frame_size = (0, 0)
         self._points_for_frame: Callable[[], List[dict]] = lambda: []
         self._current_obj: Callable[[], int] = lambda: 1
-        self.message = "Open a video (Ctrl+O)"
+        self.message = "영상을 여세요 (Ctrl+O)"
         self._overlay: Optional[dict] = None
 
     def set_overlay(self, overlay: Optional[dict]):
@@ -98,7 +98,7 @@ class VideoView(QWidget):
         else:
             p.fillRect(target, QColor("#1b1b22"))
             p.setPen(QColor("#9aa0a6"))
-            p.drawText(target, Qt.AlignmentFlag.AlignCenter, "loading frame...")
+            p.drawText(target, Qt.AlignmentFlag.AlignCenter, "프레임 불러오는 중...")
         ov = self._overlay
         if ov:
             for img in ov.get("masks") or []:

@@ -67,7 +67,7 @@ def open_clip(w, path=None):
 
 
 def test_starts_without_video(win):
-    assert win.info is None and "no video" in win.pos_label.text()
+    assert win.info is None and "영상 없음" in win.pos_label.text()
     assert not win.slider.isEnabled() and all(not b.isEnabled() for b in win._nav_buttons)
     win.step(1)
     win.toggle_play()                       # must be harmless
@@ -78,7 +78,7 @@ def test_starts_without_video(win):
 def test_open_video_shows_first_frame(win):
     open_clip(win)
     assert (win.info.width, win.info.height, win.info.nb_frames) == (W, H, 160)
-    assert win.slider.maximum() == 159 and "frame 0/159" in win.pos_label.text()
+    assert win.slider.maximum() == 159 and "프레임 0/159" in win.pos_label.text()
     assert shown_code(win) == 0
     assert "640x360" in win.info_label.text() and win.slider.isEnabled()
 
@@ -99,7 +99,7 @@ def test_stepping_and_jumping_show_the_right_frame(win):
     win.step_seconds(1)
     assert win.frame_idx == 130 and pump(lambda: shown_code(win) == 130)
     win.slider.setValue(37)                                   # slider drives the same path
-    assert pump(lambda: shown_code(win) == 37) and "frame 37/159" in win.pos_label.text()
+    assert pump(lambda: shown_code(win) == 37) and "프레임 37/159" in win.pos_label.text()
     win.goto(-50)
     assert win.frame_idx == 0
     win.goto(10_000)
@@ -110,7 +110,7 @@ def test_stepping_and_jumping_show_the_right_frame(win):
 def test_playback_advances_and_stops(win):
     open_clip(win)
     win.toggle_play()
-    assert win.playing and win.play_btn.text() == "Pause"
+    assert win.playing and win.play_btn.text() == "일시정지"
     assert pump(lambda: win.frame_idx > 15)
     win.toggle_play()
     assert not win.playing
@@ -169,7 +169,7 @@ def test_save_and_reload_points(win, tmp_path):
         open_clip(w2, win.test_video)
         assert len(w2.store.points) == 3 and not w2.dirty                   # auto-loaded
         assert [o for o in w2.store.objects] == [1, 2]
-        assert "loaded 3 points" in w2.statusBar().currentMessage()
+        assert "점 3개를 불러왔습니다" in w2.statusBar().currentMessage()
     finally:
         w2.close()
 
@@ -192,7 +192,7 @@ def test_points_of_another_file_are_ignored(win, video_noaudio, tmp_path):
     w2.show_error = lambda t: None
     try:
         open_clip(w2, other)
-        assert w2.store.points == [] and "ignored" in w2.statusBar().currentMessage()
+        assert w2.store.points == [] and "무시됨" in w2.statusBar().currentMessage()
     finally:
         w2.close()
 
@@ -235,7 +235,7 @@ def test_per_object_mosaic_settings_are_edited_saved_and_reloaded(win):
     assert win.save_points() and not win.dirty
     assert json.load(open(path))["version"] == 2 and load_object_styles(path) == {2: {"style": "solid", "block": 48, "pad_px": 30.0}}
     win.store.styles.clear()
-    assert win._try_load_points(path, quiet=True).strip().startswith("- loaded 2 points")
+    assert win._try_load_points(path, quiet=True).strip().endswith("점 2개를 불러왔습니다")
     assert win.store.styles == {2: {"style": "solid", "block": 48, "pad_px": 30.0}} and not win.dirty
     win.obj_list.setCurrentRow(1)
     assert win.obj_style.currentData() == "solid" and win.obj_block.value() == 48 and win.obj_pad.value() == 30
@@ -245,6 +245,31 @@ def test_per_object_mosaic_settings_are_edited_saved_and_reloaded(win):
     win._set_job_running(False)
     win.delete_object()
     assert win.store.styles == {}
+
+
+def test_editor_layout_and_dark_theme(qapp, win):
+    from PySide6.QtCore import Qt
+    from src.app.theme import apply_theme
+    old_sheet, old_palette, old_font = qapp.styleSheet(), qapp.palette(), qapp.font()
+    try:
+        apply_theme(qapp)                                                     # the stylesheet parses and the window still paints
+        assert "QToolButton#primary" in qapp.styleSheet() and not win.grab().isNull()
+    finally:
+        qapp.setStyleSheet(old_sheet)
+        qapp.setPalette(old_palette)
+        qapp.setFont(old_font)
+    assert win.dockWidgetArea(win.targets_dock) == Qt.DockWidgetArea.LeftDockWidgetArea          # objects on the left
+    assert win.dockWidgetArea(win.props_dock) == Qt.DockWidgetArea.RightDockWidgetArea           # properties + review tab on the right
+    assert win.review_dock in win.tabifiedDockWidgets(win.props_dock)
+    assert win.style_box.parent() is win.props_dock.widget() and win.info_label.parent() is win.props_dock.widget()
+    assert win.slider.parent() is win.timeline                                                   # the timeline strip under the preview
+    acts = win.toolbar.actions()
+    assert win.act_open_video in acts and win.act_live in acts and win.act_last in acts and win.act_cancel in acts
+    assert win.start_btn.defaultAction() is win.act_start and win.start_btn.text() == "처리 시작"
+    win._set_job_running(True)                                                # toolbar buttons follow the menu actions
+    assert not win.start_btn.isEnabled()
+    win._set_job_running(False)
+    assert win.start_btn.isEnabled()
 
 
 def test_undo_clear_objects(win):

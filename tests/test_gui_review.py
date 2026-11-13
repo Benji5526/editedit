@@ -49,7 +49,7 @@ def test_review_table_filters_navigation_and_reviewed_marks(win, tmp_path):
     rp = win.review_panel
     types = [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
     assert "tracking_lost_mid_frame" in types and "tracking_recovered" in types and "chunk_boundary_resumed" not in types   # info hidden
-    assert "consistent" in rp.banner.text() and win.slider._flags                                # ticks on the slider
+    assert "일치합니다" in rp.banner.text() and win.slider._flags                                # ticks on the slider
     rp.sev.setCurrentIndex(2)                                                                    # everything incl. info
     assert "chunk_boundary_resumed" in [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
     rp.sev.setCurrentIndex(1)                                                                    # errors only
@@ -72,7 +72,7 @@ def test_review_table_filters_navigation_and_reviewed_marks(win, tmp_path):
     assert win.frame_idx == 70
     win.goto(159)
     win.next_flag()
-    assert "No more flags" in win.statusBar().currentMessage() and win.frame_idx == 159
+    assert "더 이상 플래그가 없습니다" in win.statusBar().currentMessage() and win.frame_idx == 159
 
     # mark the lost flag reviewed: sidecar file, table, ticks, 'hide reviewed'
     ticks_before = len(win.slider._flags)
@@ -90,14 +90,14 @@ def test_review_table_filters_navigation_and_reviewed_marks(win, tmp_path):
 def test_staleness_banner_follows_point_edits(win, tmp_path):
     path = make_review_with_stand_in(win, tmp_path)
     win.load_review(path)
-    assert "consistent" in win.review_panel.banner.text()
+    assert "일치합니다" in win.review_panel.banner.text()
     win.view.handle_click(*_widget_pos(win, 100, 100), 1)                                       # unsaved edit
-    assert "unsaved point edits" in win.review_panel.banner.text()
+    assert "저장하지 않은 포인트 수정" in win.review_panel.banner.text()
     assert win.save_points()
     assert "points file changed" in win.review_panel.banner.text()
     win.undo_point()
     assert win.save_points()
-    assert "consistent" in win.review_panel.banner.text()                                       # identical file again => consistent
+    assert "일치합니다" in win.review_panel.banner.text()                                       # identical file again => consistent
 
 
 def test_review_of_another_video_is_rejected(win, video_noaudio, tmp_path):
@@ -119,7 +119,7 @@ def test_reprocess_plan_reuses_everything_when_nothing_changed(win, tmp_path):
     texts = []
     win.ask_confirm = lambda t: texts.append(t) or True
     win.reprocess()
-    assert pump(lambda: bool(texts), 60) and "nothing changed" in texts[0].lower() and "160 of 160 frames are reused" in texts[0]
+    assert pump(lambda: bool(texts), 60) and "바뀐 것이 없습니다" in texts[0]
     assert finish(win)
     assert win.last_result["status"] == "completed_no_flags" and win.review.meta["reused_chunks"] == 4
     assert win.review.meta["reprocessed_chunks"] == []
@@ -132,7 +132,7 @@ def test_reprocess_without_kept_chunks_says_so(win, tmp_path):
     texts = []
     win.ask_confirm = lambda t: texts.append(t) or False                                        # user declines
     win.reprocess()
-    assert pump(lambda: bool(texts), 60) and "no kept intermediate chunks" in texts[0].lower() and "All 160 frames" in texts[0]
+    assert pump(lambda: bool(texts), 60) and "보관된 중간 청크가 없습니다" in texts[0] and "전체 160프레임" in texts[0]
     assert not win.job_running
 
 
@@ -145,7 +145,7 @@ def test_delete_intermediate_chunks(win, tmp_path):
     texts = []
     win.ask_confirm = lambda t: texts.append(t) or True
     win.delete_intermediate()
-    assert not os.path.isdir(jd) and "Delete" in texts[0] and os.path.isfile(win.last_result["output"])
+    assert not os.path.isdir(jd) and "삭제할까요" in texts[0] and os.path.isfile(win.last_result["output"])
 
 
 def tex(frame, y, x, b=16):
@@ -167,7 +167,7 @@ def test_real_sam2_review_reclick_partial_reprocess_end_to_end(win, tmp_path):
     assert win.start_processing(st) and finish(win, 240)
     first = win.last_result
     assert first["status"] in ("completed_no_flags", "completed_with_review_required"), first
-    assert win.review is not None and "consistent" in win.review_panel.banner.text()
+    assert win.review is not None and "일치합니다" in win.review_panel.banner.text()
     lost = [s for s in win.review.segments if s["type"] == "tracking_lost_mid_frame"]
     assert lost and lost[0]["start_frame"] == 70                                                # the occlusion was flagged
     # the reviewer looks at the flag and marks it as reviewed
@@ -195,14 +195,14 @@ def test_real_sam2_review_reclick_partial_reprocess_end_to_end(win, tmp_path):
     win.last_result = None
     win.reprocess()
     assert pump(lambda: bool(texts), 60)
-    assert "80 of 160 frames are reused" in texts[0] and "chunks 3-4" in texts[0]               # chunks 1-2 reused, 3-4 re-processed
+    assert "160프레임 중 80프레임은 재사용" in texts[0] and "청크 3-4" in texts[0]              # chunks 1-2 reused, 3-4 re-processed
     assert finish(win, 240)
     res = win.last_result
     assert res["status"] in ("completed_no_flags", "completed_with_review_required"), res
 
     meta = win.review.meta
     assert meta["reused_chunks"] == 2 and meta["reprocessed_chunks"] == [2, 3]
-    assert "consistent" in win.review_panel.banner.text()                                       # log, points and output agree again
+    assert "일치합니다" in win.review_panel.banner.text()                                       # log, points and output agree again
     lost2 = [s for s in win.review.segments if s["type"] == "tracking_lost_mid_frame"]
     assert lost2 and seg_key(lost2[0]) == seg_key(lost[0]) and win.review.state.is_reviewed(lost2[0])   # chunk 2 unchanged: mark kept
     assert all(not win.review.state.is_reviewed(s) for s in win.review.segments if s["start_frame"] >= 80)

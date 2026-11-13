@@ -46,7 +46,7 @@ def test_preview_masks_for_one_frame(video, tmp_path):
     tr = ColorTracker((180, 320))
     objects = {"1": {"points": [CLICK30], "labels": [1]}, "2": {"points": [[5, 5]], "labels": [0]}, "3": {"points": [], "labels": []}}
     masks, skipped = preview_masks(tr, info, (320, 180), 30, objects, str(tmp_path / "f"))
-    assert set(masks) == {1} and set(skipped) == {2, 3} and "positive" in skipped[2]
+    assert set(masks) == {1} and set(skipped) == {2, 3} and "긍정" in skipped[2]
     m = decode_mask(encode_mask(masks[1]), (180, 320))
     assert 600 < int(m.sum()) < 1100 and m[90, 50]                                   # the 30 px square at analysis size
     call = tr.calls[0]
@@ -181,18 +181,18 @@ def test_app_shows_the_mask_of_a_click_and_updates_it(win, tmp_path):
     win.preview_command = fake_server_command(tmp_path, win.test_video)
     win.act_live.setChecked(True)
     assert win.preview.is_on() and win.errors == []
-    assert "click the object" in win.view.overlay()["note"]                          # no clicks on this frame yet
+    assert "대상을 클릭" in win.view.overlay()["note"]                          # no clicks on this frame yet
     win.view.handle_click(*_widget_pos(win, *CLICK30), 1)
     assert pump(lambda: bool((win.view.overlay() or {}).get("masks")), timeout=60), win.view.overlay()
     ov = win.view.overlay()
-    assert ov["size"] == (320, 180) and len(ov["masks"]) == 1 and "Preview of this frame" in ov["note"]
+    assert ov["size"] == (320, 180) and len(ov["masks"]) == 1 and "이 프레임의 클릭 미리보기" in ov["note"]
     img = ov["masks"][0]
     assert img.pixelColor(50, 90).alpha() > 0 and img.pixelColor(5, 5).alpha() == 0  # tinted where the square is, clear elsewhere
     assert not win.view.grab().isNull()                                              # painting the overlay works
 
     win.new_object()                                                                 # a second object with only a negative click
     win.view.handle_click(*_widget_pos(win, 300, 40), 0)
-    assert pump(lambda: "object 2" in ((win.view.overlay() or {}).get("note") or ""), timeout=30)
+    assert pump(lambda: "객체 2" in ((win.view.overlay() or {}).get("note") or ""), timeout=30)
     assert len(win.view.overlay()["masks"]) == 1
 
     win.goto(31)                                                                     # a frame without clicks: nothing to preview
@@ -211,25 +211,25 @@ def test_app_reports_a_preview_that_cannot_start(win, tmp_path):
     win.preview_command = [sys.executable.replace("pythonw.exe", "python.exe"), "-c", "import sys; sys.exit(3)"]
     win.act_live.setChecked(True)
     assert pump(lambda: bool(win.errors), timeout=30)
-    assert "could not be started" in win.errors[0] and not win.act_live.isChecked() and not win.preview.is_on()
+    assert "시작하지 못했습니다" in win.errors[0] and not win.act_live.isChecked() and not win.preview.is_on()
 
 
 def test_app_needs_a_video_and_a_checkpoint_for_the_preview(win, monkeypatch):
     win.act_live.setChecked(True)
-    assert win.errors == ["Open a video first."] and not win.act_live.isChecked()
+    assert win.errors == ["먼저 영상을 여세요."] and not win.act_live.isChecked()
     open_clip(win)
     from src.app import main_window as mw
     from src.app.job_runner import ProcessSettings
     monkeypatch.setattr(mw, "load_last_settings", lambda: ProcessSettings(sam2_checkpoint="Z:/nope.pt"))
     win.act_live.setChecked(True)
-    assert "checkpoint not found" in win.errors[-1] and not win.act_live.isChecked() and not win.preview.is_on()
+    assert "체크포인트를 찾을 수 없습니다" in win.errors[-1] and not win.act_live.isChecked() and not win.preview.is_on()
 
 
 def test_app_shows_the_masks_of_the_last_run(win, tmp_path):
     from src.app.job_runner import ProcessSettings
     open_clip(win)
     win.act_last.setChecked(True)                                                    # nothing kept yet
-    assert not win.act_last.isChecked() and "No kept masks" in win.statusBar().currentMessage()
+    assert not win.act_last.isChecked() and "보관된 마스크가 없습니다" in win.statusBar().currentMessage()
 
     _, pts = run_job(win.test_video, tmp_path)
     win.last_settings = ProcessSettings(work_dir=str(tmp_path / "work"))
@@ -238,12 +238,12 @@ def test_app_shows_the_masks_of_the_last_run(win, tmp_path):
     assert win.act_last.isChecked()
     win.goto(30)
     ov = win.view.overlay()
-    assert len(ov["masks"]) == 1 and len(ov["boxes"]) == 1 and "Last run" in ov["note"] and "changed" not in ov["note"]
+    assert len(ov["masks"]) == 1 and len(ov["boxes"]) == 1 and "지난 실행" in ov["note"] and "바뀌었습니다" not in ov["note"]
     win.goto(75)
     ov = win.view.overlay()
     assert not ov["masks"] and len(ov["regions"]) == 1                               # lost object: fail-closed area
     assert not win.view.grab().isNull()
     win.view.handle_click(*_widget_pos(win, 300, 100), 1)                            # edited since the run
-    assert "points changed since that run" in win.view.overlay()["note"]
+    assert "포인트가 바뀌었습니다" in win.view.overlay()["note"]
     win.act_last.setChecked(False)
     assert win.view.overlay() is None

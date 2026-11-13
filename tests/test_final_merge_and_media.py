@@ -106,9 +106,9 @@ def test_progress_panel_shows_warnings_and_the_finalizing_stage():
     app = QApplication.instance() or QApplication([])
     p = ProcessPanel()
     p.on_progress({"event": "warning", "text": "the work folder is on a hard disk drive (HDD)"})
-    assert "WARNING: the work folder is on a hard disk drive" in p.log.toPlainText()
+    assert "경고: the work folder is on a hard disk drive" in p.log.toPlainText()
     p.on_progress({"event": "stage", "stage": "finalizing"})
-    assert "Merging chunks" in p.stage.text()
+    assert "청크 병합" in p.stage.text()
     del app
 
 

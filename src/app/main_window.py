@@ -12,8 +12,9 @@ import time
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
+                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QToolBar,
+                               QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from src.points_io import OBJECT_STYLES, PointStore, PointsError, load_object_styles, load_points, save_points
 from src.review import ReviewError
@@ -28,12 +29,12 @@ from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args, jo
 from .jobs_dialog import JobsDialog
 from .mask_preview import MaskPreview, preview_args
 from .process_dialog import ProcessDialog, find_default_checkpoint, load_last_settings, validate_settings
-from .process_panel import ProcessPanel
+from .process_panel import STATUS_TEXT, ProcessPanel
 from .review_panel import FlagSlider, ReviewPanel
 from .video_view import VideoView, mask_image, object_color
 
 log = logging.getLogger("app")
-VIDEO_FILTER = "Video (*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.ts);;All files (*.*)"
+VIDEO_FILTER = "영상 (*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.ts);;모든 파일 (*.*)"
 CACHE_FRAMES = 40
 
 
@@ -102,7 +103,8 @@ class MainWindow(QMainWindow):
         self.slider = FlagSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._slider_changed)
-        self.pos_label = QLabel("no video")
+        self.pos_label = QLabel("영상 없음")
+        self.pos_label.setObjectName("timecode")
         self.pos_label.setMinimumWidth(260)
 
         self._nav_buttons = []
@@ -115,21 +117,35 @@ class MainWindow(QMainWindow):
             self._nav_buttons.append(b)
             return b
 
-        self.play_btn = btn("Play", "Space", self.toggle_play)
-        row = QHBoxLayout()
-        for b in (btn("-1 s", "Ctrl+Left", lambda: self.step_seconds(-1)), btn("-10", "Shift+Left", lambda: self.step(-10)),
+        self.play_btn = btn("재생", "Space", self.toggle_play)
+        self.play_btn.setObjectName("play")
+        row = QHBoxLayout()                              # transport: timecode on the left, controls in the middle
+        row.addWidget(self.pos_label)
+        row.addStretch(1)
+        for b in (btn("-1초", "Ctrl+Left", lambda: self.step_seconds(-1)), btn("-10", "Shift+Left", lambda: self.step(-10)),
                   btn("<", "Left", lambda: self.step(-1)), self.play_btn, btn(">", "Right", lambda: self.step(1)),
-                  btn("+10", "Shift+Right", lambda: self.step(10)), btn("+1 s", "Ctrl+Right", lambda: self.step_seconds(1))):
+                  btn("+10", "Shift+Right", lambda: self.step(10)), btn("+1초", "Ctrl+Right", lambda: self.step_seconds(1))):
             row.addWidget(b)
         row.addStretch(1)
-        row.addWidget(self.pos_label)
+        balance = QWidget()                              # same width as the timecode so the controls stay centred
+        balance.setMinimumWidth(260)
+        row.addWidget(balance)
+
+        self.timeline = QFrame()                         # bottom strip: the frame slider with the review-flag ticks
+        self.timeline.setObjectName("timeline")
+        tl = QVBoxLayout(self.timeline)
+        tl.setContentsMargins(10, 6, 10, 10)
+        self.timeline_title = QLabel("타임라인")
+        tl.addWidget(self.timeline_title)
+        tl.addWidget(self.slider)
 
         central = QWidget()
         lay = QVBoxLayout(central)
-        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
         lay.addWidget(self.view, 1)
-        lay.addWidget(self.slider)
         lay.addLayout(row)
+        lay.addWidget(self.timeline)
         self.setCentralWidget(central)
         self._build_side_panel()
         self._build_process_dock()
@@ -143,7 +159,7 @@ class MainWindow(QMainWindow):
         self.preview.masks_ready.connect(self._on_preview_masks)
         self.preview.request_failed.connect(self._on_preview_failed)
         self.preview.state_changed.connect(self._on_preview_state)
-        self.statusBar().showMessage("Open a video to start (Ctrl+O). Left-click = this is the object, right-click = this is NOT.")
+        self.statusBar().showMessage("영상을 열어 시작하세요 (Ctrl+O). 왼쪽 클릭 = 이것이 대상, 오른쪽 클릭 = 이것은 대상이 아님.")
 
     # ------------------------------------------------------------------ UI construction
     def _act(self, text, shortcut, fn):
@@ -155,48 +171,48 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         act = self._act
-        m = self.menuBar().addMenu("&File")
-        self.act_open_video = act("Open video...", "Ctrl+O", self.open_video_dialog)
-        self.act_open_points = act("Open points...", "Ctrl+L", self.open_points_dialog)
+        m = self.menuBar().addMenu("파일(&F)")
+        self.act_open_video = act("영상 열기...", "Ctrl+O", self.open_video_dialog)
+        self.act_open_points = act("포인트 열기...", "Ctrl+L", self.open_points_dialog)
         m.addAction(self.act_open_video)
         m.addAction(self.act_open_points)
-        self.act_open_review = act("Open review log...", "Ctrl+Shift+O", self.open_review_dialog)
+        self.act_open_review = act("검수 로그 열기...", "Ctrl+Shift+O", self.open_review_dialog)
         m.addAction(self.act_open_review)
-        m.addAction(act("Save points", "Ctrl+S", self.save_points))
-        m.addAction(act("Save points as...", "Ctrl+Shift+S", self.save_points_as))
+        m.addAction(act("포인트 저장", "Ctrl+S", self.save_points))
+        m.addAction(act("포인트 다른 이름으로 저장...", "Ctrl+Shift+S", self.save_points_as))
         m.addSeparator()
-        m.addAction(act("Quit", "Ctrl+Q", self.close))
-        pm = self.menuBar().addMenu("&Process")
-        self.act_start = act("Start processing...", "Ctrl+R", self.start_processing_dialog)
-        self.act_cancel = act("Cancel processing", "Ctrl+.", self.cancel_processing)
+        m.addAction(act("종료", "Ctrl+Q", self.close))
+        pm = self.menuBar().addMenu("처리(&P)")
+        self.act_start = act("처리 시작...", "Ctrl+R", self.start_processing_dialog)
+        self.act_cancel = act("처리 취소", "Ctrl+.", self.cancel_processing)
         self.act_cancel.setEnabled(False)
         pm.addAction(self.act_start)
         pm.addAction(self.act_cancel)
-        self.act_reprocess = act("Re-process with edited points...", "Ctrl+Shift+R", self.reprocess)
-        self.act_cleanup = act("Delete intermediate chunks...", None, self.delete_intermediate)
-        self.act_resume_job = act("Resume interrupted job...", None, self.reprocess)
+        self.act_reprocess = act("수정한 포인트로 다시 처리...", "Ctrl+Shift+R", self.reprocess)
+        self.act_cleanup = act("중간 청크 삭제...", None, self.delete_intermediate)
+        self.act_resume_job = act("중단된 작업 이어하기...", None, self.reprocess)
         self.act_resume_job.setEnabled(False)
-        self.act_history = act("Job history...", None, self.show_job_history)
+        self.act_history = act("작업 기록...", None, self.show_job_history)
         pm.addAction(self.act_reprocess)
         pm.addAction(self.act_resume_job)
         pm.addAction(self.act_history)
         pm.addAction(self.act_cleanup)
-        vm = self.menuBar().addMenu("&View")
-        self.act_live = QAction("Preview the mask while clicking (SAM 2)", self)
+        vm = self.menuBar().addMenu("보기(&V)")
+        self.act_live = QAction("클릭하면서 마스크 미리보기 (SAM 2)", self)
         self.act_live.setCheckable(True)
         self.act_live.setShortcut(QKeySequence("P"))
-        self.act_live.setToolTip("Shows what SAM 2 selects for the clicks on the current frame, before any processing.")
+        self.act_live.setToolTip("처리하기 전에, 현재 프레임의 클릭으로 SAM 2가 무엇을 잡는지 보여 줍니다.")
         self.act_live.toggled.connect(self.toggle_live_preview)
-        self.act_last = QAction("Show the masks of the last run", self)
+        self.act_last = QAction("지난 실행의 마스크 보기", self)
         self.act_last.setCheckable(True)
         self.act_last.setShortcut(QKeySequence("K"))
-        self.act_last.setToolTip("Shows the tracked masks, detection boxes and fail-closed areas the last run kept for each frame.")
+        self.act_last.setToolTip("지난 실행이 프레임마다 남긴 추적 마스크, 탐지 박스, 안전 모드 영역을 보여 줍니다.")
         self.act_last.toggled.connect(self.toggle_last_masks)
         vm.addAction(self.act_live)
         vm.addAction(self.act_last)
-        e = self.menuBar().addMenu("&Edit")
-        e.addAction(act("Undo last point on this frame", "U", self.undo_point))
-        e.addAction(act("Delete this object's points on this frame", "X", self.clear_frame_points))
+        e = self.menuBar().addMenu("편집(&E)")
+        e.addAction(act("이 프레임의 마지막 점 되돌리기", "U", self.undo_point))
+        e.addAction(act("이 프레임에서 이 객체의 점 지우기", "X", self.clear_frame_points))
         # navigation shortcuts are window-level actions so they work wherever the focus is
         for key, fn in (("Left", lambda: self.step(-1)), ("Right", lambda: self.step(1)),
                         ("Shift+Left", lambda: self.step(-10)), ("Shift+Right", lambda: self.step(10)),
@@ -204,58 +220,98 @@ class MainWindow(QMainWindow):
                         ("Space", self.toggle_play), ("M", self.next_flag), ("B", self.prev_flag),
                         ("R", lambda: self.review_panel.toggle_reviewed())):
             self.addAction(act("", key, fn))
+        self._build_toolbar()
+
+    def _build_toolbar(self):
+        """Top bar with the everyday actions; the same QActions as the menus, so their enabled state stays in sync."""
+        tb = QToolBar("도구", self)
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.toolbar = tb
+        self.act_save = self._act("포인트 저장", None, self.save_points)
+        for a in (self.act_open_video, self.act_open_points, self.act_save):
+            tb.addAction(a)
+        tb.addSeparator()
+        tb.addAction(self.act_live)
+        tb.addAction(self.act_last)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        spacer.setStyleSheet("background: transparent")
+        tb.addWidget(spacer)
+        tb.addAction(self.act_cancel)
+        self.start_btn = QToolButton()                   # the accent button on the right: start the mosaic job
+        self.start_btn.setObjectName("primary")
+        self.start_btn.setDefaultAction(self.act_start)
+        tb.addWidget(self.start_btn)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
 
     def _build_side_panel(self):
-        dock = QDockWidget("Targets", self)
+        # ---- left: the objects being marked
+        dock = QDockWidget("대상", self)
         self.targets_dock = dock
         dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         w = QWidget()
         v = QVBoxLayout(w)
-        self.info_label = QLabel("No video loaded.")
-        self.info_label.setWordWrap(True)
-        self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v.addWidget(self.info_label)
-        v.addWidget(QLabel("Objects (select the one you are marking):"))
+        v.addWidget(QLabel("객체 (지금 표시할 객체를 선택):"))
         self.obj_list = QListWidget()
         self.obj_list.currentRowChanged.connect(self._object_selected)
         v.addWidget(self.obj_list, 1)
-        for text, fn in (("New object", self.new_object), ("Delete object", self.delete_object),
-                         ("Undo last point (U)", self.undo_point), ("Clear points on this frame (X)", self.clear_frame_points)):
+        for text, fn in (("새 객체", self.new_object), ("객체 삭제", self.delete_object),
+                         ("마지막 점 되돌리기 (U)", self.undo_point), ("이 프레임의 점 지우기 (X)", self.clear_frame_points)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             v.addWidget(b)
-        # per-object mosaic settings ("job setting" = whatever is chosen in the processing dialog)
-        self.style_box = QGroupBox("Mosaic for the selected object")
-        form = QFormLayout(self.style_box)
-        self.obj_style = QComboBox()
-        self.obj_style.addItem("job setting", None)
-        for name in OBJECT_STYLES:
-            self.obj_style.addItem(name, name)
-        self.obj_style.setToolTip("pixelate and solid destroy the content; blur is the weakest")
-        form.addRow("Style", self.obj_style)
-        self.obj_block = QSpinBox()
-        self.obj_block.setRange(0, 256)
-        self.obj_block.setSpecialValueText("job setting")
-        self.obj_block.setToolTip("Block size (pixelate) or blur strength in full-resolution pixels, 2-256. 0 = the job's strength.")
-        form.addRow("Strength (px)", self.obj_block)
-        self.obj_pad = QSpinBox()
-        self.obj_pad.setRange(-1, 500)
-        self.obj_pad.setSpecialValueText("job setting")
-        self.obj_pad.setToolTip("How far the mosaic reaches beyond this object's mask, in full-resolution pixels. -1 = the job's padding.")
-        form.addRow("Padding (px)", self.obj_pad)
-        self.obj_style.currentIndexChanged.connect(self._style_edited)
-        self.obj_block.valueChanged.connect(self._style_edited)
-        self.obj_pad.valueChanged.connect(self._style_edited)
-        v.addWidget(self.style_box)
-        note = QLabel("Detections (NudeNet) and fail-closed areas always use the job setting. Where areas overlap, the stronger one wins.")
-        note.setWordWrap(True)
-        v.addWidget(note)
-        self.hint = QLabel("Tracking of an object starts at its earliest click: click it on the first frame where it is visible.")
+        self.hint = QLabel("객체 추적은 가장 이른 클릭에서 시작합니다. 객체가 처음 보이는 프레임에서 클릭하세요.\n"
+                           "왼쪽 클릭 = 대상, 오른쪽 클릭 = 대상 아님.")
+        self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
         v.addWidget(self.hint)
         dock.setWidget(w)
-        dock.setMinimumWidth(300)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        dock.setMinimumWidth(260)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+
+        # ---- right: properties of the video and of the selected object
+        pdock = QDockWidget("속성", self)
+        self.props_dock = pdock
+        pdock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        pw = QWidget()
+        pv = QVBoxLayout(pw)
+        self.info_label = QLabel("불러온 영상이 없습니다.")
+        self.info_label.setWordWrap(True)
+        self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        pv.addWidget(self.info_label)
+        # per-object mosaic settings ("작업 설정" = whatever is chosen in the processing dialog)
+        self.style_box = QGroupBox("선택한 객체의 모자이크")
+        form = QFormLayout(self.style_box)
+        self.obj_style = QComboBox()
+        self.obj_style.addItem("작업 설정", None)
+        for name in OBJECT_STYLES:
+            self.obj_style.addItem(name, name)
+        self.obj_style.setToolTip("pixelate(픽셀)와 solid(단색)는 내용을 완전히 없앱니다. blur(흐림)가 가장 약합니다.")
+        form.addRow("형태", self.obj_style)
+        self.obj_block = QSpinBox()
+        self.obj_block.setRange(0, 256)
+        self.obj_block.setSpecialValueText("작업 설정")
+        self.obj_block.setToolTip("블록 크기(픽셀) 또는 흐림 강도, 원본 해상도 픽셀 기준 2-256. 0 = 작업 설정의 강도.")
+        form.addRow("강도 (px)", self.obj_block)
+        self.obj_pad = QSpinBox()
+        self.obj_pad.setRange(-1, 500)
+        self.obj_pad.setSpecialValueText("작업 설정")
+        self.obj_pad.setToolTip("모자이크가 이 객체의 마스크 바깥으로 얼마나 넓게 덮는지, 원본 해상도 픽셀 기준. -1 = 작업 설정의 여백.")
+        form.addRow("여백 (px)", self.obj_pad)
+        self.obj_style.currentIndexChanged.connect(self._style_edited)
+        self.obj_block.valueChanged.connect(self._style_edited)
+        self.obj_pad.valueChanged.connect(self._style_edited)
+        pv.addWidget(self.style_box)
+        note = QLabel("탐지(NudeNet) 영역과 안전 모드 영역은 항상 작업 설정을 따릅니다. 영역이 겹치면 더 강한 쪽이 적용됩니다.")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        pv.addWidget(note)
+        pv.addStretch(1)
+        pdock.setWidget(pw)
+        pdock.setMinimumWidth(300)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, pdock)
         self._refresh_objects()
 
     def _build_process_dock(self):
@@ -264,7 +320,7 @@ class MainWindow(QMainWindow):
         self.panel.resume_requested.connect(self.resume_processing)
         self.panel.open_output_requested.connect(lambda: self.open_path(self._result_output()))
         self.panel.open_logs_requested.connect(lambda: self.open_path(os.path.join(PROJECT_ROOT, "logs")))
-        self.process_dock = QDockWidget("Processing", self)
+        self.process_dock = QDockWidget("처리", self)
         self.process_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         self.process_dock.setWidget(self.panel)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.process_dock)
@@ -278,19 +334,20 @@ class MainWindow(QMainWindow):
         self.review_panel.reprocess_requested.connect(self.reprocess)
         self.review_panel.reviewed_changed.connect(self._update_flag_ticks)
         self.review_panel.sev.currentIndexChanged.connect(lambda *_: self._update_flag_ticks())
-        self.review_dock = QDockWidget("Review", self)
+        self.review_dock = QDockWidget("검수", self)
         self.review_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         self.review_dock.setWidget(self.review_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.review_dock)
-        self.tabifyDockWidget(self.targets_dock, self.review_dock)
-        self.targets_dock.raise_()
+        self.setTabPosition(Qt.DockWidgetArea.RightDockWidgetArea, QTabWidget.TabPosition.North)
+        self.tabifyDockWidget(self.props_dock, self.review_dock)
+        self.props_dock.raise_()
 
     # ------------------------------------------------------------------ review screen
     def open_review_dialog(self):
         if self.info is None:
-            self.show_error("Open a video first.")
+            self.show_error("먼저 영상을 여세요.")
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open review log", os.path.join(PROJECT_ROOT, "logs"), "Review log (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "검수 로그 열기", os.path.join(PROJECT_ROOT, "logs"), "검수 로그 (*.json)")
         if path:
             self.load_review(path)
 
@@ -307,9 +364,9 @@ class MainWindow(QMainWindow):
         self.review_panel.set_data(data, self._stale_reasons())
         self._update_flag_ticks()
         self.review_dock.raise_()
-        msg = f"Review log loaded: {len(data.filtered('warn'))} flags (warn+), {data.unreviewed_count()} not reviewed"
+        msg = f"검수 로그를 불러왔습니다: 플래그 {len(data.filtered('warn'))}건 (경고 이상), 미확인 {data.unreviewed_count()}건"
         if data.dropped_marks:
-            msg += f"; {data.dropped_marks} 'reviewed' marks were reset because their chunks were re-processed"
+            msg += f"; 해당 청크가 다시 처리되어 '확인' 표시 {data.dropped_marks}건이 초기화되었습니다"
         self.statusBar().showMessage(msg)
         return True
 
@@ -319,7 +376,7 @@ class MainWindow(QMainWindow):
         pp = self.points_path if self.points_path and os.path.isfile(self.points_path) else None
         reasons = self.review.staleness(pp, bool(self.store.points))
         if self.dirty:
-            reasons.append("there are unsaved point edits")
+            reasons.append("저장하지 않은 포인트 수정이 있습니다")
         return reasons
 
     def _refresh_stale_banner(self):
@@ -346,12 +403,12 @@ class MainWindow(QMainWindow):
 
     def _step_flag(self, forward: bool):
         if self.review is None or self.info is None:
-            self.statusBar().showMessage("No review log loaded (File > Open review log).")
+            self.statusBar().showMessage("불러온 검수 로그가 없습니다 (파일 > 검수 로그 열기).")
             return
         nav = self.review.navigator(self.review_panel.sev.currentData() or "warn")
         tgt = nav.next_after(self.frame_idx) if forward else nav.prev_before(self.frame_idx)
         if tgt is None:
-            self.statusBar().showMessage("No more flags in that direction.")
+            self.statusBar().showMessage("그 방향에는 더 이상 플래그가 없습니다.")
             return
         self._goto_flag(tgt, nav.object_at(tgt))
         self.review_panel.select_row_for(tgt)
@@ -386,7 +443,7 @@ class MainWindow(QMainWindow):
             return
         self._plan, self._plan_settings = None, settings
         cancel_file = self.plan_runner.new_cancel_file()
-        self.statusBar().showMessage("Checking what can be reused ...")
+        self.statusBar().showMessage("재사용할 수 있는 부분을 확인하는 중 ...")
         self.plan_runner.start(build_args(self.info.path, points, settings, cancel_file, plan_only=True), cancel_file)
 
     def _on_plan_event(self, ev: dict):
@@ -396,20 +453,23 @@ class MainWindow(QMainWindow):
     def _on_plan_finished(self, res: dict):
         plan = self._plan
         if plan is None:
-            self.show_error("Could not work out what can be re-used: " + str(res.get("reason") or "unknown error"))
+            self.show_error("재사용할 수 있는 부분을 확인하지 못했습니다: " + str(res.get("reason") or "알 수 없는 오류"))
             return
         n, total = plan["total_chunks"], plan["total_frames"]
         render_only = plan.get("frames_render_only") or 0
         if plan["can_resume"] and render_only:
             full = total - plan["frames_reused"] - render_only
-            text = (f"{plan['reason'].capitalize()}.\n\n{plan['frames_reused']} of {total} frames are reused as they are; "
-                    f"{render_only} frames only get a new mosaic (no tracking, no detection); "
-                    f"{full} frames are re-processed in full.\nStart?")
+            text = (f"모자이크 또는 인코더 설정이 바뀌었습니다.\n\n전체 {total}프레임 중 {plan['frames_reused']}프레임은 그대로 재사용하고, "
+                    f"{render_only}프레임은 모자이크만 다시 적용합니다 (추적·탐지 없음). "
+                    f"{full}프레임은 처음부터 다시 처리합니다.\n시작할까요?")
         elif plan["can_resume"] and plan["reusable_chunks"]:
-            text = (f"{plan['reason'].capitalize()}.\n\n{plan['frames_reused']} of {total} frames are reused; "
-                    f"{total - plan['frames_reused']} frames are re-processed (chunks {plan['reusable_chunks'] + 1}-{n}).\nStart?")
+            text = (f"전체 {total}프레임 중 {plan['frames_reused']}프레임은 재사용하고, "
+                    f"{total - plan['frames_reused']}프레임은 다시 처리합니다 (청크 {plan['reusable_chunks'] + 1}-{n}).\n시작할까요?"
+                    if plan["reusable_chunks"] < n else "바뀐 것이 없습니다. 최종 영상만 다시 만듭니다.\n시작할까요?")
         else:
-            text = f"{plan['reason'].capitalize()}.\n\nAll {total} frames will be processed. Start?"
+            why = ("보관된 중간 청크가 없습니다" if not plan["job_found"] else
+                   "설정이나 영상이 이전 실행과 달라 이전 결과를 쓸 수 없습니다" if not plan["can_resume"] else "재사용할 수 있는 청크가 없습니다")
+            text = f"{why}.\n\n전체 {total}프레임을 처리합니다. 시작할까요?"
         if self.ask_confirm(text):
             self.start_processing(dataclasses.replace(self._plan_settings, resume=bool(plan["can_resume"])))
 
@@ -435,8 +495,8 @@ class MainWindow(QMainWindow):
         if j is not None:
             total = j.get("n_chunks") or "?"
             done = j["chunks_done"] + (0 if j["chunks_done"] else (j.get("reused_chunks") or 0))
-            self.statusBar().showMessage(self.statusBar().currentMessage() + f"  |  Interrupted job found ({j['status']}, {done}/{total} chunks done, "
-                                         f"{j.get('created')}): Process > Resume interrupted job")
+            self.statusBar().showMessage(self.statusBar().currentMessage() + f"  |  중단된 작업이 있습니다 ({j['status']}, 청크 {done}/{total} 완료, "
+                                         f"{j.get('created')}): 처리 > 중단된 작업 이어하기")
         return j
 
     def show_job_history(self):
@@ -455,13 +515,13 @@ class MainWindow(QMainWindow):
         work = self.last_settings.work_dir if self.last_settings else ""
         jd = job_dir_for_video(work, self.info.path, self.info.fingerprint)
         if not os.path.isdir(jd):
-            self.statusBar().showMessage("No intermediate chunks found for this video.")
+            self.statusBar().showMessage("이 영상의 중간 청크가 없습니다.")
             return
         size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(jd) for f in fs) / 2 ** 20
-        if self.ask_confirm(f"Delete {size:.0f} MB of intermediate chunks?\nThe result video and logs are kept, but re-processing will then start from scratch."):
+        if self.ask_confirm(f"중간 청크 {size:.0f} MB를 삭제할까요?\n결과 영상과 로그는 남지만, 다시 처리할 때는 처음부터 시작합니다."):
             import shutil
             shutil.rmtree(jd, ignore_errors=True)
-            self.statusBar().showMessage(f"Deleted {size:.0f} MB of intermediate chunks.")
+            self.statusBar().showMessage(f"중간 청크 {size:.0f} MB를 삭제했습니다.")
 
     # ------------------------------------------------------------------ processing jobs
     def open_path(self, path: Optional[str]):
@@ -489,7 +549,7 @@ class MainWindow(QMainWindow):
 
     def start_processing_dialog(self):
         if self.info is None:
-            self.show_error("Open a video first.")
+            self.show_error("먼저 영상을 여세요.")
             return
         if self.job_running:
             return
@@ -515,7 +575,7 @@ class MainWindow(QMainWindow):
         if self.info is None or self.job_running:
             return False
         if self.dirty:
-            self.show_error("Save the points first (Ctrl+S): the worker reads the saved file.")
+            self.show_error("먼저 포인트를 저장하세요 (Ctrl+S). 처리는 저장된 파일을 읽습니다.")
             return False
         points = self._points_for_job()
         probs = validate_settings(settings, self.info.path, points is not None)
@@ -528,7 +588,7 @@ class MainWindow(QMainWindow):
         self.process_dock.show()
         self._set_job_running(True)
         self._stop_play()
-        self.statusBar().showMessage("Processing ... (Process > Cancel to stop; completed chunks are kept)")
+        self.statusBar().showMessage("처리 중 ... (처리 > 처리 취소로 중단, 완료된 청크는 보관됩니다)")
         if not self.runner.start(build_args(self.info.path, points, settings, cancel_file), cancel_file):
             self._set_job_running(False)
             return False
@@ -537,7 +597,7 @@ class MainWindow(QMainWindow):
     def cancel_processing(self):
         if self.job_running:
             self.panel.cancel_btn.setEnabled(False)
-            self.panel.stage.setText("Cancelling - finishing the current step ...")
+            self.panel.stage.setText("취소하는 중 - 현재 단계를 마무리하고 있습니다 ...")
             self.runner.cancel()
 
     def resume_processing(self):
@@ -551,7 +611,7 @@ class MainWindow(QMainWindow):
         self.last_result = res
         self._set_job_running(False)
         self.panel.on_finished(res)
-        self.statusBar().showMessage(f"Processing {res.get('status')}: " + (res.get("reason") or res.get("output") or ""))
+        self.statusBar().showMessage(f"처리 결과 {STATUS_TEXT.get(res.get('status'), res.get('status'))}: " + (res.get("reason") or res.get("output") or ""))
         if res.get("review_log") and os.path.isfile(res["review_log"]):
             self.load_review(res["review_log"], quiet=True)
         self.check_resumable()
@@ -574,11 +634,11 @@ class MainWindow(QMainWindow):
             st = self.last_settings or load_last_settings()
             ckpt = st.sam2_checkpoint or find_default_checkpoint()
             if self.info is None:
-                problem = "Open a video first."
+                problem = "먼저 영상을 여세요."
             elif self.job_running:
-                problem = "A job is running: the mask preview is available again when it has finished."
+                problem = "작업이 실행 중입니다. 작업이 끝나면 마스크 미리보기를 다시 쓸 수 있습니다."
             elif self.preview_command is None and not os.path.isfile(ckpt):
-                problem = "SAM 2 checkpoint not found. Download one into models/ (see models/README.md) or select it in Process > Start processing."
+                problem = "SAM 2 체크포인트를 찾을 수 없습니다. models/ 폴더에 받거나(models/README.md 참고) 처리 > 처리 시작에서 선택하세요."
             if problem:
                 self._set_checked(self.act_live, False)
                 self.show_error(problem)
@@ -599,7 +659,7 @@ class MainWindow(QMainWindow):
                 self._job_masks = jm
             except (OSError, ValueError, KeyError):
                 self._set_checked(self.act_last, False)
-                self.statusBar().showMessage("No kept masks for this video. Process it with \"Keep intermediate chunks\" switched on first.")
+                self.statusBar().showMessage("이 영상으로 보관된 마스크가 없습니다. 먼저 \"중간 청크 보관\"을 켜고 처리하세요.")
         self._update_overlay()
 
     def _points_sha(self) -> Optional[str]:
@@ -624,13 +684,13 @@ class MainWindow(QMainWindow):
             sig = tuple(sorted((p["obj_id"], round(p["x"], 2), round(p["y"], 2), p["label"]) for p in pts))
             hit = self._live_masks.get(f)
             if hit is not None and hit[0] == sig:
-                note = "Preview of this frame's clicks (mask before padding)."
+                note = "이 프레임의 클릭 미리보기 (여백 적용 전 마스크)."
                 if hit[2]:
-                    note += "  Not shown: " + "; ".join(f"object {o} - {r}" for o, r in sorted(hit[2].items()))
+                    note += "  표시 안 됨: " + "; ".join(f"객체 {o} - {r}" for o, r in sorted(hit[2].items()))
                 shape = next(iter(hit[1].values())).shape if hit[1] else (self.info.height, self.info.width)
                 self.view.set_overlay(self._make_overlay(shape, hit[1], note=note))
                 return
-            self.view.set_overlay({"note": "Computing the mask ..." if self.preview.is_ready() else "Loading the model for the mask preview ..."})
+            self.view.set_overlay({"note": "마스크 계산 중 ..." if self.preview.is_ready() else "마스크 미리보기용 모델을 불러오는 중 ..."})
             if self._preview_asked != (f, sig):
                 objects: dict = {}
                 for p in pts:
@@ -644,15 +704,15 @@ class MainWindow(QMainWindow):
         if self._job_masks is not None:
             fr = self._job_masks.frame(f)
             stale = self.dirty or (self._job_masks.points_sha is not None and self._job_masks.points_sha != self._points_sha())
-            tail = "  The points changed since that run." if stale else ""
+            tail = "  그 실행 이후 포인트가 바뀌었습니다." if stale else ""
             if fr is None:
-                self.view.set_overlay({"note": "The last run kept no masks for this frame." + tail})
+                self.view.set_overlay({"note": "지난 실행에 이 프레임의 마스크가 없습니다." + tail})
             else:
-                note = f"Last run ({self._job_masks.created}): masks before padding, detection boxes, fail-closed areas (red)." + tail
+                note = f"지난 실행 ({self._job_masks.created}): 여백 적용 전 마스크, 탐지 박스, 안전 모드 영역(빨강)." + tail
                 self.view.set_overlay(self._make_overlay(fr["shape"], fr["masks"], fr["boxes"], fr["fc_regions"], fr["fc_full"], note))
             return
         if self.preview.is_on():
-            self.view.set_overlay({"note": "Mask preview is on: click the object on this frame to see what SAM 2 selects."})
+            self.view.set_overlay({"note": "마스크 미리보기 켜짐: 이 프레임에서 대상을 클릭하면 SAM 2가 잡는 영역이 보입니다."})
             return
         self.view.set_overlay(None)
 
@@ -669,18 +729,18 @@ class MainWindow(QMainWindow):
     def _on_preview_failed(self, rid: int, reason: str):
         self._preview_reqs.pop(rid, None)
         self._preview_asked = None
-        self.statusBar().showMessage("Mask preview failed for this frame: " + reason)
-        self.view.set_overlay({"note": "Mask preview failed: " + reason})
+        self.statusBar().showMessage("이 프레임의 마스크 미리보기에 실패했습니다: " + reason)
+        self.view.set_overlay({"note": "마스크 미리보기 실패: " + reason})
 
     def _on_preview_state(self, state: str, detail: str):
         if state == "failed":
             self._set_checked(self.act_live, False)
             self.preview.stop()
-            self.show_error("The mask preview could not be started:\n" + detail)
+            self.show_error("마스크 미리보기를 시작하지 못했습니다:\n" + detail)
         elif state == "loading":
-            self.statusBar().showMessage("Mask preview: loading the model (a few seconds) ...")
+            self.statusBar().showMessage("마스크 미리보기: 모델을 불러오는 중 (몇 초 걸립니다) ...")
         elif state == "ready":
-            self.statusBar().showMessage("Mask preview is ready: click the object to see what SAM 2 selects on this frame.")
+            self.statusBar().showMessage("마스크 미리보기 준비 완료: 대상을 클릭하면 이 프레임에서 SAM 2가 잡는 영역이 보입니다.")
         if state != "off":
             self._update_overlay()
 
@@ -692,7 +752,7 @@ class MainWindow(QMainWindow):
     def ask_save_changes(self) -> str:
         """'save' | 'discard' | 'cancel'"""
         B = QMessageBox.StandardButton
-        r = QMessageBox.question(self, "Unsaved points", "The points have unsaved changes.", B.Save | B.Discard | B.Cancel)
+        r = QMessageBox.question(self, "저장하지 않은 포인트", "포인트에 저장하지 않은 변경이 있습니다.", B.Save | B.Discard | B.Cancel)
         return {B.Save: "save", B.Discard: "discard"}.get(r, "cancel")
 
     def ask_confirm(self, text: str) -> bool:
@@ -709,7 +769,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ opening a video
     def open_video_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open video", "", VIDEO_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "영상 열기", "", VIDEO_FILTER)
         if path:
             self.open_video(path)
 
@@ -727,8 +787,8 @@ class MainWindow(QMainWindow):
 
     def _probe_failed(self, msg: str):
         self.setEnabled(True)
-        self.statusBar().showMessage("Could not open the video.")
-        self.show_error(f"Could not open the video:\n{msg}")
+        self.statusBar().showMessage("영상을 열지 못했습니다.")
+        self.show_error(f"영상을 열지 못했습니다:\n{msg}")
 
     def _video_probed(self, info: VideoInfo):
         self.setEnabled(True)
@@ -773,15 +833,15 @@ class MainWindow(QMainWindow):
 
     def _show_info(self):
         i = self.info
-        lines = [f"<b>{os.path.basename(i.path)}</b>", f"{i.width}x{i.height}, {i.fps:.3f} fps, {i.nb_frames} frames ({i.duration:.1f} s)",
-                 f"codec {i.codec}, {i.pix_fmt}", f"audio: {i.audio_codec if i.has_audio else 'none'}"]
+        lines = [f"<b>{os.path.basename(i.path)}</b>", f"{i.width}x{i.height}, {i.fps:.3f} fps, {i.nb_frames}프레임 ({i.duration:.1f}초)",
+                 f"코덱 {i.codec}, {i.pix_fmt}", f"오디오: {i.audio_codec if i.has_audio else '없음'}"]
         warn = []
         if i.is_vfr:
-            warn.append(f"Variable frame rate ({i.vfr_detail}). Processing rejects VFR unless allowed; times shown here are real packet times.")
+            warn.append(f"가변 프레임률 ({i.vfr_detail}). 허용하지 않으면 처리가 거부됩니다. 여기 표시되는 시간은 실제 패킷 시간입니다.")
         if is_hdr(i):
-            warn.append("HDR / high bit depth: processing converts to 8-bit SDR.")
+            warn.append("HDR / 고비트 영상: 처리하면 8비트 SDR로 변환됩니다.")
         if i.rotation:
-            warn.append(f"Rotation metadata {i.rotation} deg is applied (frames shown as they will be processed).")
+            warn.append(f"회전 정보 {i.rotation}도를 적용했습니다 (처리될 모습 그대로 표시).")
         if warn:
             lines.append("<span style='color:#d9822b'>" + "<br>".join(warn) + "</span>")
         self.info_label.setText("<br>".join(lines))
@@ -822,7 +882,7 @@ class MainWindow(QMainWindow):
     def _frame_failed(self, idx: int, msg: str):
         self._awaiting = False
         self._stop_play()
-        self.statusBar().showMessage(f"Frame {idx}: {msg}")
+        self.statusBar().showMessage(f"프레임 {idx}: {msg}")
         log.warning("frame %d failed: %s", idx, msg)
 
     def _slider_changed(self, v: int):
@@ -838,7 +898,7 @@ class MainWindow(QMainWindow):
 
     def _update_pos_label(self):
         i = self.info
-        self.pos_label.setText(f"frame {self.frame_idx}/{i.nb_frames - 1}   t = {i.timestamp_of(self.frame_idx):.3f} s")
+        self.pos_label.setText(f"프레임 {self.frame_idx}/{i.nb_frames - 1}   t = {i.timestamp_of(self.frame_idx):.3f}초")
 
     # ------------------------------------------------------------------ playback
     def toggle_play(self):
@@ -850,14 +910,14 @@ class MainWindow(QMainWindow):
         if self.frame_idx >= self.info.nb_frames - 1:
             self.goto(0)
         self.playing = True
-        self.play_btn.setText("Pause")
+        self.play_btn.setText("일시정지")
         self._play_step = max(1, int(round(self.info.fps / 30.0)))
         self.timer.start(int(1000 * self._play_step / self.info.fps))
 
     def _stop_play(self):
         self.playing = False
         self.timer.stop()
-        self.play_btn.setText("Play")
+        self.play_btn.setText("재생")
 
     def _play_tick(self):
         if self.info is None or self._awaiting:
@@ -872,7 +932,7 @@ class MainWindow(QMainWindow):
         if self.info is None:
             return
         if self.job_running:
-            self.statusBar().showMessage("A job is running: points are locked until it finishes or is cancelled.")
+            self.statusBar().showMessage("작업이 실행 중입니다. 끝나거나 취소될 때까지 포인트를 바꿀 수 없습니다.")
             return
         self._stop_play()
         self.store.add(self.frame_idx, fx, fy, label)
@@ -889,11 +949,11 @@ class MainWindow(QMainWindow):
     def new_object(self):
         oid = self.store.new_object()
         self._refresh_objects()
-        self.statusBar().showMessage(f"New object {oid}: left-click it in the video")
+        self.statusBar().showMessage(f"새 객체 {oid}: 영상에서 대상을 왼쪽 클릭하세요")
 
     def delete_object(self):
         n = sum(1 for p in self.store.points if p["obj_id"] == self.store.current)
-        if n and not self.ask_confirm(f"Delete object {self.store.current} and its {n} points?"):
+        if n and not self.ask_confirm(f"객체 {self.store.current}와(과) 그 점 {n}개를 삭제할까요?"):
             return
         removed = self.store.delete_object()
         if removed:
@@ -950,12 +1010,12 @@ class MainWindow(QMainWindow):
         for oid in ids:
             pts = [p for p in self.store.points if p["obj_id"] == oid]
             first = min((p["frame_idx"] for p in pts), default=None)
-            text = f"Object {oid}: {sum(1 for p in pts if p['label'] == 1)} +, {sum(1 for p in pts if p['label'] == 0)} -"
-            text += f"  (starts at frame {first})" if first is not None else "  (no points yet)"
+            text = f"객체 {oid}: {sum(1 for p in pts if p['label'] == 1)} +, {sum(1 for p in pts if p['label'] == 0)} -"
+            text += f"  (프레임 {first}부터)" if first is not None else "  (아직 점 없음)"
             st = self.store.styles.get(oid)
             if st:
                 text += "  [" + ", ".join(([st["style"]] if "style" in st else []) + ([f"{st['block']} px"] if "block" in st else [])
-                                          + ([f"pad {st['pad_px']:g}"] if "pad_px" in st else [])) + "]"
+                                          + ([f"여백 {st['pad_px']:g}"] if "pad_px" in st else [])) + "]"
             it = QListWidgetItem(text)
             it.setData(Qt.ItemDataRole.UserRole, oid)
             pm = QPixmap(14, 14)
@@ -978,31 +1038,31 @@ class MainWindow(QMainWindow):
     def save_points_as(self) -> bool:
         if self.info is None:
             return False
-        path, _ = QFileDialog.getSaveFileName(self, "Save points", self.points_path or "", "Points (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "포인트 저장", self.points_path or "", "포인트 (*.json)")
         return self._write_points(path) if path else False
 
     def _write_points(self, path: str) -> bool:
         probs = self.store.valid()
         if probs:
-            self.show_error("Points not saved:\n" + "\n".join(probs) + "\nAdd a positive (left-click) point for each of them.")
+            self.show_error("포인트를 저장하지 않았습니다:\n" + "\n".join(probs) + "\n각 항목에 긍정(왼쪽 클릭) 점을 하나 이상 추가하세요.")
             return False
         try:
             save_points(path, self.info, self.store.points, styles=self.store.styles)
         except OSError as e:
-            self.show_error(f"Could not write {path}:\n{e}")
+            self.show_error(f"{path}에 쓸 수 없습니다:\n{e}")
             return False
         self.points_path = path
         self.dirty = False
         self._update_title()
         self._refresh_stale_banner()
-        self.statusBar().showMessage(f"Saved {len(self.store.points)} points to {path}")
+        self.statusBar().showMessage(f"점 {len(self.store.points)}개를 {path}에 저장했습니다")
         return True
 
     def open_points_dialog(self):
         if self.info is None:
-            self.show_error("Open a video first.")
+            self.show_error("먼저 영상을 여세요.")
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open points", os.path.dirname(self.info.path), "Points (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "포인트 열기", os.path.dirname(self.info.path), "포인트 (*.json)")
         if path:
             self.statusBar().showMessage(self._try_load_points(path, quiet=False).strip(" -"))
 
@@ -1012,8 +1072,8 @@ class MainWindow(QMainWindow):
             styles = load_object_styles(path)
         except (PointsError, OSError, ValueError, KeyError) as e:
             if not quiet:
-                self.show_error(f"Could not use this points file:\n{e}")
-            return f" - points file ignored: {e}"
+                self.show_error(f"이 포인트 파일을 쓸 수 없습니다:\n{e}")
+            return f" - 포인트 파일 무시됨: {e}"
         if self.dirty and not self._maybe_save_before_leaving():
             return ""
         store = PointStore()
@@ -1029,7 +1089,7 @@ class MainWindow(QMainWindow):
         self._refresh_objects()
         self._update_title()
         self.view.update()
-        return f" - loaded {len(store.points)} points from {os.path.basename(path)}"
+        return f" - {os.path.basename(path)}에서 점 {len(store.points)}개를 불러왔습니다"
 
     def _update_title(self):
         name = os.path.basename(self.info.path) if self.info else ""
@@ -1038,7 +1098,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ shutdown
     def closeEvent(self, e):
         if self.job_running:
-            if not self.ask_confirm("A processing job is running. Cancel it and quit? (completed chunks are kept for resume)"):
+            if not self.ask_confirm("처리 작업이 실행 중입니다. 취소하고 종료할까요? (완료된 청크는 이어하기용으로 보관됩니다)"):
                 e.ignore()
                 return
             self.cancel_processing()

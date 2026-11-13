@@ -9,8 +9,10 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar,
 
 from .job_runner import overall_fraction
 
-STAGE_TEXT = {"loading_models": "Loading models ...", "processing": "Starting ...", "finalizing": "Merging chunks, attaching audio, verifying the result ...", "analyze": "Reading + detecting",
-              "track": "Tracking (SAM 2)", "render": "Applying mosaic + encoding"}
+STAGE_TEXT = {"loading_models": "모델 불러오는 중 ...", "processing": "시작하는 중 ...", "finalizing": "청크 병합, 오디오 결합, 결과 검증 중 ...", "analyze": "읽기 + 탐지",
+              "track": "추적 (SAM 2)", "render": "모자이크 적용 + 인코딩"}
+STATUS_TEXT = {"completed_no_flags": "완료 (검수 플래그 없음)", "completed_with_review_required": "완료 (검수 필요)", "cancelled": "취소됨",
+               "failed": "실패", "planned": "계획 완료", "interrupted": "중단됨"}
 
 
 def format_eta(seconds: Optional[float]) -> str:
@@ -32,18 +34,19 @@ class ProcessPanel(QWidget):
         super().__init__(parent)
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
-        self.stage = QLabel("Idle")
+        self.stage = QLabel("대기 중")
         self.detail = QLabel("")
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
-        self.log.setMinimumHeight(90)
-        self.cancel_btn = QPushButton("Cancel")
-        self.resume_btn = QPushButton("Resume")
-        self.out_btn = QPushButton("Open result")
-        self.logs_btn = QPushButton("Open logs folder")
+        self.log.setMinimumHeight(70)
+        self.log.setMaximumHeight(130)                   # keep the panel compact so the preview above keeps its room
+        self.cancel_btn = QPushButton("취소")
+        self.resume_btn = QPushButton("이어하기")
+        self.out_btn = QPushButton("결과 열기")
+        self.logs_btn = QPushButton("로그 폴더 열기")
         self.cancel_btn.clicked.connect(self.cancel_requested)
         self.resume_btn.clicked.connect(self.resume_requested)
         self.out_btn.clicked.connect(self.open_output_requested)
@@ -62,7 +65,7 @@ class ProcessPanel(QWidget):
 
     def reset(self):
         self.bar.setValue(0)
-        self.stage.setText("Idle")
+        self.stage.setText("대기 중")
         self.detail.setText("")
         self.summary.setText("")
         self.log.clear()
@@ -83,7 +86,7 @@ class ProcessPanel(QWidget):
     def on_progress(self, ev: dict):
         kind = ev.get("event")
         if kind == "warning":
-            self.add_log("WARNING: " + str(ev.get("text")))
+            self.add_log("경고: " + str(ev.get("text")))
             return
         if kind == "stage":
             self.stage.setText(STAGE_TEXT.get(ev.get("stage"), str(ev.get("stage"))))
@@ -93,39 +96,39 @@ class ProcessPanel(QWidget):
             return
         if kind == "start":
             self._f0 = f
-            self.detail.setText(f"{ev.get('total_frames')} frames in {ev.get('chunks')} chunks"
-                                + (f" - mosaic settings changed: {ev['rerender_chunks']} chunks only get a new mosaic (tracking reused)"
+            self.detail.setText(f"{ev.get('total_frames')}프레임, {ev.get('chunks')}개 청크"
+                                + (f" - 모자이크 설정 변경: {ev['rerender_chunks']}개 청크는 모자이크만 다시 적용 (추적 재사용)"
                                    if ev.get("rerender_chunks") else
-                                   f" - points changed: chunks 1-{ev['reused_chunks']} reused, the rest re-processed"
+                                   f" - 포인트 변경: 청크 1-{ev['reused_chunks']} 재사용, 나머지 다시 처리"
                                    if ev.get("points_changed") and ev.get("reused_chunks") else
-                                   f" - points changed: everything re-processed" if ev.get("points_changed") else
-                                   f" (resuming at chunk {ev['resume_from_chunk'] + 1})" if ev.get("resume_from_chunk") else ""))
+                                   f" - 포인트 변경: 전체 다시 처리" if ev.get("points_changed") else
+                                   f" (청크 {ev['resume_from_chunk'] + 1}부터 이어하기)" if ev.get("resume_from_chunk") else ""))
         if kind == "progress":
-            self.stage.setText(f"Chunk {ev['chunk'] + 1}/{ev['chunks']}: {STAGE_TEXT.get(ev['stage'], ev['stage'])}")
+            self.stage.setText(f"청크 {ev['chunk'] + 1}/{ev['chunks']}: {STAGE_TEXT.get(ev['stage'], ev['stage'])}")
         if kind == "chunk_done":
-            self.detail.setText(f"chunk {ev['chunk'] + 1}/{ev['chunks']} done  -  {ev.get('events', 0)} review events"
-                                f"  -  RSS {ev.get('rss_mb', '?')} MB, GPU peak {ev.get('cuda_peak_mb', '?')} MB")
+            self.detail.setText(f"청크 {ev['chunk'] + 1}/{ev['chunks']} 완료  -  검수 이벤트 {ev.get('events', 0)}건"
+                                f"  -  메모리 {ev.get('rss_mb', '?')} MB, GPU 최대 {ev.get('cuda_peak_mb', '?')} MB")
         self.bar.setValue(int(f * 1000))
         base = self._f0 or 0.0
         if f > base + 0.005:
             elapsed = time.time() - self._t0
-            self.bar.setFormat(f"{f * 100:.1f}%   elapsed {format_eta(elapsed)}   remaining ~{format_eta(elapsed * (1 - f) / (f - base))}")
+            self.bar.setFormat(f"{f * 100:.1f}%   경과 {format_eta(elapsed)}   남은 시간 약 {format_eta(elapsed * (1 - f) / (f - base))}")
         else:
             self.bar.setFormat(f"{f * 100:.1f}%")
 
     def on_finished(self, res: dict):
         self.cancel_btn.setEnabled(False)
         status = res.get("status") or "failed"
-        text = {"completed_no_flags": "Finished. No review flags (this does not prove nothing was missed - spot-check the result).",
-                "completed_with_review_required": f"Finished with review required: {res.get('error_events', 0)} error and "
-                                                  f"{res.get('warn_events', 0)} warning events. Check the review log before using the video.",
-                "cancelled": "Cancelled. Completed chunks are kept; Resume continues from them.",
-                "failed": "FAILED: " + str(res.get("reason") or "unknown error")}.get(status, status)
+        text = {"completed_no_flags": "완료. 검수 플래그가 없습니다 (누락이 없다는 증명은 아니므로 결과를 직접 확인하세요).",
+                "completed_with_review_required": f"완료, 검수 필요: 오류 {res.get('error_events', 0)}건, "
+                                                  f"경고 {res.get('warn_events', 0)}건. 영상을 쓰기 전에 검수 탭을 확인하세요.",
+                "cancelled": "취소됨. 완료된 청크는 보관되며, 이어하기를 누르면 거기서부터 계속합니다.",
+                "failed": "실패: " + str(res.get("reason") or "알 수 없는 오류")}.get(status, status)
         if res.get("problems"):
             text += "\n" + "; ".join(res["problems"])
         self.summary.setText(text)
-        self.summary.setStyleSheet("color: #c0392b" if status == "failed" else ("color: #d9822b" if status != "completed_no_flags" else ""))
-        self.stage.setText(status.replace("_", " "))
+        self.summary.setStyleSheet("color: #ff6b6b" if status == "failed" else ("color: #d9822b" if status != "completed_no_flags" else ""))
+        self.stage.setText(STATUS_TEXT.get(status, status.replace("_", " ")))
         if status in ("completed_no_flags", "completed_with_review_required"):
             self.bar.setValue(1000)
             self.out_btn.setVisible(True)

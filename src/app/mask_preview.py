@@ -62,7 +62,7 @@ class MaskPreview(QObject):
         p.errorOccurred.connect(self._on_error)
         self._proc, self._buf, self._busy, self._waiting = p, "", False, None
         cmd = list(command) if command else worker_command() + args
-        self._set_state("loading", "loading the model ...")
+        self._set_state("loading", "모델을 불러오는 중 ...")
         p.start(cmd[0], cmd[1:])
         return True
 
@@ -145,7 +145,7 @@ class MaskPreview(QObject):
     def _on_error(self, err):
         if err == QProcess.ProcessError.FailedToStart and self._proc is not None:
             self._proc = None
-            self._set_state("failed", "could not start the worker process")
+            self._set_state("failed", "작업 프로세스를 시작하지 못했습니다")
 
     def _on_finished(self, code, _status):
         if self._proc is None:
@@ -154,4 +154,4 @@ class MaskPreview(QObject):
         self._proc = None
         self._busy, self._waiting = False, None
         if self.state != "failed":
-            self._set_state("failed", f"the preview process ended (exit code {code})")
+            self._set_state("failed", f"미리보기 프로세스가 종료되었습니다 (종료 코드 {code})")
