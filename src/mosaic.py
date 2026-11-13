@@ -112,9 +112,10 @@ STYLES = ("pixelate", "blur", "solid")
 
 
 def recommended_block(width: int, height: int) -> int:
-    """Strength that scales with the video: about 1/60 of the longer side, in multiples of 4 (1280 -> 20, 1920 -> 32, 3840 -> 64).
+    """Strength that scales with the video: about 1/24 of the longer side, in multiples of 4 (1280 -> 52, 1920 -> 80, 3840 -> 160).
+    (1/60 until 2026-11-14: judged far too weak on real 4K footage by the user, who asked for five times the 32 px used then.)
     A rule of thumb, not a measurement: look at the preview and adjust for the footage."""
-    return int(min(256, max(4, round(max(width, height) / 60 / 4) * 4)))
+    return int(min(256, max(4, round(max(width, height) / 24 / 4) * 4)))
 
 
 def blur_region(frame: np.ndarray, mask: np.ndarray, strength: int) -> np.ndarray:

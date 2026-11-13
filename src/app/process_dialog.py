@@ -109,7 +109,7 @@ class ProcessDialog(QDialog):
         self.block_auto = QCheckBox("셀 크기 자동 (영상 해상도에 맞춰 정함)")
         self.block_auto.setChecked(st.block_auto and info is not None)
         self.block_auto.setEnabled(info is not None)
-        self.block_auto.setToolTip("화면 긴 변의 약 1/60로 정합니다 (풀HD 1920 → 32, 4K 3840 → 64). 어림값이므로 아래 미리보기로 "
+        self.block_auto.setToolTip("화면 긴 변의 약 1/24로 정합니다 (풀HD 1920 → 80, 4K 3840 → 160). 어림값이므로 아래 미리보기로 "
                                    "확인하세요. 아래 값을 직접 바꾸면 자동은 꺼집니다.")
         form.addRow(self.block_auto)
         self.block = QSpinBox()

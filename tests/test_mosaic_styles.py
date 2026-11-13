@@ -139,8 +139,8 @@ def test_style_change_rerenders_kept_chunks(video, tmp_path):
 # ------------------------------------------------------------------ strength: automatic choice, slider and preview in the settings dialog
 def test_recommended_block_scales_with_resolution():
     from src.mosaic import recommended_block
-    assert [recommended_block(w, h) for w, h in ((1280, 720), (1920, 1080), (3840, 2160))] == [20, 32, 64]
-    assert recommended_block(1080, 1920) == 32                      # portrait: the longer side counts
+    assert [recommended_block(w, h) for w, h in ((1280, 720), (1920, 1080), (3840, 2160))] == [52, 80, 160]
+    assert recommended_block(1080, 1920) == 80                      # portrait: the longer side counts
     assert recommended_block(10, 10) == 4 and recommended_block(100000, 10) == 256
 
 
