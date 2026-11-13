@@ -33,7 +33,7 @@ from .system_guard import disk_check, keep_awake
 from .detection import Det, fill_detections
 from .mosaic import (STYLES, apply_layers, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
-from .points_io import ObjectStyles, Prompts, load_object_styles, load_points
+from .points_io import MaskPrompts, ObjectStyles, Prompts, load_mask_prompts, load_object_styles, load_points, mask_digest
 from .tracking import Init, Tracker, TrackerError, pack_mask, unpack_mask
 from .video_io import (FrameReader, PrefetchReader, SegmentWriter, VideoError, VideoInfo, concat_and_mux, count_packets,
                        is_hdr, probe_video, verify_output)
@@ -161,8 +161,8 @@ def file_sha(path: Optional[str]) -> Optional[str]:
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def prompt_signatures(prompts: Prompts, chunks) -> List[str]:
-    """One signature per chunk over the clicks that fall into it.
+def prompt_signatures(prompts: Prompts, chunks, mask_prompts: Optional[MaskPrompts] = None) -> List[str]:
+    """One signature per chunk over the clicks and hand-drawn masks that fall into it.
 
     Tracking only runs forward and every chunk is re-seeded from the previous one, so the result of chunk c depends on the
     clicks in chunks 0..c and on nothing later. Changing a click therefore invalidates its own chunk and everything after it,
@@ -175,6 +175,10 @@ def prompt_signatures(prompts: Prompts, chunks) -> List[str]:
                 if s_ <= fr < e_:
                     pts, labs = prompts[oid][fr]
                     items.append([oid, fr, [[round(x, 2), round(y, 2)] for x, y in pts], list(labs)])
+        for oid in sorted(mask_prompts or {}):                    # appended only when present: files without masks keep their signatures
+            for fr in sorted(mask_prompts[oid]):
+                if s_ <= fr < e_:
+                    items.append([oid, fr, "mask", mask_digest(mask_prompts[oid][fr])])
         sigs.append(hashlib.sha256(json.dumps(items).encode()).hexdigest()[:16])
     return sigs
 
@@ -191,7 +195,7 @@ def plan_reprocess(cfg: Config) -> dict:
     chunks = [(s, min(s + cfg.chunk_size, total)) for s in range(0, total, cfg.chunk_size)]
     prompts = load_points(cfg.points, info, cfg.allow_points_mismatch) if cfg.points else {}
     styles = {k: v for k, v in (load_object_styles(cfg.points) if cfg.points else {}).items() if k in prompts}
-    sigs = prompt_signatures(prompts, chunks)
+    sigs = prompt_signatures(prompts, chunks, load_mask_prompts(cfg.points, info) if cfg.points else {})
     jd = job_dir_for(cfg, info)
     plan = {"total_chunks": len(chunks), "total_frames": total, "job_found": False, "can_resume": False, "reusable_chunks": 0,
             "frames_reused": 0, "render_only_chunks": 0, "frames_render_only": 0, "first_changed_chunk": None, "reason": ""}
@@ -439,7 +443,11 @@ class Pipeline:
         h = config_hash(cfg, info)
         rh = render_hash(cfg, self.obj_styles)
         self._points_changed, self._reused, self._rerender = False, 0, 0
-        self._sigs = prompt_signatures(prompts, chunks)
+        # hand-drawn masks: a prompt like a click; on its frame the tracker starts from exactly this mask
+        self.mask_prompts: MaskPrompts = load_mask_prompts(cfg.points, info) if cfg.points else {}
+        if self.mask_prompts:
+            log.info("hand-drawn masks: %s", {o: sorted(fr) for o, fr in self.mask_prompts.items()})
+        self._sigs = prompt_signatures(prompts, chunks, self.mask_prompts)
         job_dir = job_dir_for(cfg, info)
         self.job_dir = job_dir
         job_path = os.path.join(job_dir, "job.json")
@@ -768,10 +776,17 @@ class Pipeline:
         # ---- 2. tracking
         for oid in self.obj_ids:
             st = self.objstate[oid]
-            for k in sorted(prompts[oid]):
+            drawn = self.mask_prompts.get(oid, {})
+            for k in sorted(set(prompts[oid]) | set(drawn)):
                 if s <= k < e:
-                    pts, labs = prompts[oid][k]
-                    inits.append(Init(oid, L + k - s, [(x * self.sx, y * self.sy) for x, y in pts], list(labs), source="points"))
+                    if k in drawn:                         # a drawn mask replaces this object's clicks on the same frame
+                        m = drawn[k]
+                        if m.shape != self.shape:
+                            m = cv2.resize(m.astype(np.uint8), (self.aw, self.ah), interpolation=cv2.INTER_NEAREST).astype(bool)
+                        inits.append(Init(oid, L + k - s, mask=m, source="mask_prompt"))
+                    else:
+                        pts, labs = prompts[oid][k]
+                        inits.append(Init(oid, L + k - s, [(x * self.sx, y * self.sy) for x, y in pts], list(labs), source="points"))
                     started_here.setdefault(oid, L + k - s)
                     st.update(known=True, retired=False)
         self._tick("track", 0, n, ci, s)
@@ -818,7 +833,7 @@ class Pipeline:
                 m = unpack_mask(pm, shape) if pm is not None else None
                 v = self.monitor.observe(f, oid, m, qlog)
                 if v.status == "not_started":
-                    if li == started_here.get(oid) and f in self.prompts[oid]:
+                    if li == started_here.get(oid) and (f in self.prompts[oid] or f in self.mask_prompts.get(oid, {})):
                         qlog.add(f, PROMPT_NO_MASK, "error", oid, "SAM 2 returned an empty mask for the clicked prompt",
                                  action="flagged_no_region_known")
                     continue

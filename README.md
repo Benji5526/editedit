@@ -122,6 +122,21 @@ frame-number code of the synthetic clip that exactly the kept frames come out, i
 numbers the clicks and the mask cache refer to. Not supported: joining several videos, lossless (stream-copy) cuts, more than 200 kept pieces in one export; export time on a long
 4K video was not measured (the whole file is decoded and re-encoded).
 
+*Brush: correcting a mask by hand (`브러시로 마스크 수정`, `G`).* With the brush on, dragging on the preview paints (left button) or erases (right button) the mask of the
+selected object on the current frame; `Ctrl+Z` undoes the last stroke, and the properties panel has the brush size and a button that removes the drawn mask of the frame. The first
+stroke starts from the mask that is known for that object and frame - an earlier drawn mask, else the live preview's mask, else the last run's mask (when shown), else nothing - so
+the usual use is to fix what SAM 2 selected rather than to draw from scratch. A drawn mask is a **prompt like a click**: on its frame the tracker starts from exactly this mask
+(`add_new_mask`) and the object's clicks on that frame are ignored; an object may consist of drawn masks only. Drawn masks are saved in the points file (`mask_prompts`, compressed,
+file version 3; versions 1-3 are read) at the preview resolution and resized to the analysis size by the pipeline. They are part of the per-chunk prompt signature, so after saving,
+"re-process" recomputes from the chunk of the edited frame on, exactly like after a re-click. With the real checkpoint `tests/test_brush.py` checks the case the preview exposed:
+one click on the synthetic square selects a single stripe; painting the square on that frame gives that mask on the frame (IoU > 0.97) and the whole square on the following frames,
+across a chunk boundary (IoU > 0.8).
+**Correction records.** Every time the points are saved, each mask painted since the last save is written to `logs/corrections/` as one small `.npz`: the mask before (and where it
+came from: `drawn`, `preview`, `last_run`, `none`), the mask after, object, frame, and the number of added and removed pixels. The video's name and path are not stored (only its
+fingerprint). Nothing reads these records yet; they are the raw material for later features (suggesting padding from repeated edits, training a detector) and they stay on this
+machine. Limits: a drawn mask applies to its own frame only - the frames after it are whatever the tracker makes of it, and only a new run shows that; there is no "apply to the
+neighbouring frames and compare before/after" step yet; masks are edited at preview resolution (at most 1280 px wide).
+
 *Per-object mosaic settings.* In the Targets panel, "Mosaic for the selected object" gives a clicked object its own **style** (pixelate / blur / solid), **strength** (px) and
 **padding** (px); each can stay on "job setting" (the value from the processing dialog). The object list shows what is set. The settings are saved in the points file: a file with
 any of them is written as version 2 with an `object_styles` block (`{"2": {"style": "solid", "block": 48, "pad_px": 30}}`); a file without stays version 1, and both versions are read.
@@ -310,7 +325,7 @@ python -m pytest tests -q                    # everything (about 10 minutes): ru
 python -m pytest tests -q -m "not slow"      # quick check while working (about 2 minutes)
 python -m pytest tests -q --record-slow 3    # everything, then re-measure which tests are slow
 ```
-`tests/slow_tests.txt` lists the tests that took 3 s or more in a measured full run (86 of 292, which account for over 90 % of the time: real SAM 2 checkpoint, worker
+`tests/slow_tests.txt` lists the tests that took 3 s or more in a measured full run (about 80 of 300, which account for about 90 % of the time: real SAM 2 checkpoint, worker
 processes that import torch, encodes that are decoded again). `tests/conftest.py` gives them the marker `slow`. The list only decides what the quick run skips; the full run always
 runs everything, and a test that is not in the list counts as fast (re-record after adding slow tests). The quick run is not a substitute for the full run: bugs have shown up only
 in slow tests.

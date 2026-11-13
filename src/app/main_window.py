@@ -10,13 +10,17 @@ import dataclasses
 import hashlib
 import time
 
+import cv2
+import numpy as np
+
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
                                QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QToolBar,
                                QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
-from src.points_io import OBJECT_STYLES, PointStore, PointsError, load_object_styles, load_points, save_points
+from src.corrections import save_correction
+from src.points_io import OBJECT_STYLES, PointStore, PointsError, load_mask_prompts, load_object_styles, load_points, save_points
 from src.review import ReviewError
 from src.review_data import ReviewData, load_review_data
 from src.video_io import VideoInfo, is_hdr, probe_video
@@ -97,10 +101,19 @@ class MainWindow(QMainWindow):
         self._preview_reqs: dict = {}          # request id -> (frame, signature)
         self._preview_asked = None             # (frame, signature) of the newest request
         self._job_masks: Optional[JobMasks] = None
+        # brush: hand-drawn masks. _brush_base remembers what a mask looked like before the first stroke (for the correction record)
+        self._brush_base: dict = {}            # (obj_id, frame) -> (mask at edit size or None, source)
+        self._brush_undo: list = []            # [(obj_id, frame, mask before the stroke or None)]
+        self._stroke_key = None
+        self._stroke_mask: Optional[np.ndarray] = None
+        self.corrections_saved: list = []      # paths of the correction records written by the last save
 
         self.view = VideoView()
         self.view.set_provider(self._points_on_frame, lambda: self.store.current)
         self.view.clicked.connect(self.on_click)
+        self.view.stroke_started.connect(self._stroke_started)
+        self.view.stroke.connect(self._stroke_segment)
+        self.view.stroke_finished.connect(self._stroke_finished)
 
         self.slider = FlagSlider(Qt.Orientation.Horizontal)
         self.slider.setEnabled(False)
@@ -218,9 +231,20 @@ class MainWindow(QMainWindow):
         self.act_last.toggled.connect(self.toggle_last_masks)
         vm.addAction(self.act_live)
         vm.addAction(self.act_last)
+        self.act_brush = QAction("브러시로 마스크 수정", self)
+        self.act_brush.setCheckable(True)
+        self.act_brush.setShortcut(QKeySequence("G"))
+        self.act_brush.setToolTip("선택한 객체의 마스크를 이 프레임에서 직접 칠해 고칩니다. 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기.")
+        self.act_brush.toggled.connect(self.toggle_brush)
+        self.act_undo_stroke = self._act("마지막 붓질 되돌리기", "Ctrl+Z", self.undo_stroke)
+        self.act_clear_mask = self._act("이 프레임에서 그린 마스크 지우기", None, self.clear_drawn_mask)
         e = self.menuBar().addMenu("편집(&E)")
         e.addAction(act("이 프레임의 마지막 점 되돌리기", "U", self.undo_point))
         e.addAction(act("이 프레임에서 이 객체의 점 지우기", "X", self.clear_frame_points))
+        e.addSeparator()
+        e.addAction(self.act_brush)
+        e.addAction(self.act_undo_stroke)
+        e.addAction(self.act_clear_mask)
         e.addSeparator()
         self.act_cut = act("결과 영상 자르기...", "Ctrl+T", self.open_cut_dialog)
         self.act_cut.setToolTip("처리가 끝난 영상에서 구간을 잘라내 새 파일로 내보냅니다. 원본과 추적 결과는 바뀌지 않습니다.")
@@ -247,6 +271,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_live)
         tb.addAction(self.act_last)
+        tb.addAction(self.act_brush)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         spacer.setStyleSheet("background: transparent")
@@ -320,6 +345,27 @@ class MainWindow(QMainWindow):
         note.setObjectName("hint")
         note.setWordWrap(True)
         pv.addWidget(note)
+        # brush: paint the mask of the selected object on the current frame
+        self.brush_box = QGroupBox("브러시 (선택한 객체, 현재 프레임)")
+        bform = QFormLayout(self.brush_box)
+        self.brush_size = QSpinBox()
+        self.brush_size.setRange(2, 300)
+        self.brush_size.setValue(24)
+        self.brush_size.setToolTip("붓의 반지름, 원본 해상도 픽셀 기준.")
+        self.brush_size.valueChanged.connect(lambda *_: self._apply_brush_mode())
+        bform.addRow("붓 크기 (px)", self.brush_size)
+        self.brush_undo_btn = QPushButton("마지막 붓질 되돌리기 (Ctrl+Z)")
+        self.brush_undo_btn.clicked.connect(self.undo_stroke)
+        self.brush_clear_btn = QPushButton("이 프레임에서 그린 마스크 지우기")
+        self.brush_clear_btn.clicked.connect(self.clear_drawn_mask)
+        bform.addRow(self.brush_undo_btn)
+        bform.addRow(self.brush_clear_btn)
+        bnote = QLabel("도구 막대의 '브러시로 마스크 수정'(G)을 켜고 왼쪽 드래그로 칠하고 오른쪽 드래그로 지웁니다. "
+                       "그린 프레임에서는 클릭 대신 그린 마스크에서 추적을 시작합니다.")
+        bnote.setObjectName("hint")
+        bnote.setWordWrap(True)
+        bform.addRow(bnote)
+        pv.addWidget(self.brush_box)
         pv.addStretch(1)
         pdock.setWidget(pw)
         pdock.setMinimumWidth(300)
@@ -386,7 +432,7 @@ class MainWindow(QMainWindow):
         if self.review is None:
             return []
         pp = self.points_path if self.points_path and os.path.isfile(self.points_path) else None
-        reasons = self.review.staleness(pp, bool(self.store.points))
+        reasons = self.review.staleness(pp, bool(self.store.points or self.store.masks))
         if self.dirty:
             reasons.append("저장하지 않은 포인트 수정이 있습니다")
         return reasons
@@ -564,6 +610,10 @@ class MainWindow(QMainWindow):
         if running and self.act_live.isChecked():          # the job needs the GPU: the preview process is stopped
             self.act_live.setChecked(False)
         self.act_live.setEnabled(not running)
+        if running and self.act_brush.isChecked():         # masks are locked like the points while a job runs
+            self.act_brush.setChecked(False)
+        for w in (self.act_brush, self.act_undo_stroke, self.act_clear_mask, self.brush_box):
+            w.setEnabled(not running)
 
     def start_processing_dialog(self):
         if self.info is None:
@@ -584,7 +634,7 @@ class MainWindow(QMainWindow):
 
     def _points_for_job(self) -> Optional[str]:
         """The saved points file to hand to the worker, or None when nothing was clicked."""
-        if self.store.points and self.points_path and os.path.isfile(self.points_path) and not self.store.valid():
+        if (self.store.points or self.store.masks) and self.points_path and os.path.isfile(self.points_path) and not self.store.valid():
             return self.points_path
         return None
 
@@ -772,12 +822,132 @@ class MainWindow(QMainWindow):
         return {"size": (shape[1], shape[0]), "masks": [mask_image(m, object_color(oid)) for oid, m in sorted(masks.items())],
                 "boxes": list(boxes), "regions": list(regions), "full": full, "note": note}
 
+    # ------------------------------------------------------------------ brush: hand-drawn masks
+    def _edit_shape(self) -> tuple:
+        """(height, width) drawn masks are edited at: the preview size."""
+        w, h = self.server.size
+        return int(h), int(w)
+
+    def _apply_brush_mode(self):
+        self.view.set_brush(self.act_brush.isChecked(), float(self.brush_size.value()))
+
+    def toggle_brush(self, on: bool):
+        if on and self.info is None:
+            self._set_checked(self.act_brush, False)
+            self.show_error("먼저 영상을 여세요.")
+            on = False
+        if on:
+            self._stop_play()
+            self.statusBar().showMessage("브러시: 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기. 미리보기나 지난 실행의 마스크가 있으면 거기서 시작합니다.")
+        self._apply_brush_mode()
+        self._update_overlay()
+
+    def _resize_mask(self, mask: np.ndarray) -> np.ndarray:
+        shape = self._edit_shape()
+        if mask.shape == shape:
+            return mask.astype(bool)
+        return cv2.resize(mask.astype(np.uint8), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    def _brush_start_mask(self, oid: int, frame: int):
+        """What the mask of this object on this frame looks like before the user touches it: (mask at edit size or None, source)."""
+        drawn = self.store.get_mask(oid, frame)
+        if drawn is not None:
+            return self._resize_mask(drawn), "drawn"
+        hit = self._live_masks.get(frame)
+        if hit is not None and oid in hit[1]:
+            return self._resize_mask(hit[1][oid]), "preview"
+        if self._job_masks is not None:
+            fr = self._job_masks.frame(frame)
+            if fr is not None and oid in fr["masks"]:
+                return self._resize_mask(fr["masks"][oid]), "last_run"
+        return None, "none"
+
+    def _stroke_started(self, label: int):
+        if self.info is None or self.job_running or not self.act_brush.isChecked():
+            self._stroke_key = None
+            return
+        key = (self.store.current, self.frame_idx)
+        base, source = self._brush_start_mask(*key)
+        if key not in self._brush_base:
+            self._brush_base[key] = (None if base is None else base.copy(), source)
+        prev = self.store.get_mask(*key)
+        self._brush_undo.append((key[0], key[1], None if prev is None else prev.copy()))
+        del self._brush_undo[:-50]
+        self._stroke_key = key
+        self._stroke_mask = (np.zeros(self._edit_shape(), dtype=np.uint8) if base is None else base.astype(np.uint8))
+
+    def _stroke_segment(self, x0: float, y0: float, x1: float, y1: float, label: int):
+        if self._stroke_key is None or self._stroke_mask is None or self._stroke_key != (self.store.current, self.frame_idx):
+            return
+        h, w = self._stroke_mask.shape
+        kx, ky = w / self.info.width, h / self.info.height
+        r = max(1, int(round(self.brush_size.value() * kx)))
+        p0, p1 = (int(round(x0 * kx)), int(round(y0 * ky))), (int(round(x1 * kx)), int(round(y1 * ky)))
+        cv2.line(self._stroke_mask, p0, p1, int(label), thickness=2 * r, lineType=cv2.LINE_8)
+        cv2.circle(self._stroke_mask, p1, r, int(label), thickness=-1)
+        self.store.set_mask(self._stroke_key[0], self._stroke_key[1], self._stroke_mask.astype(bool))
+        self._update_overlay()
+
+    def _stroke_finished(self):
+        if self._stroke_key is not None:
+            self._stroke_key, self._stroke_mask = None, None
+            self._points_changed()
+
+    def undo_stroke(self):
+        if self.job_running or not self._brush_undo:
+            return
+        oid, frame, prev = self._brush_undo.pop()
+        self.store.set_mask(oid, frame, prev)
+        self._points_changed()
+        self.statusBar().showMessage(f"객체 {oid}, 프레임 {frame}의 붓질을 되돌렸습니다.")
+
+    def clear_drawn_mask(self):
+        key = (self.store.current, self.frame_idx)
+        if self.job_running or self.info is None or self.store.get_mask(*key) is None:
+            return
+        self._brush_undo.append((key[0], key[1], self.store.get_mask(*key).copy()))
+        self.store.set_mask(key[0], key[1], None)
+        self._points_changed()
+        self.statusBar().showMessage(f"객체 {key[0]}, 프레임 {key[1]}의 그린 마스크를 지웠습니다. 이 프레임은 다시 클릭으로 추적합니다.")
+
+    def _write_corrections(self):
+        """After a successful save: one record per mask that was painted since the last save (what it was before, what it is now)."""
+        self.corrections_saved = []
+        for (oid, frame), (base, source) in sorted(self._brush_base.items()):
+            after = self.store.get_mask(oid, frame)
+            if after is None:
+                continue
+            after = self._resize_mask(after)
+            if base is not None and base.shape == after.shape and np.array_equal(base, after):
+                continue
+            try:
+                self.corrections_saved.append(save_correction(self._log_dir(), self.info.fingerprint, (self.info.width, self.info.height), oid,
+                                                              frame, self.info.timestamp_of(frame), base, after, source))
+            except Exception:  # noqa: BLE001  (the record is a by-product: it must never make saving the points fail)
+                log.warning("could not write a correction record", exc_info=True)
+        self._brush_base.clear()
+
     def _update_overlay(self):
-        """Decide what to draw over the current frame: the live preview where the frame has clicks, else the last run's masks."""
+        """Decide what to draw over the current frame, then add the brush hint when the brush is on."""
+        self._update_overlay_base()
+        if self.info is not None and self.frame_idx >= 0 and self.act_brush.isChecked():
+            ov = dict(self.view.overlay() or {})
+            hint = f"[브러시: 객체 {self.store.current}] 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기."
+            ov["note"] = hint + ("  " + ov["note"] if ov.get("note") else "")
+            self.view.set_overlay(ov)
+
+    def _update_overlay_base(self):
+        """Hand-drawn masks of this frame first, else the live preview where the frame has clicks, else the last run's masks."""
         if self.info is None or self.frame_idx < 0:
             self.view.set_overlay(None)
             return
         f = self.frame_idx
+        drawn = {oid: frames[f] for oid, frames in self.store.masks.items() if f in frames}
+        if drawn:
+            shape = next(iter(drawn.values())).shape
+            ov = self._make_overlay(shape, drawn, note="그린 마스크: 이 프레임에서는 클릭 대신 이 마스크에서 추적을 시작합니다.")
+            self.view.set_overlay(ov)
+            return
         pts = [p for p in self.store.points if p["frame_idx"] == f]
         if self.preview.is_on() and pts:
             sig = tuple(sorted((p["obj_id"], round(p["x"], 2), round(p["y"], 2), p["label"]) for p in pts))
@@ -900,6 +1070,11 @@ class MainWindow(QMainWindow):
         self._live_masks.clear()
         self._preview_reqs.clear()
         self._preview_asked, self._job_masks = None, None
+        self._set_checked(self.act_brush, False)
+        self.view.set_brush(False)
+        self._brush_base.clear()
+        self._brush_undo.clear()
+        self._stroke_key = None
         self.view.set_overlay(None)
         self.review = None
         self.review_panel.set_data(None)
@@ -1110,11 +1285,14 @@ class MainWindow(QMainWindow):
     def _refresh_objects(self):
         self.obj_list.blockSignals(True)
         self.obj_list.clear()
-        ids = sorted(set(self.store.objects) | {p["obj_id"] for p in self.store.points})
+        ids = self.store.object_ids()
         for oid in ids:
             pts = [p for p in self.store.points if p["obj_id"] == oid]
-            first = min((p["frame_idx"] for p in pts), default=None)
+            drawn_frames = sorted(self.store.masks.get(oid, {}))
+            first = min([p["frame_idx"] for p in pts] + drawn_frames, default=None)
             text = f"객체 {oid}: {sum(1 for p in pts if p['label'] == 1)} +, {sum(1 for p in pts if p['label'] == 0)} -"
+            if drawn_frames:
+                text += f", 그린 마스크 {len(drawn_frames)}"
             text += f"  (프레임 {first}부터)" if first is not None else "  (아직 점 없음)"
             st = self.store.styles.get(oid)
             if st:
@@ -1129,7 +1307,8 @@ class MainWindow(QMainWindow):
             if oid == self.store.current:
                 self.obj_list.setCurrentItem(it)
         self.obj_list.blockSignals(False)
-        self.timeline_view.set_objects([(oid, object_color(oid), sorted({p["frame_idx"] for p in self.store.points if p["obj_id"] == oid}))
+        self.timeline_view.set_objects([(oid, object_color(oid), sorted({p["frame_idx"] for p in self.store.points if p["obj_id"] == oid}
+                                                                         | set(self.store.masks.get(oid, {}))))
                                         for oid in ids])
         self._load_style_widgets()
 
@@ -1153,12 +1332,13 @@ class MainWindow(QMainWindow):
             self.show_error("포인트를 저장하지 않았습니다:\n" + "\n".join(probs) + "\n각 항목에 긍정(왼쪽 클릭) 점을 하나 이상 추가하세요.")
             return False
         try:
-            save_points(path, self.info, self.store.points, styles=self.store.styles)
+            save_points(path, self.info, self.store.points, styles=self.store.styles, masks=self.store.masks)
         except OSError as e:
             self.show_error(f"{path}에 쓸 수 없습니다:\n{e}")
             return False
         self.points_path = path
         self.dirty = False
+        self._write_corrections()
         self._update_title()
         self._refresh_stale_banner()
         self.statusBar().showMessage(f"점 {len(self.store.points)}개를 {path}에 저장했습니다")
@@ -1176,6 +1356,7 @@ class MainWindow(QMainWindow):
         try:
             prompts = load_points(path, self.info)
             styles = load_object_styles(path)
+            drawn = load_mask_prompts(path, self.info)
         except (PointsError, OSError, ValueError, KeyError) as e:
             if not quiet:
                 self.show_error(f"이 포인트 파일을 쓸 수 없습니다:\n{e}")
@@ -1187,9 +1368,12 @@ class MainWindow(QMainWindow):
             for fr, (pts, labs) in frames.items():
                 for (x, y), lab in zip(pts, labs):
                     store.points.append({"obj_id": oid, "frame_idx": fr, "x": x, "y": y, "label": lab})
-        ids = sorted({p["obj_id"] for p in store.points})
+        store.masks = drawn
+        ids = sorted({p["obj_id"] for p in store.points} | set(drawn))
         if ids:
             store.objects, store.current = ids, ids[0]
+        self._brush_base.clear()
+        self._brush_undo.clear()
         store.styles = {k: v for k, v in styles.items() if k in ids}
         self.store, self.points_path, self.dirty = store, path, False
         self._refresh_objects()

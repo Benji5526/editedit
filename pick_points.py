@@ -32,7 +32,8 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-from src.points_io import PointStore, PointsError, load_object_styles, save_points, load_points  # noqa: F401  (PointStore re-exported)
+from src.points_io import (PointStore, PointsError, load_mask_prompts, load_object_styles, save_points,  # noqa: F401  (PointStore re-exported)
+                           load_points)
 from src.review import ReviewError, ReviewNavigator, load_review
 from src.video_io import VideoInfo, probe_video, read_frame_at
 
@@ -59,6 +60,7 @@ class Picker:
             try:
                 pr = load_points(self.out, self.info)
                 self.store.styles = load_object_styles(self.out)      # per-object mosaic settings made in the app survive a re-save here
+                self.store.masks = load_mask_prompts(self.out, self.info)   # ... and so do masks drawn in the app
             except (PointsError, KeyError, ValueError) as e:
                 print(f"existing {self.out} not loaded: {e}")
                 return
@@ -129,7 +131,7 @@ class Picker:
             self.msg = "NOT saved: " + probs[0]
             print("NOT saved:", "; ".join(probs))
             return
-        save_points(self.out, self.info, self.store.points, styles=self.store.styles)
+        save_points(self.out, self.info, self.store.points, styles=self.store.styles, masks=self.store.masks)
         self.dirty = False
         self.msg = f"saved {len(self.store.points)} points"
         print(self.msg, "->", self.out)

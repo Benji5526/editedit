@@ -28,6 +28,9 @@ def mask_image(mask: np.ndarray, color: QColor, alpha: int = 110) -> QImage:
 
 class VideoView(QWidget):
     clicked = Signal(float, float, int)    # frame x, frame y (full-res px), label (1 = positive, 0 = negative)
+    stroke_started = Signal(int)           # brush mode: a drag begins; label 1 = paint, 0 = erase
+    stroke = Signal(float, float, float, float, int)   # brush mode: segment from (x0, y0) to (x1, y1) in full-res frame px, label
+    stroke_finished = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,6 +43,62 @@ class VideoView(QWidget):
         self._current_obj: Callable[[], int] = lambda: 1
         self.message = "영상을 여세요 (Ctrl+O)"
         self._overlay: Optional[dict] = None
+        self.brush_mode = False                # True: dragging paints/erases instead of placing points
+        self.brush_radius = 0.0                # in full-resolution frame pixels (drawn as the cursor circle)
+        self._stroke_label: Optional[int] = None
+        self._stroke_last: Optional[tuple] = None
+        self._hover: Optional[tuple] = None
+
+    def set_brush(self, on: bool, radius_frame_px: float = 0.0):
+        self.brush_mode, self.brush_radius = bool(on), float(radius_frame_px)
+        self.setMouseTracking(self.brush_mode)
+        self.setCursor(Qt.CursorShape.CrossCursor if self.brush_mode else Qt.CursorShape.ArrowCursor)
+        if not on:
+            self._stroke_label = self._stroke_last = self._hover = None
+        self.update()
+
+    def _frame_pos(self, wx: float, wy: float) -> Optional[tuple]:
+        """Widget position -> frame coordinates, clamped to the frame (a stroke may run over the letterbox bars)."""
+        fit = self.fit()
+        if fit is None or self._frame_size[0] <= 0:
+            return None
+        w, h = self._frame_size
+        return (min(w - 1.0, max(0.0, (wx - fit.ox) / fit.w * w)), min(h - 1.0, max(0.0, (wy - fit.oy) / fit.h * h)))
+
+    def handle_stroke_press(self, wx: float, wy: float, label: int) -> bool:
+        pt = self._frame_pos(wx, wy)
+        if pt is None:
+            return False
+        self._stroke_label, self._stroke_last = int(label), pt
+        self.stroke_started.emit(int(label))
+        self.stroke.emit(pt[0], pt[1], pt[0], pt[1], int(label))
+        return True
+
+    def handle_stroke_move(self, wx: float, wy: float):
+        self._hover = (wx, wy)
+        pt = self._frame_pos(wx, wy)
+        if pt is not None and self._stroke_label is not None and self._stroke_last is not None:
+            self.stroke.emit(self._stroke_last[0], self._stroke_last[1], pt[0], pt[1], self._stroke_label)
+            self._stroke_last = pt
+        self.update()
+
+    def handle_stroke_release(self):
+        if self._stroke_label is not None:
+            self._stroke_label = self._stroke_last = None
+            self.stroke_finished.emit()
+
+    def mouseMoveEvent(self, e):
+        if self.brush_mode:
+            pos = e.position()
+            self.handle_stroke_move(pos.x(), pos.y())
+
+    def mouseReleaseEvent(self, e):
+        if self.brush_mode:
+            self.handle_stroke_release()
+
+    def leaveEvent(self, e):
+        self._hover = None
+        self.update()
 
     def set_overlay(self, overlay: Optional[dict]):
         """Masks and boxes to draw over the frame, or None. Keys (all optional): size (w, h) of the coordinate space of boxes and
@@ -70,11 +129,14 @@ class VideoView(QWidget):
         if e.button() not in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             return
         pos = e.position()
+        if self.brush_mode:
+            self.handle_stroke_press(pos.x(), pos.y(), 1 if e.button() == Qt.MouseButton.LeftButton else 0)
+            return
         self.handle_click(pos.x(), pos.y(), 1 if e.button() == Qt.MouseButton.LeftButton else 0)
 
     def handle_click(self, wx: float, wy: float, label: int) -> bool:
         """Widget position -> frame coordinates; clicks on the letterbox bars are ignored."""
-        if self._frame_size[0] <= 0:
+        if self._frame_size[0] <= 0 or self.brush_mode:        # in brush mode the mouse paints; no points are placed
             return False
         pt = widget_to_frame(self.fit(), wx, wy, *self._frame_size)
         if pt is None:
@@ -123,10 +185,18 @@ class VideoView(QWidget):
                 p.drawRect(target.adjusted(2, 2, -2, -2))
             if ov.get("note"):
                 p.setFont(QFont("Malgun Gothic", 9))
-                box = QRectF(target.left() + 6, target.top() + 6, min(target.width() - 12, 640), 22)
+                box = QRectF(target.left() + 6, target.top() + 6, min(target.width() - 12, 980), 22)
                 p.fillRect(box, QColor(0, 0, 0, 150))
                 p.setPen(QColor("white"))
                 p.drawText(box.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, ov["note"])
+        if self.brush_mode and self._hover is not None and self.brush_radius > 0:      # brush cursor: a circle of the brush's size
+            r = self.brush_radius * fit.w / max(1, self._frame_size[0])
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor("white"), 1.5))
+            p.drawEllipse(QPointF(*self._hover), r, r)
+            p.setPen(QPen(QColor("black"), 1, Qt.PenStyle.DotLine))
+            p.drawEllipse(QPointF(*self._hover), r + 1.5, r + 1.5)
         cur = self._current_obj()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setFont(QFont("Malgun Gothic", 10, QFont.Weight.Bold))
