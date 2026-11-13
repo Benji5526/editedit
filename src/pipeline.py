@@ -30,9 +30,9 @@ from . import quality_control as qc
 from .job_manager import JobDB, db_path_for
 from .system_guard import disk_check, keep_awake
 from .detection import Det, fill_detections
-from .mosaic import (STYLES, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
+from .mosaic import (STYLES, apply_layers, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
-from .points_io import Prompts, load_points
+from .points_io import ObjectStyles, Prompts, load_object_styles, load_points
 from .tracking import Init, Tracker, TrackerError, pack_mask, unpack_mask
 from .video_io import (FrameReader, PrefetchReader, SegmentWriter, VideoError, VideoInfo, concat_and_mux, count_packets,
                        is_hdr, probe_video, verify_output)
@@ -144,9 +144,12 @@ def config_hash(cfg: Config, info: VideoInfo) -> str:
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
 
 
-def render_hash(cfg: Config) -> str:
-    """Hash of the render-only options. Stored with every finished chunk; a segment is only reused when it matches."""
+def render_hash(cfg: Config, object_styles: Optional[ObjectStyles] = None) -> str:
+    """Hash of the render-only options, including the per-object mosaic settings of the points file. Stored with every finished
+    chunk; a segment is only reused when it matches."""
     d = {k: v for k, v in asdict(cfg).items() if k in RENDER_ONLY}
+    if object_styles:
+        d["object_styles"] = {str(k): object_styles[k] for k in sorted(object_styles)}
     d["code"] = CODE_VERSION
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
 
@@ -248,6 +251,7 @@ def plan_reprocess(cfg: Config) -> dict:
     total = min(info.nb_frames, cfg.max_frames) if cfg.max_frames else info.nb_frames
     chunks = [(s, min(s + cfg.chunk_size, total)) for s in range(0, total, cfg.chunk_size)]
     prompts = load_points(cfg.points, info, cfg.allow_points_mismatch) if cfg.points else {}
+    styles = {k: v for k, v in (load_object_styles(cfg.points) if cfg.points else {}).items() if k in prompts}
     sigs = prompt_signatures(prompts, chunks)
     jd = job_dir_for(cfg, info)
     plan = {"total_chunks": len(chunks), "total_frames": total, "job_found": False, "can_resume": False, "reusable_chunks": 0,
@@ -265,7 +269,7 @@ def plan_reprocess(cfg: Config) -> dict:
     plan["can_resume"] = True
     limit = first_changed_chunk(old.get("chunk_prompt_sigs"), sigs)
     plan["first_changed_chunk"] = limit if limit < len(chunks) else None
-    rh = render_hash(cfg)
+    rh = render_hash(cfg, styles)
     good = analyzed = 0
     seg_prefix = True
     for ci in range(min(limit, len(chunks))):
@@ -486,11 +490,15 @@ class Pipeline:
             raise JobFailed("nothing to do: no points and NudeNet disabled")
         self.prompts = prompts
         self.obj_ids = sorted(prompts)
+        # per-object mosaic settings: render-only (they are part of render_hash, not of the clicks' signatures)
+        self.obj_styles: ObjectStyles = {k: v for k, v in (load_object_styles(cfg.points) if cfg.points else {}).items() if k in prompts}
+        if self.obj_styles:
+            log.info("per-object mosaic settings: %s", self.obj_styles)
 
         cs = cfg.chunk_size
         chunks = [(s, min(s + cs, total)) for s in range(0, total, cs)]
         h = config_hash(cfg, info)
-        rh = render_hash(cfg)
+        rh = render_hash(cfg, self.obj_styles)
         self._points_changed, self._reused, self._rerender = False, 0, 0
         self._sigs = prompt_signatures(prompts, chunks)
         job_dir = job_dir_for(cfg, info)
@@ -931,6 +939,11 @@ class Pipeline:
         writer = SegmentWriter(seg_path, info, cfg.encoder, cfg.crf, cfg.preset)
         pad_an = int(round(cfg.mask_pad_px * self.sx))
         det_pad_an = cfg.det_pad_px * self.sx
+        default_key = (cfg.mosaic_style, int(cfg.block))
+        # objects with their own settings get their own layer: (style, strength) -> mask, own padding
+        own = {oid: ((st.get("style", cfg.mosaic_style), int(st.get("block", cfg.block))),
+                     int(round(st.get("pad_px", cfg.mask_pad_px) * self.sx)))
+               for oid, st in self.obj_styles.items()}
         fc_run: Dict[str, int] = {}
         try:
             for i in range(n):
@@ -940,19 +953,22 @@ class Pipeline:
                 if full is None:
                     qlog.add(s + i, qc.FRAME_ERROR, "error", None, "full-resolution reader ended early", action="job_aborted")
                     raise JobFailed(f"full-resolution reader returned only {i} of {n} frames in chunk {ci}")
+                layers: Dict[tuple, np.ndarray] = {}     # everything else (unstyled objects, detections, fail-closed) is default_key
                 if fc_full[i]:
                     m_an = np.ones(shape, dtype=bool)
                 else:
-                    seqs = []
+                    m_an = np.zeros(shape, dtype=bool)
                     for oid in self.obj_ids:
                         if any(p is not None for p in packed[oid]):
                             lo, hi = max(0, i - cfg.temporal_radius), min(n, i + cfg.temporal_radius + 1)
+                            m_obj = m_an if oid not in own else np.zeros(shape, dtype=bool)
                             for j in range(lo, hi):
                                 if packed[oid][j] is not None:
-                                    seqs.append(unpack_mask(packed[oid][j], shape))
-                    m_an = np.zeros(shape, dtype=bool)
-                    for m in seqs:
-                        m_an |= m
+                                    m_obj |= unpack_mask(packed[oid][j], shape)
+                            if oid in own:
+                                key, pad_o = own[oid]
+                                m_obj = dilate_mask(m_obj, pad_o)
+                                layers[key] = m_obj if key not in layers else (layers[key] | m_obj)
                     m_an = dilate_mask(m_an, pad_an)
                     dboxes = [expand_box(d.box, cfg.det_expand, det_pad_an, shape) for d in filled[i]]
                     if dboxes:
@@ -967,8 +983,8 @@ class Pipeline:
                     qlog.add(s + i, qc.FAIL_CLOSED_APPLIED, "info", None,
                              f"reason={fc_reason[i]} mode={'full' if fc_full[i] else cfg.fail_closed_mode}",
                              action="full_frame_mosaic" if (fc_full[i] or cfg.fail_closed_mode == "full") else "expanded_bbox_mosaic")
-                m_full = upscale_mask(m_an, (info.height, info.width))
-                apply_mosaic(full, m_full, cfg.mosaic_style, cfg.block)
+                layers[default_key] = m_an if default_key not in layers else (layers[default_key] | m_an)
+                apply_layers(full, {k: upscale_mask(m, (info.height, info.width)) for k, m in layers.items() if m.any()})
                 writer.write(full)
             writer.close()
         except BaseException:
@@ -1044,6 +1060,7 @@ class Pipeline:
                 "points_path": os.path.abspath(cfg.points) if cfg.points else None,
                 "reused_chunks": self._reused, "reprocessed_chunks": list(range(self._reused, len(chunks))),
                 "rerendered_chunks": self._rerender,
+                "object_styles": {str(k): v for k, v in self.obj_styles.items()},
                 "created": time.strftime("%F %T"),
                 "output": None if problems else {"path": os.path.abspath(out_final), "size": os.path.getsize(partial),
                                                  "mtime": round(os.path.getmtime(partial), 3)}}

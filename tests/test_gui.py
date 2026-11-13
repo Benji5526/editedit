@@ -205,6 +205,48 @@ def test_negative_only_points_are_not_saved(win):
     assert not os.path.exists(default_points_path(win.test_video)) and win.dirty
 
 
+def test_per_object_mosaic_settings_are_edited_saved_and_reloaded(win):
+    import json
+    from src.points_io import load_object_styles
+    open_clip(win)
+    win.goto(20)
+    pump(lambda: shown_code(win) == 20)
+    win.view.handle_click(*_widget_pos(win, 200, 150), 1)
+    win.new_object()
+    win.view.handle_click(*_widget_pos(win, 500, 100), 1)
+    assert win.save_points() and not win.dirty
+    path = default_points_path(win.test_video)
+    assert json.load(open(path))["version"] == 1                              # no settings yet: the old file format
+
+    assert win.store.current == 2
+    win.obj_style.setCurrentIndex(win.obj_style.findData("solid"))
+    win.obj_block.setValue(48)
+    win.obj_pad.setValue(30)
+    assert win.dirty and win.store.styles == {2: {"style": "solid", "block": 48, "pad_px": 30.0}}
+    assert "solid" in win.obj_list.item(1).text() and "48 px" in win.obj_list.item(1).text()
+    win.obj_list.setCurrentRow(0)                                             # object 1 has none: the widgets show "job setting"
+    assert win.store.current == 1 and win.obj_style.currentData() is None and win.obj_block.value() == 0 and win.obj_pad.value() == -1
+    assert win.store.styles == {2: {"style": "solid", "block": 48, "pad_px": 30.0}}      # switching did not edit anything
+    win.obj_block.setValue(1)                                                 # 1 is not a strength: it becomes 2
+    assert win.store.styles[1] == {"block": 2}
+    win.obj_block.setValue(0)
+    assert 1 not in win.store.styles
+
+    assert win.save_points() and not win.dirty
+    assert json.load(open(path))["version"] == 2 and load_object_styles(path) == {2: {"style": "solid", "block": 48, "pad_px": 30.0}}
+    win.store.styles.clear()
+    assert win._try_load_points(path, quiet=True).strip().startswith("- loaded 2 points")
+    assert win.store.styles == {2: {"style": "solid", "block": 48, "pad_px": 30.0}} and not win.dirty
+    win.obj_list.setCurrentRow(1)
+    assert win.obj_style.currentData() == "solid" and win.obj_block.value() == 48 and win.obj_pad.value() == 30
+
+    win._set_job_running(True)                                                # locked while a job runs
+    assert not win.style_box.isEnabled()
+    win._set_job_running(False)
+    win.delete_object()
+    assert win.store.styles == {}
+
+
 def test_undo_clear_objects(win):
     open_clip(win)
     win.view.handle_click(*_widget_pos(win, 10, 10), 1)

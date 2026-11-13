@@ -12,7 +12,13 @@ from typing import Dict, List, Tuple
 
 from .video_io import VideoInfo
 
-VERSION = 1
+VERSION = 1            # clicks only
+VERSION_STYLES = 2     # clicks + per-object mosaic settings ("object_styles"); written only when an object has its own settings
+SUPPORTED_VERSIONS = (VERSION, VERSION_STYLES)
+OBJECT_STYLES = ("pixelate", "blur", "solid")          # same names as src.mosaic.STYLES (kept here so this module stays light)
+
+# obj_id -> {"style": str, "block": int, "pad_px": float}; every key is optional, a missing key means "use the job's setting"
+ObjectStyles = Dict[int, dict]
 
 # obj_id -> frame_idx -> (points[(x, y)], labels[int])
 Prompts = Dict[int, Dict[int, Tuple[List[Tuple[float, float]], List[int]]]]
@@ -28,8 +34,45 @@ def video_block(info: VideoInfo) -> dict:
             "nb_frames": info.nb_frames, "rotation": info.rotation, "is_vfr": info.is_vfr}
 
 
-def save_points(path: str, info: VideoInfo, points: List[dict], names: Dict[int, str] = None):
-    """points: dicts with obj_id, frame_idx, x, y, label (1 positive / 0 negative)."""
+def normalize_styles(styles) -> ObjectStyles:
+    """Validate per-object mosaic settings and drop everything that is unset. Raises PointsError on a bad value."""
+    out: ObjectStyles = {}
+    for oid, st in (styles or {}).items():
+        if not isinstance(st, dict):
+            raise PointsError(f"object {oid}: mosaic settings must be an object, not {type(st).__name__}")
+        clean = {}
+        unknown = set(st) - {"style", "block", "pad_px"}
+        if unknown:
+            raise PointsError(f"object {oid}: unknown mosaic setting(s) {sorted(unknown)}")
+        if st.get("style") is not None:
+            if st["style"] not in OBJECT_STYLES:
+                raise PointsError(f"object {oid}: unknown mosaic style {st['style']!r}; choose one of {OBJECT_STYLES}")
+            clean["style"] = st["style"]
+        if st.get("block") is not None:
+            b = int(st["block"])
+            if not (2 <= b <= 256):
+                raise PointsError(f"object {oid}: mosaic strength {b} is outside 2-256")
+            clean["block"] = b
+        if st.get("pad_px") is not None:
+            pad = float(st["pad_px"])
+            if not (0 <= pad <= 500):
+                raise PointsError(f"object {oid}: mask padding {pad} is outside 0-500")
+            clean["pad_px"] = pad
+        if clean:
+            out[int(oid)] = clean
+    return out
+
+
+def load_object_styles(path: str) -> ObjectStyles:
+    """Per-object mosaic settings of a points file ({} for a version 1 file)."""
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    return normalize_styles(doc.get("object_styles"))
+
+
+def save_points(path: str, info: VideoInfo, points: List[dict], names: Dict[int, str] = None, styles: ObjectStyles = None):
+    """points: dicts with obj_id, frame_idx, x, y, label (1 positive / 0 negative).
+    styles: per-object mosaic settings; only those of objects that have points are written. A file without any stays version 1."""
     rows = []
     for p in sorted(points, key=lambda p: (p["obj_id"], p["frame_idx"])):
         rows.append({"obj_id": int(p["obj_id"]), "frame_idx": int(p["frame_idx"]),
@@ -37,9 +80,13 @@ def save_points(path: str, info: VideoInfo, points: List[dict], names: Dict[int,
                      "x": round(float(p["x"]), 2), "y": round(float(p["y"]), 2),
                      "x_norm": round(float(p["x"]) / info.width, 6), "y_norm": round(float(p["y"]) / info.height, 6),
                      "label": int(p["label"])})
-    doc = {"version": VERSION, "video": video_block(info),
+    have = {r["obj_id"] for r in rows}
+    styles = {k: v for k, v in normalize_styles(styles).items() if k in have}
+    doc = {"version": VERSION_STYLES if styles else VERSION, "video": video_block(info),
            "coordinate_space": "decoded full-resolution frame pixels (after rotation), origin top-left",
            "objects": {str(k): v for k, v in (names or {}).items()}, "points": rows}
+    if styles:
+        doc["object_styles"] = {str(k): styles[k] for k in sorted(styles)}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=1, ensure_ascii=False)
@@ -49,8 +96,9 @@ def save_points(path: str, info: VideoInfo, points: List[dict], names: Dict[int,
 def load_points(path: str, info: VideoInfo, allow_fingerprint_mismatch: bool = False) -> Prompts:
     with open(path, encoding="utf-8") as f:
         doc = json.load(f)
-    if doc.get("version") != VERSION:
+    if doc.get("version") not in SUPPORTED_VERSIONS:
         raise PointsError(f"unsupported points file version {doc.get('version')}")
+    normalize_styles(doc.get("object_styles"))          # a bad per-object setting is rejected here, before any processing
     v = doc["video"]
     if (v["width"], v["height"]) != (info.width, info.height):
         raise PointsError(f"points were picked on {v['width']}x{v['height']} frames but the video decodes to "
@@ -87,6 +135,23 @@ class PointStore:
         self.points: List[dict] = []     # {obj_id, frame_idx, x, y, label}
         self.objects: List[int] = [1]
         self.current = 1
+        self.styles: ObjectStyles = {}   # per-object mosaic settings (see normalize_styles)
+
+    def set_style(self, obj_id: int, key: str, value) -> bool:
+        """Set (or with None: clear) one mosaic setting of an object. Returns True when something changed."""
+        st = dict(self.styles.get(obj_id, {}))
+        if value is None:
+            st.pop(key, None)
+        else:
+            st[key] = value
+        new = normalize_styles({obj_id: st}).get(obj_id, {})
+        if new == self.styles.get(obj_id, {}):
+            return False
+        if new:
+            self.styles[obj_id] = new
+        else:
+            self.styles.pop(obj_id, None)
+        return True
 
     def add(self, frame_idx: int, x: float, y: float, label: int):
         if label not in (0, 1):
@@ -119,6 +184,7 @@ class PointStore:
 
     def delete_object(self) -> int:
         n = len(self.points)
+        self.styles.pop(self.current, None)
         self.points = [p for p in self.points if p["obj_id"] != self.current]
         if self.current in self.objects and len(self.objects) > 1:
             self.objects.remove(self.current)

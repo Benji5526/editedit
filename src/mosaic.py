@@ -144,6 +144,26 @@ def solid_region(frame: np.ndarray, mask: np.ndarray, value: int = 0) -> np.ndar
     return frame
 
 
+_STYLE_RANK = {"blur": 0, "pixelate": 1, "solid": 2}
+
+
+def layer_order(layers):
+    """Order in which (style, strength) layers are applied: weakest first, so that where two layers overlap the stronger one is
+    applied last and wins (blur < pixelate < solid, then by strength)."""
+    return sorted(layers, key=lambda k: (_STYLE_RANK.get(k[0], 1), int(k[1])))
+
+
+def apply_layers(frame: np.ndarray, layers) -> np.ndarray:
+    """Obscure ``frame`` in place with several masks, each with its own style and strength.
+    ``layers`` maps (style, strength) -> bool mask of the frame's size. Every pixel of every mask ends up obscured; in overlaps the
+    strongest layer wins. With a single layer this is exactly apply_mosaic."""
+    for key in layer_order(layers):
+        mask = layers[key]
+        if mask is not None and mask.any():
+            apply_mosaic(frame, mask, key[0], int(key[1]))
+    return frame
+
+
 def apply_mosaic(frame: np.ndarray, mask: np.ndarray, style: str = "pixelate", strength: int = 32) -> np.ndarray:
     """Obscure ``frame`` in place where ``mask`` is True. ``strength`` is the block size (pixelate) or twice the sigma (blur);
     it is ignored for solid. Pixelate and solid destroy the content; blur is the weakest of the three."""

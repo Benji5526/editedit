@@ -95,6 +95,17 @@ missing makes processing start in full from that chunk; a cache file that exists
 Not measured: the size of the cache on real 4K footage (masks compress well, but it adds to the disk use of the kept chunks) and the time saved on a long video.
 The cache is derived from the footage; it lives in the job's work folder and is deleted with it.
 
+*Per-object mosaic settings.* In the Targets panel, "Mosaic for the selected object" gives a clicked object its own **style** (pixelate / blur / solid), **strength** (px) and
+**padding** (px); each can stay on "job setting" (the value from the processing dialog). The object list shows what is set. The settings are saved in the points file: a file with
+any of them is written as version 2 with an `object_styles` block (`{"2": {"style": "solid", "block": 48, "pad_px": 30}}`); a file without stays version 1, and both versions are read.
+Bad values are rejected when the file is loaded. They are render-only: after changing them, saving, and re-running with "Resume / reuse an earlier run", the chunks are re-rendered
+from the mask cache without tracking again. Rendering works in layers, one per (style, strength): objects with their own settings get their own layer; objects without, NudeNet
+detections and fail-closed areas use the job setting. Layers are applied weakest first (blur < pixelate < solid, then by strength), so **where areas overlap the stronger one wins**
+and every pixel of every area is still covered. Without any per-object setting the render is exactly the previous single-mask render.
+Limits: no per-detection-class settings (all NudeNet boxes use the job setting), no settings per time range, no feathered edges, and the strength is in pixels (the dialog's
+automatic strength only applies to the job setting). `tests/test_object_styles.py` checks the file format, the layer order, and that an object's own setting gives the same video as
+the same job setting when that object is the only region.
+
 *Review log consistency.* Every run writes `run_id`, the sha256 of the points file it used and the size/mtime of the output video into the review log. The Review tab shows a red
 banner when the current points file or the output video no longer match the log. "Reviewed" marks are stored next to the log (`*_review_state.json`); after a re-process they are kept
 only for flags in reused chunks and reset for recomputed ones. "Reviewed" means a human looked at it, not that the frame is correct.

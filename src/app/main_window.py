@@ -11,10 +11,10 @@ import time
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap
-from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+                               QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
-from src.points_io import PointStore, PointsError, load_points, save_points
+from src.points_io import OBJECT_STYLES, PointStore, PointsError, load_object_styles, load_points, save_points
 from src.review import ReviewError
 from src.review_data import ReviewData, load_review_data
 from src.video_io import VideoInfo, is_hdr, probe_video
@@ -198,6 +198,32 @@ class MainWindow(QMainWindow):
             b = QPushButton(text)
             b.clicked.connect(fn)
             v.addWidget(b)
+        # per-object mosaic settings ("job setting" = whatever is chosen in the processing dialog)
+        self.style_box = QGroupBox("Mosaic for the selected object")
+        form = QFormLayout(self.style_box)
+        self.obj_style = QComboBox()
+        self.obj_style.addItem("job setting", None)
+        for name in OBJECT_STYLES:
+            self.obj_style.addItem(name, name)
+        self.obj_style.setToolTip("pixelate and solid destroy the content; blur is the weakest")
+        form.addRow("Style", self.obj_style)
+        self.obj_block = QSpinBox()
+        self.obj_block.setRange(0, 256)
+        self.obj_block.setSpecialValueText("job setting")
+        self.obj_block.setToolTip("Block size (pixelate) or blur strength in full-resolution pixels, 2-256. 0 = the job's strength.")
+        form.addRow("Strength (px)", self.obj_block)
+        self.obj_pad = QSpinBox()
+        self.obj_pad.setRange(-1, 500)
+        self.obj_pad.setSpecialValueText("job setting")
+        self.obj_pad.setToolTip("How far the mosaic reaches beyond this object's mask, in full-resolution pixels. -1 = the job's padding.")
+        form.addRow("Padding (px)", self.obj_pad)
+        self.obj_style.currentIndexChanged.connect(self._style_edited)
+        self.obj_block.valueChanged.connect(self._style_edited)
+        self.obj_pad.valueChanged.connect(self._style_edited)
+        v.addWidget(self.style_box)
+        note = QLabel("Detections (NudeNet) and fail-closed areas always use the job setting. Where areas overlap, the stronger one wins.")
+        note.setWordWrap(True)
+        v.addWidget(note)
         self.hint = QLabel("Tracking of an object starts at its earliest click: click it on the first frame where it is visible.")
         self.hint.setWordWrap(True)
         v.addWidget(self.hint)
@@ -430,6 +456,7 @@ class MainWindow(QMainWindow):
         self.act_reprocess.setEnabled(not running)
         self.act_cleanup.setEnabled(not running)
         self.act_resume_job.setEnabled(not running and self.resumable_job is not None)
+        self.style_box.setEnabled(not running)
 
     def start_processing_dialog(self):
         if self.info is None:
@@ -723,6 +750,32 @@ class MainWindow(QMainWindow):
         if oid != self.store.current:
             self.store.select(oid)
             self.view.update()
+        self._load_style_widgets()
+
+    def _load_style_widgets(self):
+        """Show the mosaic settings of the current object without triggering an edit."""
+        st = self.store.styles.get(self.store.current, {})
+        for w in (self.obj_style, self.obj_block, self.obj_pad):
+            w.blockSignals(True)
+        self.obj_style.setCurrentIndex(max(0, self.obj_style.findData(st.get("style"))))
+        self.obj_block.setValue(int(st.get("block", 0)))
+        self.obj_pad.setValue(int(round(st["pad_px"])) if "pad_px" in st else -1)
+        for w in (self.obj_style, self.obj_block, self.obj_pad):
+            w.blockSignals(False)
+
+    def _style_edited(self, *_):
+        if self.job_running:
+            self._load_style_widgets()
+            return
+        if self.obj_block.value() == 1:                    # 0 means "job setting", the smallest real strength is 2
+            self.obj_block.setValue(2)
+            return
+        oid = self.store.current
+        changed = self.store.set_style(oid, "style", self.obj_style.currentData())
+        changed |= self.store.set_style(oid, "block", self.obj_block.value() or None)
+        changed |= self.store.set_style(oid, "pad_px", float(self.obj_pad.value()) if self.obj_pad.value() >= 0 else None)
+        if changed:
+            self._points_changed()
 
     def _refresh_objects(self):
         self.obj_list.blockSignals(True)
@@ -733,6 +786,10 @@ class MainWindow(QMainWindow):
             first = min((p["frame_idx"] for p in pts), default=None)
             text = f"Object {oid}: {sum(1 for p in pts if p['label'] == 1)} +, {sum(1 for p in pts if p['label'] == 0)} -"
             text += f"  (starts at frame {first})" if first is not None else "  (no points yet)"
+            st = self.store.styles.get(oid)
+            if st:
+                text += "  [" + ", ".join(([st["style"]] if "style" in st else []) + ([f"{st['block']} px"] if "block" in st else [])
+                                          + ([f"pad {st['pad_px']:g}"] if "pad_px" in st else [])) + "]"
             it = QListWidgetItem(text)
             it.setData(Qt.ItemDataRole.UserRole, oid)
             pm = QPixmap(14, 14)
@@ -742,6 +799,7 @@ class MainWindow(QMainWindow):
             if oid == self.store.current:
                 self.obj_list.setCurrentItem(it)
         self.obj_list.blockSignals(False)
+        self._load_style_widgets()
 
     # ------------------------------------------------------------------ save / load points
     def save_points(self) -> bool:
@@ -763,7 +821,7 @@ class MainWindow(QMainWindow):
             self.show_error("Points not saved:\n" + "\n".join(probs) + "\nAdd a positive (left-click) point for each of them.")
             return False
         try:
-            save_points(path, self.info, self.store.points)
+            save_points(path, self.info, self.store.points, styles=self.store.styles)
         except OSError as e:
             self.show_error(f"Could not write {path}:\n{e}")
             return False
@@ -785,6 +843,7 @@ class MainWindow(QMainWindow):
     def _try_load_points(self, path: str, quiet: bool) -> str:
         try:
             prompts = load_points(path, self.info)
+            styles = load_object_styles(path)
         except (PointsError, OSError, ValueError, KeyError) as e:
             if not quiet:
                 self.show_error(f"Could not use this points file:\n{e}")
@@ -799,6 +858,7 @@ class MainWindow(QMainWindow):
         ids = sorted({p["obj_id"] for p in store.points})
         if ids:
             store.objects, store.current = ids, ids[0]
+        store.styles = {k: v for k, v in styles.items() if k in ids}
         self.store, self.points_path, self.dirty = store, path, False
         self._refresh_objects()
         self._update_title()
