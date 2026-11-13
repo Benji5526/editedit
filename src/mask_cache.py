@@ -119,6 +119,37 @@ class JobMasks:
             self._chunks.popitem(last=False)
         return c
 
+    def summary(self, should_stop=None) -> dict:
+        """What the kept run has for every frame, without unpacking any mask:
+        {"masks": {obj_id: bool array}, "detections": bool array, "fail_closed": bool array}, each ``total_frames`` long.
+        "masks" is True where the object has a non-empty mask. Frames of chunks without a cache stay False.
+        ``should_stop()`` is polled between chunks (returns the partial result)."""
+        n = self.total_frames
+        masks: Dict[int, np.ndarray] = {}
+        det, fc = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
+        ci = 0
+        while ci * self.chunk_size < n:
+            if should_stop is not None and should_stop():
+                break
+            path = cache_path(self.job_dir, ci)
+            if os.path.isfile(path):
+                try:
+                    with np.load(path, allow_pickle=False) as z:
+                        meta = json.loads(str(z["meta"][()]))
+                        s0, e0 = int(meta["start"]), min(n, int(meta["end"]))
+                        for oid in meta["obj_ids"]:
+                            present = z[f"p{oid}"][: e0 - s0]
+                            has = np.zeros(e0 - s0, dtype=bool)
+                            if f"m{oid}" in z.files and present.any():
+                                has[np.flatnonzero(present)] = z[f"m{oid}"].any(axis=1)[: int(present.sum())]
+                            masks.setdefault(int(oid), np.zeros(n, dtype=bool))[s0:e0] = has
+                        det[s0:e0] = [bool(ds) for ds in meta["filled"][: e0 - s0]]
+                        fc[s0:e0] = [bool(r) or bool(f) for r, f in zip(meta["fc_regions"], meta["fc_full"])][: e0 - s0]
+                except Exception:  # noqa: BLE001  (an unreadable cache is simply not shown)
+                    pass
+            ci += 1
+        return {"masks": masks, "detections": det, "fail_closed": fc}
+
     def frame(self, idx: int) -> Optional[dict]:
         if not (0 <= idx < self.total_frames) or self.chunk_size <= 0:
             return None

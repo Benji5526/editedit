@@ -21,6 +21,7 @@ from src.review import ReviewError
 from src.review_data import ReviewData, load_review_data
 from src.video_io import VideoInfo, is_hdr, probe_video
 
+from .cut_dialog import CutDialog
 from .frame_server import FrameServer
 from src.job_manager import JobDB, db_path_for
 from src.mask_cache import JobMasks
@@ -31,6 +32,7 @@ from .mask_preview import MaskPreview, preview_args
 from .process_dialog import ProcessDialog, find_default_checkpoint, load_last_settings, validate_settings
 from .process_panel import STATUS_TEXT, ProcessPanel
 from .review_panel import FlagSlider, ReviewPanel
+from .timeline import RunSummaryLoader, ThumbnailLoader, TimelineView
 from .video_view import VideoView, mask_image, object_color
 
 log = logging.getLogger("app")
@@ -138,6 +140,12 @@ class MainWindow(QMainWindow):
         self.timeline_title = QLabel("타임라인")
         tl.addWidget(self.timeline_title)
         tl.addWidget(self.slider)
+        self.timeline_view = TimelineView()              # thumbnails, one track per object, detections, review flags
+        self.timeline_view.setEnabled(False)
+        self.timeline_view.seek_requested.connect(self.goto)
+        tl.addWidget(self.timeline_view)
+        self._thumb_loader: Optional[ThumbnailLoader] = None
+        self._summary_loader: Optional[RunSummaryLoader] = None
 
         central = QWidget()
         lay = QVBoxLayout(central)
@@ -213,6 +221,10 @@ class MainWindow(QMainWindow):
         e = self.menuBar().addMenu("편집(&E)")
         e.addAction(act("이 프레임의 마지막 점 되돌리기", "U", self.undo_point))
         e.addAction(act("이 프레임에서 이 객체의 점 지우기", "X", self.clear_frame_points))
+        e.addSeparator()
+        self.act_cut = act("결과 영상 자르기...", "Ctrl+T", self.open_cut_dialog)
+        self.act_cut.setToolTip("처리가 끝난 영상에서 구간을 잘라내 새 파일로 내보냅니다. 원본과 추적 결과는 바뀌지 않습니다.")
+        e.addAction(self.act_cut)
         # navigation shortcuts are window-level actions so they work wherever the focus is
         for key, fn in (("Left", lambda: self.step(-1)), ("Right", lambda: self.step(1)),
                         ("Shift+Left", lambda: self.step(-10)), ("Shift+Right", lambda: self.step(10)),
@@ -384,13 +396,15 @@ class MainWindow(QMainWindow):
             self.review_panel.set_banner(self._stale_reasons())
 
     def _update_flag_ticks(self):
-        flags = []
+        flags, segs = [], []
         if self.review is not None:
             floor = self.review_panel.sev.currentData() or "warn"
             for s in self.review.filtered(floor):
                 if not self.review.state.is_reviewed(s):
                     flags += [(s["start_frame"], s["severity"]), (s["end_frame"], s["severity"])]
+                    segs.append((s["start_frame"], s["end_frame"], s["severity"]))
         self.slider.set_flags(flags)
+        self.timeline_view.set_flags(segs)
 
     def _goto_flag(self, frame: int, obj: Optional[int]):
         self.goto(frame)
@@ -520,8 +534,12 @@ class MainWindow(QMainWindow):
         size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(jd) for f in fs) / 2 ** 20
         if self.ask_confirm(f"중간 청크 {size:.0f} MB를 삭제할까요?\n결과 영상과 로그는 남지만, 다시 처리할 때는 처음부터 시작합니다."):
             import shutil
+            self._release_job_folder()                     # an open cache file would keep the folder alive on Windows
             shutil.rmtree(jd, ignore_errors=True)
-            self.statusBar().showMessage(f"중간 청크 {size:.0f} MB를 삭제했습니다.")
+            if os.path.isdir(jd):
+                self.statusBar().showMessage("중간 청크를 모두 지우지 못했습니다. 다른 프로그램이 파일을 쓰고 있는지 확인하세요.")
+            else:
+                self.statusBar().showMessage(f"중간 청크 {size:.0f} MB를 삭제했습니다.")
 
     # ------------------------------------------------------------------ processing jobs
     def open_path(self, path: Optional[str]):
@@ -582,6 +600,9 @@ class MainWindow(QMainWindow):
         if probs:
             self.show_error("\n".join(probs))
             return False
+        show_last = self.act_last.isChecked()
+        self._release_job_folder()                         # the worker deletes or rewrites this video's job folder
+        self._set_checked(self.act_last, show_last)        # shown again when the job has finished
         self.last_settings, self.last_result = settings, None
         cancel_file = self.runner.new_cancel_file()
         self.panel.begin()
@@ -615,8 +636,86 @@ class MainWindow(QMainWindow):
         if res.get("review_log") and os.path.isfile(res["review_log"]):
             self.load_review(res["review_log"], quiet=True)
         self.check_resumable()
+        self._load_run_summary()                           # timeline tracks: where each object has a mask in the new run
         if self.act_last.isChecked():                      # show the masks of the run that just finished
             self.toggle_last_masks(True)
+
+    # ------------------------------------------------------------------ cutting the result
+    def open_cut_dialog(self, path: Optional[str] = None, modal: bool = True):
+        """Open the cutting window for a finished video: ``path``, else the last result, else a file the user picks."""
+        if not path:
+            out = self._result_output()
+            start = out if out and os.path.isfile(out) else os.path.join(PROJECT_ROOT, "output")
+            if out and os.path.isfile(out) and self.ask_confirm(f"방금 처리한 결과 영상을 자를까요?\n{out}\n\n'아니요'를 누르면 다른 파일을 고릅니다."):
+                path = out
+            else:
+                path, _ = QFileDialog.getOpenFileName(self, "자를 영상 선택", start, VIDEO_FILTER)
+        if not path:
+            return None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                info = probe_video(path)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except Exception as ex:  # noqa: BLE001
+            self.show_error(f"영상을 열지 못했습니다:\n{ex}")
+            return None
+        dlg = CutDialog(self, info)
+        self.cut_dialog = dlg
+        if modal:
+            dlg.exec()
+        else:
+            dlg.show()
+        return dlg
+
+    # ------------------------------------------------------------------ timeline data (loaded off the UI thread)
+    def _start_thumbnails(self):
+        if self._thumb_loader is not None:
+            self._thumb_loader.cancelled = True
+        loader = ThumbnailLoader(self.info)
+        loader.setAutoDelete(False)                        # the signal object must outlive run(); we keep the reference
+        loader.signals.done.connect(self._thumbnails_ready)
+        self._thumb_loader = loader
+        QThreadPool.globalInstance().start(loader)
+
+    def _thumbnails_ready(self, path: str, images: list):
+        if self.info is not None and path == self.info.path:
+            self.timeline_view.set_thumbnails(images)
+
+    def _release_job_folder(self):
+        """Stop everything in the app that reads the job folder (the timeline's summary loader, the kept-mask overlay), so the
+        folder can be deleted or rewritten by a job."""
+        loader, self._summary_loader = self._summary_loader, None
+        if loader is not None and QThreadPool.globalInstance().tryTake(loader):
+            loader.finished.set()                          # it never started
+        elif loader is not None:
+            loader.stop()
+        self.timeline_view.set_run_data(None)
+        if self.act_last.isChecked():
+            self._set_checked(self.act_last, False)
+        self._job_masks = None
+        self._update_overlay()
+
+    def _load_run_summary(self):
+        if self._summary_loader is not None:
+            self._summary_loader.cancelled = True
+        self.timeline_view.set_run_data(None)
+        if self.info is None:
+            return
+        work = self.last_settings.work_dir if self.last_settings else ""
+        jd = job_dir_for_video(work, self.info.path, self.info.fingerprint)
+        if not os.path.isfile(os.path.join(jd, "job.json")):
+            return
+        loader = RunSummaryLoader(self.info.path, jd)
+        loader.setAutoDelete(False)
+        loader.signals.done.connect(self._run_summary_ready)
+        self._summary_loader = loader
+        QThreadPool.globalInstance().start(loader)
+
+    def _run_summary_ready(self, path: str, data):
+        if self.info is not None and path == self.info.path:
+            self.timeline_view.set_run_data(data)
 
     # ------------------------------------------------------------------ mask overlays
     def _set_checked(self, action, on: bool):
@@ -818,12 +917,16 @@ class MainWindow(QMainWindow):
         self.slider.setValue(0)
         self.slider.blockSignals(False)
         self.slider.setEnabled(True)
+        self.timeline_view.set_video(info.nb_frames, info.fps)
+        self.timeline_view.setEnabled(True)
+        self._start_thumbnails()
+        self._load_run_summary()
         for b in self._nav_buttons:
             b.setEnabled(True)
         self._show_info()
         self._refresh_objects()
         self._update_title()
-        msg = f"Opened {os.path.basename(info.path)}"
+        msg = f"{os.path.basename(info.path)} 열림"
         if os.path.isfile(self.points_path):
             msg += self._try_load_points(self.points_path, quiet=True)
         self.statusBar().showMessage(msg)
@@ -861,6 +964,7 @@ class MainWindow(QMainWindow):
         self.slider.setValue(idx)
         self.slider.blockSignals(False)
         self._update_pos_label()
+        self.timeline_view.set_frame(idx)
         if idx in self._cache:
             self._cache.move_to_end(idx)
             self.view.set_image(self._cache[idx])
@@ -1025,6 +1129,8 @@ class MainWindow(QMainWindow):
             if oid == self.store.current:
                 self.obj_list.setCurrentItem(it)
         self.obj_list.blockSignals(False)
+        self.timeline_view.set_objects([(oid, object_color(oid), sorted({p["frame_idx"] for p in self.store.points if p["obj_id"] == oid}))
+                                        for oid in ids])
         self._load_style_widgets()
 
     # ------------------------------------------------------------------ save / load points
@@ -1111,6 +1217,9 @@ class MainWindow(QMainWindow):
             return
         self._stop_play()
         self.preview.stop()
+        for loader in (self._thumb_loader, self._summary_loader):
+            if loader is not None:
+                loader.cancelled = True
         if self.server is not None:
             self.server.close()
         e.accept()

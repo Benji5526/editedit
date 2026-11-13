@@ -108,7 +108,7 @@ class VideoView(QWidget):
                 def rect(b):
                     return QRectF(fit.ox + b[0] / sw * fit.w, fit.oy + b[1] / sh * fit.h, (b[2] - b[0]) / sw * fit.w, (b[3] - b[1]) / sh * fit.h)
                 p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setFont(QFont("Segoe UI", 8))
+                p.setFont(QFont("Malgun Gothic", 8))
                 for b in ov.get("boxes") or []:
                     p.setPen(QPen(QColor("#3cffff"), 2, Qt.PenStyle.DashLine if b[5] else Qt.PenStyle.SolidLine))
                     r = rect(b)
@@ -122,14 +122,14 @@ class VideoView(QWidget):
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(target.adjusted(2, 2, -2, -2))
             if ov.get("note"):
-                p.setFont(QFont("Segoe UI", 9))
+                p.setFont(QFont("Malgun Gothic", 9))
                 box = QRectF(target.left() + 6, target.top() + 6, min(target.width() - 12, 640), 22)
                 p.fillRect(box, QColor(0, 0, 0, 150))
                 p.setPen(QColor("white"))
                 p.drawText(box.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, ov["note"])
         cur = self._current_obj()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        p.setFont(QFont("Malgun Gothic", 10, QFont.Weight.Bold))
         for pt in self._points_for_frame():
             xy = frame_to_widget(fit, pt["x"], pt["y"])
             c = object_color(pt["obj_id"])

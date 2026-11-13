@@ -108,6 +108,20 @@ The cache is derived from the footage; it lives in the job's work folder and is 
   A note says when the points were edited after that run. Needs "Keep intermediate chunks".
 On a frame with clicks the live preview wins when both are on.
 
+*Timeline (under the preview).* Below the frame slider a track view shows the whole video at a glance: a time ruler, a strip of 16 thumbnails (grabbed in the background with
+one fast ffmpeg seek each, so they are approximate), **one track per object** with a diamond at every clicked frame and - once a run with kept chunks exists - a bar in the object's
+colour wherever it has a mask (a gap in the bar is where tracking had no mask), a track for NudeNet detections, one for fail-closed frames, and one for the unreviewed review flags.
+Click or drag on the tracks to seek. The per-frame data of a run is read from the mask cache in the background without unpacking the masks (`JobMasks.summary`); how long that takes
+on a long video was not measured. At most 8 object tracks are drawn.
+
+*Cutting the result (`편집 > 결과 영상 자르기`, `Ctrl+T`).* A separate window with its own preview and timeline for a **finished** video (the last result is offered, or pick a
+file): mark a range with `I` / `O` and add it to the removal list, or cut everything before / after the current frame; the timeline shows removed ranges in red and dims them on the
+thumbnail strip. Export writes a new file (`<name>_cut.mp4` by default) without those frames: frame-accurate (`trim` by frame number, `atrim` for the audio, `concat`), re-encoded to
+H.264 + AAC, written as `.partial`, frame count checked, then renamed. The input file, the points and the kept chunks are never changed. `tests/test_video_edit.py` checks with the
+frame-number code of the synthetic clip that exactly the kept frames come out, in order. It is meant for the result, not the source: cutting the source first would shift the frame
+numbers the clicks and the mask cache refer to. Not supported: joining several videos, lossless (stream-copy) cuts, more than 200 kept pieces in one export; export time on a long
+4K video was not measured (the whole file is decoded and re-encoded).
+
 *Per-object mosaic settings.* In the Targets panel, "Mosaic for the selected object" gives a clicked object its own **style** (pixelate / blur / solid), **strength** (px) and
 **padding** (px); each can stay on "job setting" (the value from the processing dialog). The object list shows what is set. The settings are saved in the points file: a file with
 any of them is written as version 2 with an `object_styles` block (`{"2": {"style": "solid", "block": 48, "pad_px": 30}}`); a file without stays version 1, and both versions are read.
