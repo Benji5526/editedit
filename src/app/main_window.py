@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog
                                QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from src.corrections import save_correction
+from src.exclusions import exclusion_for, is_excluded, load_exclusions, save_exclusions
 from src.points_io import (OBJECT_STYLES, PointStore, PointsError, load_mask_prompts, load_object_styles, load_points, mask_digest,
                            save_points)
 from src.review import ReviewError
@@ -110,6 +111,7 @@ class MainWindow(QMainWindow):
         self._stroke_key = None
         self._stroke_mask: Optional[np.ndarray] = None
         self.corrections_saved: list = []      # paths of the correction records written by the last save
+        self.exclusions: list = []             # detections of this video marked "not a target" (src/exclusions.py)
         self._compare: Optional[dict] = None   # before/after comparison of a correction (see start_compare)
 
         self.view = VideoView()
@@ -245,6 +247,15 @@ class MainWindow(QMainWindow):
         self.act_clear_mask = self._act("이 프레임에서 그린 마스크 지우기", None, self.clear_drawn_mask)
         self.act_compare = self._act("수정 전후 비교 (이 프레임부터 시험 추적)", "C", self.start_compare)
         self.act_compare.setToolTip("선택한 대상을 이 프레임부터 짧게 추적해 보고, 수정 전과 나란히 비교합니다. 영상은 바뀌지 않습니다.")
+        self.act_exclude = QAction("잘못 잡힌 탐지 상자를 '대상 아님'으로 표시", self)
+        self.act_exclude.setCheckable(True)
+        self.act_exclude.setShortcut("N")
+        self.act_exclude.setToolTip("지난 실행에서 자동 탐지가 잘못 잡은 상자(예: 손)를 왼쪽 클릭하면, 그 상자가 이어지는 구간 전체를 "
+                                    "모자이크에서 뺍니다. 오른쪽 클릭은 표시를 취소합니다. 다시 처리하면 반영됩니다 (탐지는 다시 하지 않습니다).")
+        self.act_exclude.toggled.connect(self.toggle_exclude)
+        vm.addAction(self.act_exclude)
+        self.act_clear_excl = self._act("이 영상의 '대상 아님' 표시 모두 지우기", None, self.clear_exclusions)
+        vm.addAction(self.act_clear_excl)
         e = self.menuBar().addMenu("편집(&E)")
         e.addAction(act("이 프레임의 마지막 점 되돌리기", "U", self.undo_point))
         e.addAction(act("이 프레임에서 이 대상의 점 지우기", "X", self.clear_frame_points))
@@ -281,8 +292,9 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_last)
         tb.addAction(self.act_brush)
         tb.addAction(self.act_compare)
+        tb.addAction(self.act_exclude)
         for a, short in ((self.act_live, "마스크 미리보기"), (self.act_last, "지난 실행 마스크"), (self.act_brush, "브러시"),
-                         (self.act_compare, "수정 전후 비교")):
+                         (self.act_compare, "수정 전후 비교"), (self.act_exclude, "대상 아님 표시")):
             a.setIconText(short)                         # shorter labels on the toolbar; the menus keep the full text
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -558,6 +570,7 @@ class MainWindow(QMainWindow):
         self._plan, self._plan_settings = None, settings
         cancel_file = self.plan_runner.new_cancel_file()
         self.statusBar().showMessage("재사용할 수 있는 부분을 확인하는 중 ...")
+        settings.exclusions = self._exclusions_file() if self.exclusions else ""
         self.plan_runner.start(build_args(self.info.path, points, settings, cancel_file, plan_only=True), cancel_file)
 
     def _on_plan_event(self, ev: dict):
@@ -716,6 +729,7 @@ class MainWindow(QMainWindow):
         self._set_job_running(True)
         self._stop_play()
         self.statusBar().showMessage("처리 중 ... (처리 > 처리 취소로 중단, 완료된 조각은 보관됩니다)")
+        settings.exclusions = self._exclusions_file() if self.exclusions else ""
         if not self.runner.start(build_args(self.info.path, points, settings, cancel_file), cancel_file):
             self._set_job_running(False)
             return False
@@ -866,6 +880,83 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError, KeyError):
                 self._set_checked(self.act_last, False)
                 self.statusBar().showMessage("이 영상으로 보관된 마스크가 없습니다. 먼저 \"중간 조각 보관\"을 켜고 처리하세요.")
+        self._update_overlay()
+
+    # ------------------------------------------------------------------ detections marked "not a target"
+    def _exclusions_file(self) -> str:
+        return os.path.join(self._log_dir(), "exclusions", f"{self.info.fingerprint}.json")
+
+    def _load_exclusions(self):
+        self.exclusions = []
+        try:
+            self.exclusions = load_exclusions(self._exclusions_file(), self.info.fingerprint)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError) as e:
+            self.statusBar().showMessage(f"'대상 아님' 표시 파일을 읽지 못해 무시합니다: {e}")
+
+    def _save_exclusions(self) -> bool:
+        try:
+            save_exclusions(self._exclusions_file(), self.info.fingerprint, self.exclusions)
+            return True
+        except OSError as e:
+            self.show_error(f"'대상 아님' 표시를 저장하지 못했습니다:\n{e}")
+            return False
+
+    def _det_boxes_full(self, f: int):
+        """The last run's detection boxes on frame f in full-resolution pixels: [(x1, y1, x2, y2, cls)], None when unknown."""
+        fr = self._job_masks.frame(f) if self._job_masks is not None else None
+        if fr is None:
+            return None
+        kx, ky = self.info.width / fr["shape"][1], self.info.height / fr["shape"][0]
+        return [(b[0] * kx, b[1] * ky, b[2] * kx, b[3] * ky, b[4]) for b in fr["boxes"]]
+
+    def toggle_exclude(self, on: bool):
+        if on:
+            if not self.act_last.isChecked():
+                self.act_last.setChecked(True)             # the boxes to click are the last run's detections
+            if self._job_masks is None:
+                self._set_checked(self.act_exclude, False)
+                self.statusBar().showMessage("'대상 아님' 표시는 지난 실행의 탐지 결과가 있어야 합니다. 먼저 \"중간 조각 파일 보관\"을 켜고 처리하세요.")
+                return
+            if self.act_brush.isChecked():
+                self.act_brush.setChecked(False)
+            self.statusBar().showMessage("대상 아님 표시: 잘못 잡힌 탐지 상자를 왼쪽 클릭하면 그 상자가 이어지는 구간이 모자이크에서 빠집니다. 오른쪽 클릭 = 취소.")
+        self._update_overlay()
+
+    def _exclude_click(self, fx: float, fy: float, label: int):
+        f = self.frame_idx
+        if label == 0:                                     # right click: take back the exclusions under the click on this frame
+            keep = [e for e in self.exclusions
+                    if not (e["frame_start"] <= f <= e["frame_end"] and e["box"][0] <= fx <= e["box"][2] and e["box"][1] <= fy <= e["box"][3])]
+            if len(keep) == len(self.exclusions):
+                self.statusBar().showMessage("여기에는 취소할 '대상 아님' 표시가 없습니다.")
+                return
+            removed = len(self.exclusions) - len(keep)
+            self.exclusions = keep
+            if self._save_exclusions():
+                self.statusBar().showMessage(f"'대상 아님' 표시 {removed}건을 취소했습니다. 다시 처리하면 이 자리가 다시 가려집니다.")
+            self._update_overlay()
+            return
+        ex = exclusion_for(self._det_boxes_full, f, fx, fy, self.info.nb_frames)
+        if ex is None:
+            self.statusBar().showMessage("클릭한 곳에 탐지 상자가 없습니다. 지난 실행에서 잡힌 상자(네모) 안쪽을 클릭하세요.")
+            return
+        self.exclusions.append(ex)
+        if self._save_exclusions():
+            a, b = ex["frame_start"], ex["frame_end"]
+            self.statusBar().showMessage(f"프레임 {a}-{b} ({self.info.timestamp_of(a):.1f}초-{self.info.timestamp_of(b):.1f}초)의 이 상자를 "
+                                         f"'대상 아님'으로 표시했습니다. 처리 > 다시 처리를 하면 모자이크에서 빠집니다 (탐지는 다시 하지 않습니다).")
+        self._update_overlay()
+
+    def clear_exclusions(self):
+        if self.info is None or not self.exclusions:
+            self.statusBar().showMessage("이 영상에는 '대상 아님' 표시가 없습니다.")
+            return
+        if not self.ask_confirm(f"이 영상의 '대상 아님' 표시 {len(self.exclusions)}건을 모두 지울까요?\n다시 처리하면 그 자리들이 다시 가려집니다."):
+            return
+        self.exclusions = []
+        self._save_exclusions()
         self._update_overlay()
 
     def _points_sha(self) -> Optional[str]:
@@ -1228,6 +1319,10 @@ class MainWindow(QMainWindow):
                 self.view.set_overlay({"note": "지난 실행에 이 프레임의 마스크가 없습니다." + tail})
             else:
                 note = f"지난 실행 ({self._job_masks.created}): 여백 적용 전 마스크, 탐지 상자, 안전 모드 영역(빨강)." + tail
+                if self.act_exclude.isChecked() or self.exclusions:
+                    k = sum(1 for b in self._det_boxes_full(f) or [] if is_excluded(self.exclusions, f, b[:4], b[4]))
+                    note = (("[대상 아님 표시] 잘못 잡힌 상자를 왼쪽 클릭 = 제외, 오른쪽 클릭 = 제외 취소.  " if self.act_exclude.isChecked() else "")
+                            + f"이 프레임에서 제외된 상자 {k}개 (이 영상 전체 제외 표시 {len(self.exclusions)}건).  ") + note
                 self.view.set_overlay(self._make_overlay(fr["shape"], fr["masks"], fr["boxes"], fr["fc_regions"], fr["fc_full"], note))
             return
         if self.preview.is_on():
@@ -1353,6 +1448,7 @@ class MainWindow(QMainWindow):
         self.timeline_view.setEnabled(True)
         self._start_thumbnails()
         self._load_run_summary()
+        self._load_exclusions()
         for b in self._nav_buttons:
             b.setEnabled(True)
         self._show_info()
@@ -1471,6 +1567,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("작업이 실행 중입니다. 끝나거나 취소될 때까지 클릭 지점을 바꿀 수 없습니다.")
             return
         self._stop_play()
+        if self.act_exclude.isChecked():
+            self._exclude_click(fx, fy, label)
+            return
         self.store.add(self.frame_idx, fx, fy, label)
         self._points_changed()
 

@@ -61,6 +61,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--det-lost-hold", type=int, default=60,
                    help="a box that was being detected and then is not: flag it for review and, with --fail-closed, keep an "
                         "expanded mosaic on its last place for up to N frames or until it is detected again (0 = off)")
+    g.add_argument("--exclusions", help="JSON file with detections marked as 'not a target' (written by the desktop app, "
+                                         "src/exclusions.py); they are not mosaicked. Render-only: no new detection run")
+    g.add_argument("--face", choices=("off", "full", "below_eyes", "above_eyes"), default="off",
+                   help="also mosaic faces found by NudeNet: the whole face, or only the part below / above the eyes "
+                        "(eye line from the face landmark model when --face-model exists, else rough proportions of the face box)")
+    g.add_argument("--face-model", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_detection_yunet_2023mar.onnx"),
+                   help="YuNet face landmark model (onnx) for --face below_eyes / above_eyes; skipped when the file is missing")
     g.add_argument("--nudenet-model", help="path to a different NudeNet onnx (e.g. 640m)")
     g.add_argument("--nudenet-res", type=int, default=320, help="inference resolution of that model")
     g.add_argument("--nudenet-device", choices=["auto", "cuda", "cpu"], default="auto",
@@ -133,11 +140,18 @@ def main(argv=None) -> int:
         fail_closed_expand=a.fail_closed_expand, fail_closed_max_frames=a.fail_closed_max_frames,
         encoder=a.encoder, crf=a.crf, preset=a.preset, keep_audio=not a.no_audio, deep_verify=a.deep_verify,
         allow_vfr=a.allow_vfr, allow_hdr=a.allow_hdr, allow_points_mismatch=a.allow_points_mismatch, skip_disk_check=a.skip_disk_check, faststart=a.faststart, resume=a.resume,
-        extra={"keep_temp": a.keep_temp, "nudenet": not a.no_nudenet, "det_classes": a.det_classes,
+        extra={"keep_temp": a.keep_temp, "nudenet": not a.no_nudenet, "det_classes": a.det_classes, "face_mode": a.face,
+               "face_model_sig": file_signature(a.face_model) if a.face not in ("off", "full") and os.path.isfile(a.face_model) else "",
                "nudenet_model": a.nudenet_model, "nudenet_res": a.nudenet_res, "nudenet_tiles": a.nudenet_tiles,
                "sam2_ckpt_sig": file_signature(a.sam2_checkpoint) if a.sam2_checkpoint and os.path.isfile(a.sam2_checkpoint) else "",
                "device": a.device},
     )
+    if a.exclusions:
+        from src.exclusions import load_exclusions
+        try:
+            cfg.extra["det_exclusions"] = load_exclusions(a.exclusions)
+        except (OSError, ValueError, KeyError) as e:
+            parser.error(f"cannot read --exclusions {a.exclusions}: {e}")
     emit_lock = threading.Lock()
 
     def emit(ev: dict):
@@ -170,7 +184,14 @@ def main(argv=None) -> int:
         if not a.no_nudenet:
             from src.detection import NudenetDetector, nudenet_version
             detector = NudenetDetector(a.det_threshold, classes=a.det_classes, model_path=a.nudenet_model,
-                                       resolution=a.nudenet_res, tiles=a.nudenet_tiles, device=a.nudenet_device)
+                                       resolution=a.nudenet_res, tiles=a.nudenet_tiles, device=a.nudenet_device,
+                                       face_mode=a.face, face_model=a.face_model if os.path.isfile(a.face_model) else None)
+            if a.face in ("below_eyes", "above_eyes"):
+                if detector.landmarks is None:
+                    logging.warning("face landmark model not found (%s): the eye line is estimated from the face box (rough)", a.face_model)
+                    emit({"event": "warning", "text": "face landmark model is missing: the eye line is only estimated from the face box"})
+                else:
+                    logging.info("faces: %s, eye line from the landmark model", a.face)
             cfg.extra["nudenet_provider"] = detector.provider          # recorded with the job, not part of the settings hash
             logging.info("NudeNet %s classes=%s threshold=%.2f running on %s", nudenet_version(), detector.classes, a.det_threshold,
                          "the GPU (CUDA)" if detector.provider == "CUDAExecutionProvider" else "the CPU")

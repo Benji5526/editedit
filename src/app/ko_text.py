@@ -32,6 +32,9 @@ EVENT_TEXT = {
     "prompt_produced_no_mask": ("클릭한 곳에서 영역을 못 찾음", "클릭한 지점에서 추적 모델이 가릴 영역을 만들지 못했습니다. 다른 곳을 클릭하거나 브러시로 칠하세요."),
 }
 
+CLASS_TEXT = {"MALE_GENITALIA_EXPOSED": "남성 성기", "FEMALE_GENITALIA_EXPOSED": "여성 성기", "FACE_FEMALE": "얼굴 (여성)",
+              "FACE_MALE": "얼굴 (남성)", "FACE_BELOW_EYES": "얼굴 눈 아래", "FACE_ABOVE_EYES": "얼굴 눈 위"}
+
 ACTION_TEXT = {
     "logged": "기록만 함", "flagged": "검수 표시", "flagged_only": "검수 표시만 (가리지 않음)",
     "flagged_no_region_known": "검수 표시 (가릴 위치를 알 수 없음)",

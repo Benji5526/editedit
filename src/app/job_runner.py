@@ -53,6 +53,10 @@ class ProcessSettings:
     nudenet_model: str = ""     # empty = the 320 px model bundled with NudeNet; otherwise the path of another NudeNet onnx (e.g. 640m)
     nudenet_res: int = 320      # input resolution of nudenet_model
     nudenet_device: str = "auto"   # auto = GPU when it works, else CPU; cuda = GPU or fail; cpu
+    det_male: bool = True       # what the detector looks for: exposed male / female genitalia, faces
+    det_female: bool = True
+    face_mode: str = "off"      # off | full (whole face) | below_eyes | above_eyes
+    exclusions: str = ""        # file with detections marked "not a target" (set by the main window per video, not remembered)
     fail_closed: bool = True
     fail_closed_mode: str = "bbox"
     block: int = 32
@@ -71,6 +75,14 @@ class ProcessSettings:
     log_dir: str = ""           # empty = project default (logs/)
 
 
+def detector_classes(st: "ProcessSettings") -> List[str]:
+    """NudeNet class names for the targets ticked in the dialog (empty = nothing for the detector to do)."""
+    out = (["MALE_GENITALIA_EXPOSED"] if st.det_male else []) + (["FEMALE_GENITALIA_EXPOSED"] if st.det_female else [])
+    if st.face_mode != "off":
+        out += ["FACE_FEMALE", "FACE_MALE"]
+    return out
+
+
 def build_args(video: str, points_path: Optional[str], st: ProcessSettings, cancel_file: str, plan_only: bool = False) -> List[str]:
     """Arguments for censor_video.py (without the interpreter and script path)."""
     a = [video, "--progress-json", "--cancel-file", cancel_file, "-o", st.output,
@@ -79,10 +91,16 @@ def build_args(video: str, points_path: Optional[str], st: ProcessSettings, canc
          "--block", str(st.block), "--mosaic-style", st.mosaic_style, "--mask-pad-px", str(st.mask_pad_px), "--encoder", st.encoder, "--device", st.device]
     if points_path:
         a += ["--points", points_path, "--sam2-checkpoint", st.sam2_checkpoint]
-    if not st.use_nudenet:
+    classes = detector_classes(st)
+    if not st.use_nudenet or not classes:
         a.append("--no-nudenet")
     else:
         a += ["--nudenet-tiles", str(st.nudenet_tiles), "--nudenet-device", st.nudenet_device]
+        a += ["--det-classes", *classes]
+        if st.exclusions and os.path.isfile(st.exclusions):
+            a += ["--exclusions", st.exclusions]
+        if st.face_mode != "off":
+            a += ["--face", st.face_mode]
         if st.nudenet_model:
             a += ["--nudenet-model", st.nudenet_model, "--nudenet-res", str(st.nudenet_res)]
     if st.fail_closed:

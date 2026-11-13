@@ -133,3 +133,16 @@ def test_settings_dialog_has_the_gpu_choices(tmp_path):
     st = d.settings()
     assert st.nudenet_device == "cpu" and st.encoder == "libx264"
     del app
+
+
+def test_targets_become_detector_classes_and_face_mode():
+    from src.app.job_runner import detector_classes
+    st = ProcessSettings(output="o.mp4")
+    assert detector_classes(st) == ["MALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_EXPOSED"]
+    a = build_args("v.mp4", None, st, "c.flag")
+    assert a[a.index("--det-classes") + 1:a.index("--det-classes") + 3] == detector_classes(st) and "--face" not in a
+    st = ProcessSettings(output="o.mp4", det_male=False, det_female=False, face_mode="below_eyes")
+    a = build_args("v.mp4", None, st, "c.flag")
+    assert a[a.index("--face") + 1] == "below_eyes" and "FACE_FEMALE" in a and "MALE_GENITALIA_EXPOSED" not in a
+    a = build_args("v.mp4", None, ProcessSettings(output="o.mp4", det_male=False, det_female=False), "c.flag")
+    assert "--no-nudenet" in a and "--det-classes" not in a               # nothing ticked = detector off

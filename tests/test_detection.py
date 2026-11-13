@@ -135,3 +135,43 @@ def test_no_lost_reports_unless_asked():
     per = [[d()], [d()], [d()]] + [[] for _ in range(10)]
     out, carry = fill_detections(per, 0, [], max_gap=2, hold=1)
     assert [len(x) for x in out] == [1, 1, 1, 1] + [0] * 9
+
+
+# ---- faces: whole-face boxes cut at the eye line
+from src.detection import EXACT_CLASSES, FACE_ABOVE, FACE_BELOW, face_parts  # noqa: E402
+
+
+def test_face_below_eyes_uses_the_landmarks_and_leaves_the_eyes_out():
+    face = Det(100, 100, 200, 240, 0.9, "FACE_FEMALE")
+    marks = [(102, 104, 198, 236, (130, 150), (170, 154), 0.95)]          # box, right eye, left eye, score
+    (below,) = face_parts([face], marks, "below_eyes", 640, 360)
+    assert below.cls == FACE_BELOW and below.cls in EXACT_CLASSES
+    assert below.y1 > 154 + 5 and below.y2 >= 240 and below.x1 <= 100 and below.x2 >= 200     # starts under the lower eye
+    (above,) = face_parts([face], marks, "above_eyes", 640, 360)
+    assert above.cls == FACE_ABOVE and above.y2 < 150 - 5 and above.y1 <= 100                  # ends over the upper eye
+
+
+def test_face_without_landmarks_is_cut_by_proportion_and_extra_landmark_faces_are_used():
+    face = Det(100, 100, 200, 240, 0.9, "FACE_MALE")
+    (below,) = face_parts([face], [], "below_eyes", 640, 360)
+    assert 100 + 0.40 * 140 < below.y1 < 100 + 0.60 * 140
+    other = (400, 50, 460, 130, (418, 80), (442, 80), 0.9)                 # a face only the landmark model found
+    parts = face_parts([face], [other], "below_eyes", 640, 360)
+    assert len(parts) == 2 and any(p.x1 > 380 and p.y1 > 80 for p in parts)
+
+
+def test_face_part_follows_a_head_lying_on_its_side():
+    # eyes one above the other (head rotated 90 degrees), nose to the right of them: "below the eyes" is to the right
+    marks = [(100, 100, 240, 200, (150, 130), (150, 170), 0.9, (175, 150))]
+    (below,) = face_parts([], marks, "below_eyes", 640, 360)
+    assert below.poly and len(below.poly) == 4 and below.x1 > 150 + 5 and below.x2 > 220       # starts right of the eyes
+    assert below.y1 < 110 and below.y2 > 190                                                  # and spans the face's width
+    (above,) = face_parts([], marks, "above_eyes", 640, 360)
+    assert above.x2 < 150 - 5
+
+
+def test_gap_filling_keeps_the_polygon():
+    a = Det(10, 10, 50, 50, 0.9, "FACE_BELOW_EYES", poly=[[10, 10], [50, 10], [50, 50], [10, 50]])
+    b = Det(20, 10, 60, 50, 0.9, "FACE_BELOW_EYES", poly=[[20, 10], [60, 10], [60, 50], [20, 50]])
+    out, _ = fill_detections([[a], [], [], [], [b], []], 0, [], max_gap=4, hold=1)
+    assert out[2][0].filled and out[2][0].poly[0] == [15.0, 10.0] and out[5][0].poly == b.poly

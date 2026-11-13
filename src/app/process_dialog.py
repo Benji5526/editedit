@@ -37,7 +37,7 @@ def load_last_settings() -> ProcessSettings:
         with open(LAST_SETTINGS_PATH, encoding="utf-8") as f:
             saved = json.load(f)
             for k, v in saved.items():
-                if hasattr(st, k) and k not in ("output", "resume", "max_frames", "settings_rev"):
+                if hasattr(st, k) and k not in ("output", "resume", "max_frames", "settings_rev", "exclusions"):
                     setattr(st, k, v)
             if (saved.get("settings_rev") or 1) < 2:           # saved before the GPU options existed: take the new default once
                 st.encoder = "auto"
@@ -159,6 +159,31 @@ class ProcessDialog(QDialog):
         self.nude.setToolTip("탐지 AI(NudeNet)가 프레임마다 노출 부위를 찾아 네모 영역으로 가립니다. 이 모델이 아는 종류만 찾고, "
                              "손이나 다른 물체를 잘못 잡을 수도 있습니다. 클릭한 대상의 추적과 함께 쓸 수 있습니다.")
         form.addRow(self.nude)
+        self.det_male = QCheckBox("남성 성기")
+        self.det_male.setChecked(st.det_male)
+        self.det_female = QCheckBox("여성 성기")
+        self.det_female.setChecked(st.det_female)
+        tw = QWidget()
+        th = QHBoxLayout(tw)
+        th.setContentsMargins(0, 0, 0, 0)
+        th.addWidget(self.det_male)
+        th.addWidget(self.det_female)
+        th.addStretch(1)
+        form.addRow("  찾아서 가릴 대상", tw)
+        self.face = combo((("가리지 않음", "off"), ("얼굴 전체", "full"), ("눈 아래만 (코·볼·입·턱, 눈과 이마는 보임)", "below_eyes"),
+                           ("눈 위만 (이마·눈썹, 눈 아래는 보임)", "above_eyes")), st.face_mode)
+        have_face_model = os.path.isfile(os.path.join(PROJECT_ROOT, "models", "face_detection_yunet_2023mar.onnx"))
+        self.face.setToolTip("화면에 나오는 모든 얼굴에 적용됩니다 (특정 사람만 고를 수는 없습니다). '눈 아래만'과 '눈 위만'은 눈 위치를 기준으로 "
+                             "얼굴을 나눕니다. " + ("눈 위치는 얼굴 모델(YuNet)로 찾습니다. 옆얼굴처럼 눈을 못 찾은 얼굴은 얼굴 크기 비율로 어림합니다."
+                                                if have_face_model else
+                                                "지금은 눈 위치를 찾는 얼굴 모델 파일(models/face_detection_yunet_2023mar.onnx)이 없어서, "
+                                                "얼굴 크기 비율로 어림해서 나눕니다. 고개를 기울이거나 옆을 보면 어긋날 수 있습니다."))
+        form.addRow("  얼굴", self.face)
+        self.fluid = QCheckBox("체액 (자동으로 찾지 못함: 영상에서 직접 클릭하거나 브러시로 칠해서 지정)")
+        self.fluid.setEnabled(False)
+        self.fluid.setToolTip("체액을 찾아 주는 탐지 모델이 아직 없습니다. 지금은 메인 화면에서 그 부분을 새 대상으로 클릭하거나 "
+                              "브러시로 칠하면 추적해서 가립니다. 자동으로 찾으려면 직접 표시한 자료로 탐지 모델을 학습해야 합니다.")
+        form.addRow("", self.fluid)
         self.every = QSpinBox()
         self.every.setRange(1, 60)
         self.every.setValue(st.detect_every)
@@ -329,6 +354,7 @@ class ProcessDialog(QDialog):
             analysis_width=int(self.aw.currentData()), use_nudenet=self.nude.isChecked(), detect_every=self.every.value(),
             det_threshold=round(self.thr.value(), 3), nudenet_tiles=self.tiles.value(), nudenet_model=self.nmodel.text().strip(),
             nudenet_res=int(self.nres.currentData()) if self.nmodel.text().strip() else 320, nudenet_device=self.ndev.currentData(),
+            det_male=self.det_male.isChecked(), det_female=self.det_female.isChecked(), face_mode=self.face.currentData(),
             fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentData(),
             block=self.block.value(), block_auto=self.block_auto.isChecked(), mosaic_style=self.style.currentData(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
             max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentData(),
@@ -359,6 +385,8 @@ def validate_settings(st: ProcessSettings, video_path: str, needs_sam2: bool) ->
             os.makedirs(os.path.dirname(os.path.abspath(st.output)), exist_ok=True)
         except OSError as e:
             probs.append(f"결과 폴더를 만들 수 없습니다: {e}")
+    if st.use_nudenet and not (st.det_male or st.det_female or st.face_mode != "off"):
+        probs.append("자동 탐지가 켜져 있는데 찾을 대상이 하나도 선택되지 않았습니다. 대상을 고르거나 자동 탐지를 끄세요.")
     if not needs_sam2 and not st.use_nudenet:
         probs.append("가릴 것이 없습니다. 영상에서 대상을 클릭하거나 자동 탐지를 켜세요.")
     if st.use_nudenet:

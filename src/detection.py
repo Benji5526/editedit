@@ -21,6 +21,13 @@ import cv2
 import numpy as np
 
 DEFAULT_CLASSES = ["FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED"]
+# faces: NudeNet finds whole faces (a box). "below_eyes" / "above_eyes" cut that box at the eye line; the eye line comes from a
+# face landmark model (YuNet, run by OpenCV) when its file is there, else from fixed proportions of the box (rough).
+FACE_CLASSES = ["FACE_FEMALE", "FACE_MALE"]
+FACE_MODES = ("off", "full", "below_eyes", "above_eyes")
+FACE_BELOW, FACE_ABOVE = "FACE_BELOW_EYES", "FACE_ABOVE_EYES"
+EXACT_CLASSES = {FACE_BELOW, FACE_ABOVE}         # boxes of these classes are final: the renderer must not grow them (eyes!)
+YUNET_NAME = "face_detection_yunet_2023mar.onnx"
 
 
 def supported_labels() -> List[str]:
@@ -45,6 +52,7 @@ class Det:
     score: float
     cls: str
     filled: bool = False   # True when synthesised by temporal gap filling (not seen by the model)
+    poly: Optional[list] = None   # exact region as a polygon [[x, y], ...] (rotated face parts); the box is then its bounding box
 
     @property
     def box(self) -> Tuple[float, float, float, float]:
@@ -108,12 +116,21 @@ def make_session(path: str, device: str = "auto", providers=None):
 
 class NudenetDetector:
     def __init__(self, threshold: float = 0.25, nms_iou: float = 0.45, classes: Optional[Sequence[str]] = None,
-                 model_path: Optional[str] = None, resolution: int = 320, tiles: int = 1, providers=None, device: str = "cpu"):
+                 model_path: Optional[str] = None, resolution: int = 320, tiles: int = 1, providers=None, device: str = "cpu",
+                 face_mode: str = "off", face_model: Optional[str] = None):
         import os
         import nudenet
 
         labels = supported_labels()
         classes = list(classes) if classes else list(DEFAULT_CLASSES)
+        if face_mode not in FACE_MODES:
+            raise ValueError(f"unknown face mode {face_mode!r}; choose one of {FACE_MODES}")
+        self.face_mode = face_mode
+        self.landmarks = None
+        if face_mode != "off":
+            classes += [c for c in FACE_CLASSES if c not in classes]
+            if face_mode != "full" and face_model:
+                self.landmarks = FaceLandmarks(face_model)
         bad = [c for c in classes if c not in labels]
         if bad:
             raise ValueError(f"unsupported NudeNet classes {bad}; supported: {labels}")
@@ -173,7 +190,96 @@ class NudenetDetector:
                 for x0 in xs:
                     for d in self._infer(np.ascontiguousarray(bgr[y0:y0 + th, x0:x0 + tw])):
                         dets.append(Det(d.x1 + x0, d.y1 + y0, d.x2 + x0, d.y2 + y0, d.score, d.cls))
-        return self._nms(dets)
+        dets = self._nms(dets)
+        if self.face_mode in ("below_eyes", "above_eyes"):
+            faces = [d for d in dets if d.cls in FACE_CLASSES]
+            marks = self.landmarks.detect(bgr) if self.landmarks is not None else []
+            dets = [d for d in dets if d.cls not in FACE_CLASSES] + face_parts(faces, marks, self.face_mode, bgr.shape[1], bgr.shape[0])
+        return dets
+
+
+class FaceLandmarks:
+    """Eye positions of the faces in a frame, from the YuNet face detector that OpenCV runs (cv2.FaceDetectorYN). Local file,
+    no network. detect() returns [(x1, y1, x2, y2, (rx, ry), (lx, ly), score, (nose_x, nose_y))] in frame pixels."""
+
+    def __init__(self, model_path: str, score: float = 0.6, max_side: int = 960):
+        import os
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"face landmark model not found: {model_path}")
+        if not hasattr(cv2, "FaceDetectorYN"):
+            raise RuntimeError("this OpenCV build has no FaceDetectorYN")
+        self.max_side = int(max_side)
+        self.det = cv2.FaceDetectorYN.create(model_path, "", (320, 320), float(score), 0.3, 200)
+
+    def detect(self, bgr: np.ndarray) -> list:
+        h, w = bgr.shape[:2]
+        k = min(1.0, self.max_side / max(h, w))
+        small = bgr if k == 1.0 else cv2.resize(bgr, (int(round(w * k)), int(round(h * k))), interpolation=cv2.INTER_AREA)
+        self.det.setInputSize((small.shape[1], small.shape[0]))
+        _, faces = self.det.detect(small)
+        out = []
+        for f in (faces if faces is not None else []):
+            f = [float(v) / k for v in f[:14]] + [float(f[14])]
+            out.append((f[0], f[1], f[0] + f[2], f[1] + f[3], (f[4], f[5]), (f[6], f[7]), f[14], (f[8], f[9])))
+        return out
+
+
+def face_parts(faces: List[Det], marks: list, mode: str, width: int, height: int) -> List[Det]:
+    """Turn whole-face boxes into the part below or above the eyes (class FACE_BELOW / FACE_ABOVE).
+
+    faces: whole-face boxes from the detector. marks: FaceLandmarks.detect() results (may be empty).
+    A face with landmarks gets a region that follows the head's rotation: a rectangle aligned with the line through the eyes
+    (a polygon in Det.poly), starting 0.3 x the eye distance below (above) the eyes so the eyes themselves stay visible. Its size
+    comes from face proportions (eye distance), not from a face outline - it is a rectangle, not the contour of the face.
+    A face without landmarks (profile, small, landmark model missing) is cut horizontally at fixed proportions of its box -
+    rough, and wrong for tilted heads. A landmark face that the detector did not report is used too."""
+    out: List[Det] = []
+    used = set()
+
+    def from_marks(m, score, box):
+        re, le = np.array(m[4], float), np.array(m[5], float)
+        mid = (re + le) / 2
+        iod = float(np.hypot(*(le - re)))
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        size = max(iod, 0.45 * min(bw, bh), 1.0)                 # a turned head shortens the eye distance: do not shrink with it
+        u = (le - re) / max(iod, 1e-6)                           # along the eyes
+        v = np.array([-u[1], u[0]])                              # across: towards the chin ...
+        nose = np.array(m[7], float) if len(m) > 7 else mid + np.array([0.0, 1.0])
+        if float(np.dot(nose - mid, v)) < 0:                     # ... on the side where the nose is
+            v = -v
+        half = 1.25 * size
+        t0, t1 = (0.3 * size, 2.2 * size) if mode == "below_eyes" else (-1.6 * size, -0.3 * size)
+        poly = [mid - half * u + t0 * v, mid + half * u + t0 * v, mid + half * u + t1 * v, mid - half * u + t1 * v]
+        poly = [[float(min(max(q[0], 0), width)), float(min(max(q[1], 0), height))] for q in poly]
+        xs, ys = [q[0] for q in poly], [q[1] for q in poly]
+        if max(xs) - min(xs) >= 2 and max(ys) - min(ys) >= 2:
+            out.append(Det(min(xs), min(ys), max(xs), max(ys), score, FACE_BELOW if mode == "below_eyes" else FACE_ABOVE, poly=poly))
+
+    for d in faces:
+        w, h = d.x2 - d.x1, d.y2 - d.y1
+        hit = None
+        for j, m in enumerate(marks):
+            cx, cy = (m[0] + m[2]) / 2, (m[1] + m[3]) / 2
+            if j not in used and d.x1 <= cx <= d.x2 and d.y1 <= cy <= d.y2:
+                hit = j
+                break
+        if hit is not None:
+            used.add(hit)
+            m = marks[hit]
+            from_marks(m, d.score, (min(d.x1, m[0]), min(d.y1, m[1]), max(d.x2, m[2]), max(d.y2, m[3])))
+            continue
+        ey, iod = d.y1 + 0.40 * h, 0.42 * w
+        xa, xb = max(0.0, d.x1 - 0.06 * w), min(float(width), d.x2 + 0.06 * w)
+        if mode == "below_eyes":
+            ya, yb, cls = ey + 0.3 * iod, min(float(height), d.y2 + 0.12 * h), FACE_BELOW
+        else:
+            ya, yb, cls = max(0.0, d.y1 - 0.12 * h), ey - 0.3 * iod, FACE_ABOVE
+        if yb - ya >= 2 and xb - xa >= 2:
+            out.append(Det(xa, ya, xb, yb, d.score, cls))
+    for j, m in enumerate(marks):
+        if j not in used:
+            from_marks(m, float(m[6]), m[:4])
+    return out
 
 
 class _Track:
@@ -258,12 +364,13 @@ def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carr
                         # take the larger of the two boxes' extents so interpolation never shrinks coverage
                         box = [min(box[0], da.x1, db.x1), min(box[1], da.y1, db.y1),
                                max(box[2], da.x2, db.x2), max(box[3], da.y2, db.y2)] if gap <= 2 else box
-                        out[g - start_frame].append(Det(*box, min(da.score, db.score), t.cls, filled=True))
+                        out[g - start_frame].append(Det(*box, min(da.score, db.score), t.cls, filled=True,
+                                                        poly=_mid_poly(da, db, u)))
         last = fr[-1]
         last_det = t.obs[last]
         for g in range(last + 1, last + 1 + hold):
             if start_frame <= g < end and not _has_cover(out[g - start_frame], last_det):
-                out[g - start_frame].append(Det(*last_det.box, last_det.score, t.cls, filled=True))
+                out[g - start_frame].append(Det(*last_det.box, last_det.score, t.cls, filled=True, poly=last_det.poly))
         watching = False                          # still inside the "lost" window when this chunk ends
         if lost_hold > 0 and lost is not None and t.seen >= min_obs:
             watching = True
@@ -278,7 +385,7 @@ def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carr
                     break
                 if g > last + hold:
                     lost.append({"frame": g, "box": list(last_det.box), "cls": t.cls, "last_seen": last,
-                                 "first": g == last + hold + 1})
+                                 "first": g == last + hold + 1, "poly": last_det.poly})
                     if lost[-1]["first"]:
                         head = lost[-1]
             else:
@@ -286,6 +393,15 @@ def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carr
         if (last + hold >= end - 1 and last >= start_frame - 1 - max_gap) or watching:
             new_carry.append({"cls": t.cls, "frame": last, "box": list(last_det.box), "score": last_det.score, "n": t.seen})
     return out, new_carry
+
+
+def _mid_poly(da: Det, db: Det, u: float) -> Optional[list]:
+    """Polygon for a gap-filled frame between two polygon detections (same number of corners: interpolated; else the nearer one)."""
+    if da.poly is None or db.poly is None:
+        return da.poly if u < 0.5 else db.poly
+    if len(da.poly) != len(db.poly):
+        return da.poly if u < 0.5 else db.poly
+    return [[a[0] * (1 - u) + b[0] * u, a[1] * (1 - u) + b[1] * u] for a, b in zip(da.poly, db.poly)]
 
 
 def _seen_again(dets: Optional[List[Det]], ref: Det) -> bool:

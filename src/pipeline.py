@@ -30,7 +30,8 @@ from . import quality_control as qc
 from .job_manager import JobDB, db_path_for
 from .mask_cache import CACHE_VERSION, cache_path, load_chunk_cache, save_chunk_cache  # noqa: F401  (re-exported)
 from .system_guard import disk_check, keep_awake
-from .detection import Det, fill_detections
+from .detection import Det, fill_detections, EXACT_CLASSES
+from .exclusions import is_excluded
 from .mosaic import (STYLES, apply_layers, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
 from .points_io import MaskPrompts, ObjectStyles, Prompts, load_mask_prompts, load_object_styles, load_points, mask_digest
@@ -126,7 +127,7 @@ class Config:
 
 
 NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points", "skip_disk_check", "faststart"}
-NON_HASHED_EXTRA = {"keep_temp", "nudenet_provider"}
+NON_HASHED_EXTRA = {"keep_temp", "nudenet_provider", "det_exclusions"}     # det_exclusions: render-only, see render_hash
 # Options that are only read by the render stage (mosaic + encoding). They do not change what the tracker, the detector or the QC
 # heuristics produce, so a job whose analysis results are cached (masks_NNNNN.npz) can be re-rendered with other values without
 # running SAM 2 or NudeNet again. Everything else is part of config_hash.
@@ -151,6 +152,8 @@ def render_hash(cfg: Config, object_styles: Optional[ObjectStyles] = None) -> st
     d = {k: v for k, v in asdict(cfg).items() if k in RENDER_ONLY}
     if object_styles:
         d["object_styles"] = {str(k): object_styles[k] for k in sorted(object_styles)}
+    if (cfg.extra or {}).get("det_exclusions"):
+        d["det_exclusions"] = cfg.extra["det_exclusions"]      # detections marked "not a target": only the mosaic changes
     if cfg.encoder == "h264_nvenc":
         d["nvenc_args"] = 2                # constant-QP arguments (see video_io.encoder_args); older nvenc segments are re-rendered
     d["code"] = CODE_VERSION
@@ -871,7 +874,10 @@ class Pipeline:
                          (f"not for {back} frames" if back else "not found again near that place (so far)"),
                          action=f"expanded_bbox_mosaic_up_to_{cfg.det_lost_hold}_frames" if cfg.fail_closed else "flagged_only",
                          last_seen=L["last_seen"])
-            if cfg.fail_closed and not fc_full[i]:
+            if cfg.fail_closed and L["cls"] in EXACT_CLASSES:
+                # part of a face: keep covering the same part, not an expanded box (that would cover the eyes)
+                filled[i].append(Det(*L["box"], 0.0, L["cls"], filled=True, poly=L.get("poly")))
+            elif cfg.fail_closed and not fc_full[i]:
                 b = L["box"]
                 fc_regions[i].append((int(b[0]), int(b[1]), int(np.ceil(b[2])), int(np.ceil(b[3]))))
                 fc_reason[i] = fc_reason[i] or qc.DET_LOST
@@ -917,6 +923,13 @@ class Pipeline:
                      int(round(st.get("pad_px", cfg.mask_pad_px) * self.sx)))
                for oid, st in self.obj_styles.items()}
         fc_run: Dict[str, int] = {}
+        excl = (cfg.extra or {}).get("det_exclusions") or []
+        if excl:                                  # detections the user marked "not a target" (boxes are in analysis pixels here)
+            def full(b):
+                return (b[0] / self.sx, b[1] / self.sy, b[2] / self.sx, b[3] / self.sy)
+            filled = [[d for d in ds if not is_excluded(excl, s + i, full(d.box), d.cls)] for i, ds in enumerate(filled)]
+            fc_regions = [[r for r in rs if fc_reason[i] != qc.DET_LOST or not is_excluded(excl, s + i, full(r))]
+                          for i, rs in enumerate(fc_regions)]
         try:
             for i in range(n):
                 if i % 4 == 0:
@@ -942,7 +955,13 @@ class Pipeline:
                                 m_obj = dilate_mask(m_obj, pad_o)
                                 layers[key] = m_obj if key not in layers else (layers[key] | m_obj)
                     m_an = dilate_mask(m_an, pad_an)
-                    dboxes = [expand_box(d.box, cfg.det_expand, det_pad_an, shape) for d in filled[i]]
+                    dboxes = [expand_box(d.box, 0.0 if d.cls in EXACT_CLASSES else cfg.det_expand,
+                                         0.0 if d.cls in EXACT_CLASSES else det_pad_an, shape) for d in filled[i] if not d.poly]
+                    polys = [np.round(np.array(d.poly)).astype(np.int32) for d in filled[i] if d.poly]
+                    if polys:
+                        pm = np.zeros(shape, np.uint8)
+                        cv2.fillPoly(pm, polys, 1)
+                        m_an |= pm.astype(bool)
                     if dboxes:
                         m_an |= boxes_to_mask(dboxes, shape)
                     if fc_regions[i]:
