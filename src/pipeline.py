@@ -37,7 +37,8 @@ from .tracking import Init, Tracker, TrackerError, pack_mask, unpack_mask
 from .video_io import (FrameReader, PrefetchReader, SegmentWriter, VideoError, VideoInfo, concat_and_mux, count_packets,
                        is_hdr, probe_video, verify_output)
 
-CODE_VERSION = "1"
+CODE_VERSION = "2"
+CACHE_VERSION = 1
 PROMPT_NO_MASK = "prompt_produced_no_mask"
 DET_ERROR = "detector_error"
 
@@ -70,10 +71,11 @@ class RenderJob:
     fc_full: list
     fc_reason: list
     filled: list
-    snapshot: dict
+    snapshot: Optional[dict]            # None when the chunk's analysis was loaded from the mask cache (its state is already on disk)
     chunk_dets: list
     last_md5: str
     timing: dict
+    a_events: list = field(default_factory=list)   # review events of the analysis stage only (what the mask cache stores)
 
 
 @dataclass
@@ -124,16 +126,90 @@ class Config:
 
 NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points", "skip_disk_check", "faststart"}
 NON_HASHED_EXTRA = {"keep_temp"}
+# Options that are only read by the render stage (mosaic + encoding). They do not change what the tracker, the detector or the QC
+# heuristics produce, so a job whose analysis results are cached (masks_NNNNN.npz) can be re-rendered with other values without
+# running SAM 2 or NudeNet again. Everything else is part of config_hash.
+RENDER_ONLY = {"block", "mosaic_style", "mask_pad_px", "temporal_radius", "det_expand", "det_pad_px", "fail_closed_expand",
+               "fail_closed_mode", "encoder", "crf", "preset"}
 
 
 def config_hash(cfg: Config, info: VideoInfo) -> str:
-    """Hash of everything that changes chunk results EXCEPT the clicked points (those are tracked per chunk, see
-    prompt_signatures) and pure bookkeeping options. A mismatch makes a job non-resumable."""
-    d = {k: v for k, v in asdict(cfg).items() if k not in NON_HASHED}
+    """Hash of everything that changes the ANALYSIS of a chunk (masks, detections, review events of the analysis stage) EXCEPT the
+    clicked points (those are tracked per chunk, see prompt_signatures), the render-only options (see render_hash) and pure
+    bookkeeping options. A mismatch makes a job non-resumable."""
+    d = {k: v for k, v in asdict(cfg).items() if k not in NON_HASHED and k not in RENDER_ONLY}
     d["extra"] = {k: v for k, v in (cfg.extra or {}).items() if k not in NON_HASHED_EXTRA}
     d["input_fp"] = info.fingerprint
     d["code"] = CODE_VERSION
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+
+def render_hash(cfg: Config) -> str:
+    """Hash of the render-only options. Stored with every finished chunk; a segment is only reused when it matches."""
+    d = {k: v for k, v in asdict(cfg).items() if k in RENDER_ONLY}
+    d["code"] = CODE_VERSION
+    return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+
+def _json_default(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    return str(o)
+
+
+def cache_path(job_dir: str, ci: int) -> str:
+    return os.path.join(job_dir, f"masks_{ci:05d}.npz")
+
+
+def save_chunk_cache(job_dir: str, rj: "RenderJob", shape: Tuple[int, int]) -> None:
+    """Write everything the render stage of one chunk needs (the analysis results) to masks_NNNNN.npz.
+
+    Layout: ``meta`` (JSON string: frame range, analysis-frame shape, object ids, detections per frame incl. gap-filled ones,
+    fail-closed regions/flags, the analysis-stage review events) and per object ``p<id>`` (bool per frame: has a mask) plus
+    ``m<id>`` (the bit-packed masks of the frames that have one, in order; see tracking.pack_mask). Masks are in analysis-frame
+    coordinates. The file is derived from the footage: it stays in the job's work folder and is deleted with it."""
+    arrays = {}
+    for oid, seq in rj.packed.items():
+        present = np.array([m is not None for m in seq], dtype=bool)
+        arrays[f"p{oid}"] = present
+        if present.any():
+            arrays[f"m{oid}"] = np.stack([m for m in seq if m is not None])
+    meta = {"version": CACHE_VERSION, "chunk": rj.ci, "start": rj.s, "end": rj.e, "shape": [int(shape[0]), int(shape[1])],
+            "obj_ids": [int(o) for o in rj.packed], "filled": [[asdict(d) for d in ds] for ds in rj.filled],
+            "fc_regions": [[[int(v) for v in r] for r in rs] for rs in rj.fc_regions], "fc_full": [bool(v) for v in rj.fc_full],
+            "fc_reason": list(rj.fc_reason), "events": rj.a_events, "detections": rj.chunk_dets}
+    arrays["meta"] = np.array(json.dumps(meta, default=_json_default))
+    path = cache_path(job_dir, rj.ci)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.savez_compressed(f, **arrays)
+    os.replace(tmp, path)
+
+
+def load_chunk_cache(job_dir: str, ci: int) -> dict:
+    """Read masks_NNNNN.npz back: {"meta": dict, "packed": {obj_id: [packed mask or None per frame]}}."""
+    with np.load(cache_path(job_dir, ci), allow_pickle=False) as z:
+        meta = json.loads(str(z["meta"][()]))
+        if meta.get("version") != CACHE_VERSION:
+            raise ValueError(f"unsupported mask cache version {meta.get('version')}")
+        n = meta["end"] - meta["start"]
+        packed = {}
+        for oid in meta["obj_ids"]:
+            present = z[f"p{oid}"]
+            rows = z[f"m{oid}"] if f"m{oid}" in z.files else None
+            seq, k = [], 0
+            for i in range(n):
+                if present[i]:
+                    seq.append(rows[k])
+                    k += 1
+                else:
+                    seq.append(None)
+            packed[int(oid)] = seq
+    return {"meta": meta, "packed": packed}
 
 
 def file_sha(path: Optional[str]) -> Optional[str]:
@@ -175,7 +251,7 @@ def plan_reprocess(cfg: Config) -> dict:
     sigs = prompt_signatures(prompts, chunks)
     jd = job_dir_for(cfg, info)
     plan = {"total_chunks": len(chunks), "total_frames": total, "job_found": False, "can_resume": False, "reusable_chunks": 0,
-            "frames_reused": 0, "first_changed_chunk": None, "reason": ""}
+            "frames_reused": 0, "render_only_chunks": 0, "frames_render_only": 0, "first_changed_chunk": None, "reason": ""}
     jp = os.path.join(jd, "job.json")
     if not os.path.isfile(jp):
         plan["reason"] = "no kept intermediate chunks were found, so everything will be processed"
@@ -189,17 +265,31 @@ def plan_reprocess(cfg: Config) -> dict:
     plan["can_resume"] = True
     limit = first_changed_chunk(old.get("chunk_prompt_sigs"), sigs)
     plan["first_changed_chunk"] = limit if limit < len(chunks) else None
-    good = 0
+    rh = render_hash(cfg)
+    good = analyzed = 0
+    seg_prefix = True
     for ci in range(min(limit, len(chunks))):
         c = old.get("chunks", {}).get(str(ci))
         if not (c and c.get("status") == "done" and all(os.path.isfile(os.path.join(jd, f"{k}_{ci:05d}.{x}"))
-                                                         for k, x in (("seg", "mp4"), ("state", "json"), ("qc", "json")))):
+                                                         for k, x in (("masks", "npz"), ("state", "json"), ("qc", "json")))):
             break
-        good = ci + 1
+        analyzed = ci + 1
+        if seg_prefix and c.get("render_hash") == rh and os.path.isfile(os.path.join(jd, f"seg_{ci:05d}.mp4")):
+            good = ci + 1
+        else:
+            seg_prefix = False
     plan["reusable_chunks"] = good
     plan["frames_reused"] = chunks[good - 1][1] if good else 0
-    plan["reason"] = ("nothing changed: only the final video is rebuilt" if good == len(chunks) else
-                      f"chunks 1-{good} are reused, the rest is re-processed" if good else "no chunk can be reused")
+    plan["render_only_chunks"] = analyzed - good
+    plan["frames_render_only"] = (chunks[analyzed - 1][1] if analyzed else 0) - plan["frames_reused"]
+    if good == len(chunks):
+        plan["reason"] = "nothing changed: only the final video is rebuilt"
+    elif analyzed > good:
+        plan["reason"] = (f"the mosaic or encoder settings changed: tracking and detection of chunks {good + 1}-{analyzed} are reused "
+                          f"and only their mosaic is redone" + (f", chunks 1-{good} are reused as they are" if good else "")
+                          + (f", chunks {analyzed + 1}-{len(chunks)} are re-processed" if analyzed < len(chunks) else ""))
+    else:
+        plan["reason"] = f"chunks 1-{good} are reused, the rest is re-processed" if good else "no chunk can be reused"
     return plan
 
 
@@ -400,7 +490,8 @@ class Pipeline:
         cs = cfg.chunk_size
         chunks = [(s, min(s + cs, total)) for s in range(0, total, cs)]
         h = config_hash(cfg, info)
-        self._points_changed, self._reused = False, 0
+        rh = render_hash(cfg)
+        self._points_changed, self._reused, self._rerender = False, 0, 0
         self._sigs = prompt_signatures(prompts, chunks)
         job_dir = job_dir_for(cfg, info)
         self.job_dir = job_dir
@@ -408,8 +499,8 @@ class Pipeline:
         self.points_sha = file_sha(cfg.points)
         job = {"config_hash": h, "input": info.to_json_dict(), "config": asdict(cfg), "total_frames": total,
                "chunks": {}, "analysis_size": [aw, ah], "created": time.strftime("%F %T"),
-               "chunk_prompt_sigs": self._sigs, "points_sha": self.points_sha, "run_id": self.run_id}
-        start_ci = 0
+               "chunk_prompt_sigs": self._sigs, "points_sha": self.points_sha, "run_id": self.run_id, "render_hash": rh}
+        start_ci = analyze_from = 0     # start_ci: first chunk whose segment must be made; analyze_from: first chunk that needs analysis
         self.monitor = qc.ObjectMonitor(self.shape, qc.QCParams(jump_ratio=cfg.jump_ratio))
         self.objstate: Dict[int, dict] = {}
         self.last_good: Dict[int, np.ndarray] = {}
@@ -420,7 +511,7 @@ class Pipeline:
         ts_fn = info.timestamp_of
 
         if cfg.resume and os.path.isfile(job_path):
-            start_ci = self._try_resume(job, job_path, chunks)
+            start_ci, analyze_from = self._try_resume(job, job_path, chunks)
         else:
             if os.path.isdir(job_dir):
                 shutil.rmtree(job_dir)
@@ -434,6 +525,9 @@ class Pipeline:
             c = job["chunks"].get(str(ci_done), {})
             self._db_call("set_chunk", ci_done, "done", start_frame=c.get("start"), end_frame=c.get("end"), seconds=c.get("seconds"),
                           rss_mb=c.get("rss_mb"), cuda_peak_mb=c.get("cuda_peak_mb"))
+        if analyze_from > start_ci:
+            log.info("render settings changed: chunks %d-%d are re-rendered from the mask cache (no tracking, no detection)",
+                     start_ci + 1, analyze_from)
         if start_ci:
             if start_ci < len(chunks):
                 log.info("resuming at chunk %d/%d (frame %d)", start_ci, len(chunks), chunks[start_ci][0])
@@ -445,32 +539,34 @@ class Pipeline:
         self.events_so_far = events
 
         s0 = chunks[start_ci][0] if start_ci < len(chunks) else total
+        sa = chunks[analyze_from][0] if analyze_from < len(chunks) else total       # first frame that needs analysis
         self._nchunks, self._done_frames = len(chunks), s0
         self._emit(event="start", total_frames=total, chunks=len(chunks), chunk_size=cfg.chunk_size,
                    resume_from_chunk=start_ci, done_frames=s0, width=W, height=H, fps=info.fps,
-                   reused_chunks=self._reused, points_changed=self._points_changed)
+                   reused_chunks=self._reused, rerender_chunks=self._rerender, points_changed=self._points_changed)
         self.ring = os.path.join(job_dir, "ring")
         shutil.rmtree(self.ring, ignore_errors=True)
         os.makedirs(self.ring)
         cap = cfg.stale_prefix_frames if self.tracker is not None else 0
-        a_start = max(0, s0 - 1 - cap) if s0 > 0 else 0
+        a_start = max(0, sa - 1 - cap) if sa > 0 else 0
         a_reader = f_reader = None
-        if start_ci < len(chunks):
+        if analyze_from < len(chunks):
             a_reader = FrameReader(info, start_frame=a_start, max_frames=total - a_start, scale_to=(aw, ah))
+        if start_ci < len(chunks):
             f_reader = PrefetchReader(FrameReader(info, start_frame=s0, max_frames=total - s0), depth=3)
         renderer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="render")
         with self._prog_lock:
-            self._prog["a"] = self._prog["r"] = float(s0)
+            self._prog["a"], self._prog["r"] = float(sa), float(s0)
         try:
-            if s0 > 0 and start_ci < len(chunks):
-                for g in range(a_start, s0):      # rebuild the ring buffer; the last frame must match the checkpoint
+            if sa > 0 and analyze_from < len(chunks):
+                for g in range(a_start, sa):      # rebuild the ring buffer; the last frame must match the checkpoint
                     fa = a_reader.read()
                     if fa is None:
                         raise JobFailed("resume: could not read analysis frames before the resume point")
-                    if g < s0 - 1 and cap:
+                    if g < sa - 1 and cap:
                         write_jpeg(os.path.join(self.ring, f"{g}.jpg"), fa)
                     self.prev_last_analysis = fa
-                want = job["chunks"][str(start_ci - 1)]["last_frame_md5"]
+                want = job["chunks"][str(analyze_from - 1)]["last_frame_md5"]
                 if self.prev_last_analysis is None or hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest() != want:
                     raise JobFailed("resume: seeked analysis frame does not match the checkpoint (seek not frame-exact). "
                                     "Re-run without --resume.")
@@ -487,7 +583,8 @@ class Pipeline:
                 last_finish[0] = now
                 timing = dict(rj_.timing, render_s=render_s)
                 job["chunks"][str(ci_)] = {"status": "done", "start": s_, "end": e_, "frames": e_ - s_, "segment": f"seg_{ci_:05d}.mp4",
-                                           "seconds": seconds, **mem, "timing": timing, "last_frame_md5": rj_.last_md5}
+                                           "seconds": seconds, **mem, "timing": timing, "last_frame_md5": rj_.last_md5,
+                                           "render_hash": rh}
                 _atomic_json(job_path, job)
                 self._db_call("set_chunk", ci_, "done", start_frame=s_, end_frame=e_, seconds=seconds,
                               rss_mb=mem.get("rss_mb"), cuda_peak_mb=mem.get("cuda_peak_mb"))
@@ -518,7 +615,10 @@ class Pipeline:
                     self._check_cancel()
                     self._db_call("set_chunk", ci, "running", start_frame=s, end_frame=e)
                     try:
-                        rj = self._analyze_chunk(ci, s, e, a_reader, prompts)         # overlaps with the render of the previous chunk
+                        if ci < analyze_from:                                         # analysis results are cached: render only
+                            rj = self._load_cached_chunk(ci, s, e, job["chunks"][str(ci)])
+                        else:
+                            rj = self._analyze_chunk(ci, s, e, a_reader, prompts)     # overlaps with the render of the previous chunk
                     except JobCancelled:
                         raise
                     except BaseException as ex:
@@ -547,53 +647,83 @@ class Pipeline:
         return self._finalize(info, chunks, job, events, status_path, t_start)
 
     # ------------------------------------------------------------------ resume
-    def _try_resume(self, job: dict, job_path: str, chunks) -> int:
+    def _try_resume(self, job: dict, job_path: str, chunks) -> Tuple[int, int]:
+        """Decide what an earlier run left that is still valid. Returns (render_from, analyze_from):
+        chunks [0, render_from) are reused as they are (segment + state), chunks [render_from, analyze_from) have valid analysis
+        results in the mask cache and only need the render stage (the render-only settings changed, or an earlier re-render was
+        interrupted), chunks from analyze_from on are processed in full. render_from <= analyze_from."""
         with open(job_path, encoding="utf-8") as f:
             old = json.load(f)
         if old.get("config_hash") != job["config_hash"]:
             raise JobFailed("resume refused: settings or input differ from the earlier run (config hash mismatch). "
-                            "Only the clicked points may change between a run and its resume. Re-run without --resume to start over.")
+                            "Only the clicked points and the mosaic/encoder settings may change between a run and its resume. "
+                            "Re-run without --resume to start over.")
         job.update({k: old[k] for k in ("created",) if k in old})
         limit = first_changed_chunk(old.get("chunk_prompt_sigs"), job["chunk_prompt_sigs"])
         self._points_changed = limit < len(chunks)
         if self._points_changed:
             log.info("points changed: chunks 0-%d are reused, chunk %d onwards is re-processed", limit - 1, limit)
-        ok = 0
+        rendered = analyzed = 0
+        seg_prefix = True
         for ci in range(min(limit, len(chunks))):
             c = old["chunks"].get(str(ci))
             seg = os.path.join(self.job_dir, f"seg_{ci:05d}.mp4")
             st = os.path.join(self.job_dir, f"state_{ci:05d}.json")
             qcf = os.path.join(self.job_dir, f"qc_{ci:05d}.json")
-            if not (c and c.get("status") == "done" and all(os.path.isfile(p) for p in (seg, st, qcf))):
-                break
-            try:
-                if count_packets(seg) != chunks[ci][1] - chunks[ci][0]:
-                    log.warning("chunk %d segment frame count mismatch; redoing from here", ci)
-                    break
-            except Exception as e:  # noqa: BLE001
-                log.warning("chunk %d segment unreadable (%s); redoing from here", ci, e)
+            if not (c and c.get("status") == "done" and all(os.path.isfile(p) for p in (st, qcf, cache_path(self.job_dir, ci)))):
                 break
             job["chunks"][str(ci)] = c
-            ok = ci + 1
-        self._reused = ok
-        if ok:
-            self._load_state(ok - 1)
-        # drop anything after the last valid chunk (incomplete work is never treated as done)
+            analyzed = ci + 1
+            if seg_prefix and c.get("render_hash") == job["render_hash"] and os.path.isfile(seg):
+                try:
+                    if count_packets(seg) == chunks[ci][1] - chunks[ci][0]:
+                        rendered = ci + 1
+                        continue
+                    log.warning("chunk %d segment frame count mismatch; re-rendering from here", ci)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("chunk %d segment unreadable (%s); re-rendering from here", ci, e)
+            seg_prefix = False
+        self._reused, self._rerender = rendered, analyzed - rendered
+        if analyzed:
+            self._load_state(analyzed - 1)
+        # drop what is no longer valid (incomplete or outdated work is never treated as done)
         for name in os.listdir(self.job_dir):
-            if name.startswith(("seg_", "state_", "qc_", "frames_")):
+            if name.startswith(("seg_", "state_", "qc_", "frames_", "masks_")):
                 try:
                     idx = int(name.split("_")[1].split(".")[0])
                 except ValueError:
                     continue
-                if idx >= ok:
+                if idx >= (rendered if name.startswith("seg_") else analyzed) or name.startswith("frames_"):
                     p = os.path.join(self.job_dir, name)
                     shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
-        return ok
+        return rendered, analyzed
 
-    def _save_state(self, ci: int, chunk_events: List[dict], snapshot: dict, chunk_dets: List[dict]):
-        st = {"monitor": snapshot["monitor"], "objstate": snapshot["objstate"], "det_carry": snapshot["det_carry"], "det_records_tail": []}
-        _atomic_json(os.path.join(self.job_dir, f"state_{ci:05d}.json"), st)
-        np.savez(os.path.join(self.job_dir, f"state_{ci:05d}.npz"), **{f"m{k}": v for k, v in snapshot["last_good"].items()})
+    def _load_cached_chunk(self, ci: int, s: int, e: int, entry: dict) -> RenderJob:
+        """Build the render job of a chunk from its mask cache instead of running the tracker and the detector."""
+        n = e - s
+        try:
+            c = load_chunk_cache(self.job_dir, ci)
+        except Exception as ex:  # noqa: BLE001
+            raise JobFailed(f"mask cache of chunk {ci} cannot be read ({type(ex).__name__}: {ex}). Re-run without --resume.") from ex
+        meta = c["meta"]
+        if (meta["start"], meta["end"]) != (s, e) or tuple(meta["shape"]) != tuple(self.shape):
+            raise JobFailed(f"mask cache of chunk {ci} does not match this job (frames {meta['start']}-{meta['end']}, "
+                            f"shape {meta['shape']}). Re-run without --resume.")
+        packed = {oid: c["packed"].get(oid, [None] * n) for oid in self.obj_ids}     # objects clicked later have no masks here
+        with self._prog_lock:
+            self._prog["a"] = max(self._prog["a"], float(e))
+        return RenderJob(ci=ci, s=s, e=e, n=n, qlog=qc.QCLog.from_events(copy.deepcopy(meta["events"]), self.info.timestamp_of),
+                         packed=packed, fc_regions=[[tuple(r) for r in rs] for rs in meta["fc_regions"]], fc_full=meta["fc_full"],
+                         fc_reason=meta["fc_reason"], filled=[[Det(**d) for d in ds] for ds in meta["filled"]], snapshot=None,
+                         chunk_dets=meta["detections"], last_md5=entry["last_frame_md5"],
+                         timing={"analysis_s": 0.0, "detect_s": 0.0, "track_s": 0.0, "qc_s": 0.0, "from_mask_cache": True},
+                         a_events=meta["events"])
+
+    def _save_state(self, ci: int, chunk_events: List[dict], snapshot: Optional[dict], chunk_dets: List[dict]):
+        if snapshot is not None:          # None: re-rendered from the mask cache, the tracking state on disk is still the right one
+            st = {"monitor": snapshot["monitor"], "objstate": snapshot["objstate"], "det_carry": snapshot["det_carry"], "det_records_tail": []}
+            _atomic_json(os.path.join(self.job_dir, f"state_{ci:05d}.json"), st)
+            np.savez(os.path.join(self.job_dir, f"state_{ci:05d}.npz"), **{f"m{k}": v for k, v in snapshot["last_good"].items()})
         _atomic_json(os.path.join(self.job_dir, f"qc_{ci:05d}.json"), {"events": chunk_events, "detections": chunk_dets})
 
     def _load_state(self, ci: int):
@@ -777,7 +907,8 @@ class Pipeline:
                        filled=filled, snapshot=self._snapshot_state(), chunk_dets=self._chunk_dets,
                        last_md5=hashlib.md5(self.prev_last_analysis.tobytes()).hexdigest(),
                        timing={"analysis_s": round(tm1 - tm0 - t_det, 2), "detect_s": round(t_det, 2), "track_s": round(tm2 - tm1, 2),
-                               "qc_s": round(tm3 - tm2, 2)})
+                               "qc_s": round(tm3 - tm2, 2)},
+                       a_events=[asdict(ev) for ev in qlog.events])
         del masks, raw_dets
         gc.collect()
         return rj
@@ -850,6 +981,8 @@ class Pipeline:
 
         render_s = round(time.perf_counter() - tm3, 2)
         chunk_events = [asdict(ev) for ev in qlog.events]
+        if rj.snapshot is not None:
+            save_chunk_cache(self.job_dir, rj, shape)       # before the state: a chunk only counts as analysed with its cache on disk
         self._save_state(ci, chunk_events, rj.snapshot, rj.chunk_dets)
         del packed, filled
         return chunk_events, render_s
@@ -910,6 +1043,7 @@ class Pipeline:
                 "config": asdict(cfg), "run_id": self.run_id, "points_sha": self.points_sha,
                 "points_path": os.path.abspath(cfg.points) if cfg.points else None,
                 "reused_chunks": self._reused, "reprocessed_chunks": list(range(self._reused, len(chunks))),
+                "rerendered_chunks": self._rerender,
                 "created": time.strftime("%F %T"),
                 "output": None if problems else {"path": os.path.abspath(out_final), "size": os.path.getsize(partial),
                                                  "mtime": round(os.path.getmtime(partial), 3)}}

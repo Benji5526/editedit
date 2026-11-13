@@ -94,7 +94,9 @@ class ProcessPanel(QWidget):
         if kind == "start":
             self._f0 = f
             self.detail.setText(f"{ev.get('total_frames')} frames in {ev.get('chunks')} chunks"
-                                + (f" - points changed: chunks 1-{ev['reused_chunks']} reused, the rest re-processed"
+                                + (f" - mosaic settings changed: {ev['rerender_chunks']} chunks only get a new mosaic (tracking reused)"
+                                   if ev.get("rerender_chunks") else
+                                   f" - points changed: chunks 1-{ev['reused_chunks']} reused, the rest re-processed"
                                    if ev.get("points_changed") and ev.get("reused_chunks") else
                                    f" - points changed: everything re-processed" if ev.get("points_changed") else
                                    f" (resuming at chunk {ev['resume_from_chunk'] + 1})" if ev.get("resume_from_chunk") else ""))

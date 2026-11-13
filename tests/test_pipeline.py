@@ -267,7 +267,7 @@ def test_resume_after_crash_matches_clean_run(video, points, tmp_path):
 def test_resume_refused_when_settings_changed(video, points, tmp_path):
     cfg = make_cfg(tmp_path, video, points)
     assert run(cfg, ColorTracker((180, 320), crash_chunks={2})) == 1
-    cfg2 = make_cfg(tmp_path, video, points, block=24, resume=True)
+    cfg2 = make_cfg(tmp_path, video, points, jump_ratio=3.0, resume=True)     # an analysis setting (render-only ones: test_mask_cache.py)
     assert run(cfg2, ColorTracker((180, 320))) == 1
     assert "differ" in status(cfg2)["reason"]
 
@@ -281,7 +281,7 @@ def test_corrupt_segment_is_not_trusted_on_resume(video, points, tmp_path):
     cfg.resume = True
     tr = ColorTracker((180, 320))
     assert run(cfg, tr) in (0, 2)
-    assert tr.n_calls == 3                                # chunks 1,2,3 redone; chunk 0 still valid
+    assert tr.n_calls == 1                                # chunk 0 still valid; 1 and 2 re-rendered from the mask cache; 3 processed
     assert probe_video(cfg.output).nb_frames == 160
 
 

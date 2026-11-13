@@ -84,6 +84,17 @@ Each job stores a signature of the clicks per chunk (`temp/<job>/job.json`); a r
 review events), recomputes everything after it, and refuses to reuse anything when the settings, the video or the code version differ. Intermediate chunks are kept after success
 (option "Keep intermediate chunks", disk use about the size of the output; `Process > Delete intermediate chunks`) - without them a re-process starts from scratch.
 
+*Mask cache: changing the mosaic without tracking again.* Next to every chunk's segment the job keeps `masks_NNNNN.npz`: the analysis results the render stage works from
+(bit-packed masks per object and frame in analysis-frame coordinates, NudeNet boxes including the gap-filled ones, fail-closed regions, and the review events of the analysis stage).
+The settings are split into two groups. **Render-only** settings - mosaic style, strength (`--block`), `--mask-pad-px`, `--temporal-radius`, `--det-expand`, `--det-pad-px`,
+`--fail-closed-expand`, `--fail-closed-mode`, encoder, CRF, preset - are stored per chunk; when only they differ, `--resume` (the app: `Process > Start processing`, change the values and tick "Resume / reuse an earlier run") **re-renders the chunks from the cache and runs neither SAM 2 nor NudeNet**. Every other setting (chunk size, analysis width, detector options, fail-closed on/off,
+QC thresholds, the model) still makes the old chunks unusable. Changed clicks and changed render settings combine: chunks before the first changed click are re-rendered from the cache,
+the rest is processed in full. An interrupted re-render continues where it stopped, a segment that is damaged or was made with other settings is re-rendered, and a cache file that is
+missing makes processing start in full from that chunk; a cache file that exists but cannot be read fails the job (re-run without `--resume`) instead of guessing.
+`tests/test_mask_cache.py` checks that a re-render equals a from-scratch run with the new settings (frames, review events, detection log) with the stand-in tracker.
+Not measured: the size of the cache on real 4K footage (masks compress well, but it adds to the disk use of the kept chunks) and the time saved on a long video.
+The cache is derived from the footage; it lives in the job's work folder and is deleted with it.
+
 *Review log consistency.* Every run writes `run_id`, the sha256 of the points file it used and the size/mtime of the output video into the review log. The Review tab shows a red
 banner when the current points file or the output video no longer match the log. "Reviewed" marks are stored next to the log (`*_review_state.json`); after a re-process they are kept
 only for flags in reused chunks and reset for recomputed ones. "Reviewed" means a human looked at it, not that the frame is correct.
@@ -123,6 +134,7 @@ Worker protocol (stdout lines `@@PROGRESS {json}`: `stage`, `start`, `progress`,
    `m` / `b` jump to the next / previous flagged frame (start and end of each flagged segment, severity warn and above; `--review-min-severity info` for all). The object named
    by the flag becomes the current object, and the banner lists the flags at that frame. Left-click the object on a frame where it is visible again, press `s`, then re-run
    `censor_video.py` with the same `points.json` and `--resume --keep-temp`: only the chunks from the first changed click onwards are recomputed (see "Re-processing after edits").
+   To change only the look (e.g. `--block 64 --mosaic-style solid`), re-run with the new values and `--resume --keep-temp`: the tracking results are reused (see "Mask cache").
 
 Exit code: `0` finished, `2` finished but error-level review events exist, `1` failed (no final file is produced), `3` cancelled (resumable).
 

@@ -137,9 +137,11 @@ def test_incremental_equals_from_scratch(video, tmp_path, extra_clicks, expect_r
 
 
 def test_changed_settings_are_still_refused(video, tmp_path):
+    """Settings that change the analysis (here the QC threshold) make the old chunks unusable. Render-only settings such as the
+    mosaic strength are covered by test_mask_cache.py."""
     p1 = mk_points(video, tmp_path, "p1.json", [P12])
     assert run(cfg_for(tmp_path, video, p1))[0] == 0
-    rc, _, _ = run(cfg_for(tmp_path, video, p1, block=24, resume=True))
+    rc, _, _ = run(cfg_for(tmp_path, video, p1, jump_ratio=3.0, resume=True))
     assert rc == 1
     status = json.load(open(os.path.join(str(tmp_path / "logs"), "synthetic_status.json")))
     assert "differ" in status["reason"]

@@ -41,8 +41,14 @@ def test_plan_only_describes_reuse_without_processing(video, tmp_path):
     assert p["can_resume"] and p["reusable_chunks"] == 4 and p["frames_reused"] == 160 and p["first_changed_chunk"] is None
     assert "nothing changed" in p["reason"]
 
-    # other settings => the old chunks cannot be used
-    rc, evs, _, _ = run_cli(cli_args(video, tmp_path, "--plan-only", "--resume", "--block", "48"))
+    # another mosaic strength => tracking and detection are reused, only the mosaic is redone
+    rc, evs, _, _ = run_cli(cli_args(video, tmp_path, "--plan-only", "--resume", "--keep-temp", "--block", "48"))
+    p = plan_of(evs)
+    assert p["can_resume"] and p["reusable_chunks"] == 0 and p["render_only_chunks"] == 4 and p["frames_render_only"] == 160
+    assert "only their mosaic is redone" in p["reason"]
+
+    # settings that change the analysis => the old chunks cannot be used
+    rc, evs, _, _ = run_cli(cli_args(video, tmp_path, "--plan-only", "--resume", "--jump-ratio", "3"))
     p = plan_of(evs)
     assert p["job_found"] and p["can_resume"] is False and "from scratch" in p["reason"]
 

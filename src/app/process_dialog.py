@@ -187,7 +187,10 @@ class ProcessDialog(QDialog):
         self.keep = QCheckBox("Keep intermediate chunks (fast re-processing after re-clicks; needs disk space ~ output size)")
         self.keep.setChecked(st.keep_chunks)
         form.addRow(self.keep)
-        self.resume = QCheckBox("Resume an interrupted job (same input and settings; changed points only redo the affected chunks)")
+        self.resume = QCheckBox("Resume / reuse an earlier run of this video (changed points redo the affected chunks; "
+                                "changed mosaic style, strength, padding or encoder only redo the mosaic)")
+        self.resume.setToolTip("Needs the intermediate chunks of the earlier run (\"Keep intermediate chunks\"). Other settings "
+                               "(chunk size, analysis width, NudeNet, fail-closed on/off, model) must be the same.")
         form.addRow(self.resume)
 
         self.error = QLabel("")

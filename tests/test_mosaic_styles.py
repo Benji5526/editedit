@@ -118,7 +118,7 @@ def test_unknown_style_fails_cleanly(video, tmp_path):
     assert st["status"] == "failed" and "mosaic style" in st["reason"] and not os.path.exists(cfg.output)
 
 
-def test_style_change_invalidates_kept_chunks(video, tmp_path):
+def test_style_change_rerenders_kept_chunks(video, tmp_path):
     pts = str(tmp_path / "p.json")
     save_points(pts, probe_video(video), [P12])
 
@@ -126,7 +126,14 @@ def test_style_change_invalidates_kept_chunks(video, tmp_path):
         return Config(input=video, output=str(tmp_path / "o.mp4"), points=pts, work_dir=str(tmp_path / "w"), log_dir=str(tmp_path / "l"),
                       chunk_size=40, analysis_width=320, preset="ultrafast", mosaic_style=style, resume=resume, extra={"keep_temp": True})
     assert Pipeline(cfg("pixelate"), ColorTracker((180, 320)), None).run() == 0
-    assert Pipeline(cfg("solid", resume=True), ColorTracker((180, 320)), None).run() == 1          # chunks were rendered with another style
+    with FrameReader(probe_video(str(tmp_path / "o.mp4"))) as r:
+        before = list(r)[30][170:190, 90:110].mean()                    # inside the square at frame 30 (x 70-130, y 150-210)
+    tr = ColorTracker((180, 320))
+    assert Pipeline(cfg("solid", resume=True), tr, None).run() == 0
+    assert tr.n_calls == 0                                               # tracking is reused from the mask cache ...
+    with FrameReader(probe_video(str(tmp_path / "o.mp4"))) as r:
+        after = list(r)[30][170:190, 90:110].mean()
+    assert before > 60 and after < 25                                    # ... but the segments were rendered again with the new style
 
 
 # ------------------------------------------------------------------ strength: automatic choice, slider and preview in the settings dialog

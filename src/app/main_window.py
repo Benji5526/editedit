@@ -347,7 +347,13 @@ class MainWindow(QMainWindow):
             self.show_error("Could not work out what can be re-used: " + str(res.get("reason") or "unknown error"))
             return
         n, total = plan["total_chunks"], plan["total_frames"]
-        if plan["can_resume"] and plan["reusable_chunks"]:
+        render_only = plan.get("frames_render_only") or 0
+        if plan["can_resume"] and render_only:
+            full = total - plan["frames_reused"] - render_only
+            text = (f"{plan['reason'].capitalize()}.\n\n{plan['frames_reused']} of {total} frames are reused as they are; "
+                    f"{render_only} frames only get a new mosaic (no tracking, no detection); "
+                    f"{full} frames are re-processed in full.\nStart?")
+        elif plan["can_resume"] and plan["reusable_chunks"]:
             text = (f"{plan['reason'].capitalize()}.\n\n{plan['frames_reused']} of {total} frames are reused; "
                     f"{total - plan['frames_reused']} frames are re-processed (chunks {plan['reusable_chunks'] + 1}-{n}).\nStart?")
         else:
