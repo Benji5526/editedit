@@ -7,12 +7,11 @@ from typing import Optional
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
+from .ko_text import STATUS_TEXT  # noqa: F401  (also imported from here by the main window)
 from .job_runner import overall_fraction
 
-STAGE_TEXT = {"loading_models": "모델 불러오는 중 ...", "processing": "시작하는 중 ...", "finalizing": "청크 병합, 오디오 결합, 결과 검증 중 ...", "analyze": "읽기 + 탐지",
-              "track": "추적 (SAM 2)", "render": "모자이크 적용 + 인코딩"}
-STATUS_TEXT = {"completed_no_flags": "완료 (검수 플래그 없음)", "completed_with_review_required": "완료 (검수 필요)", "cancelled": "취소됨",
-               "failed": "실패", "planned": "계획 완료", "interrupted": "중단됨"}
+STAGE_TEXT = {"loading_models": "모델 불러오는 중 ...", "processing": "시작하는 중 ...", "finalizing": "조각을 하나로 합치고, 소리를 넣고, 결과 영상을 검증하는 중 ...", "analyze": "영상 읽기 + 자동 탐지",
+              "track": "대상 추적 (SAM 2)", "render": "모자이크 입히기 + 영상 저장"}
 
 
 def format_eta(seconds: Optional[float]) -> str:
@@ -45,8 +44,8 @@ class ProcessPanel(QWidget):
         self.log.setMaximumHeight(130)                   # keep the panel compact so the preview above keeps its room
         self.cancel_btn = QPushButton("취소")
         self.resume_btn = QPushButton("이어하기")
-        self.out_btn = QPushButton("결과 열기")
-        self.logs_btn = QPushButton("로그 폴더 열기")
+        self.out_btn = QPushButton("결과 영상 열기")
+        self.logs_btn = QPushButton("기록 폴더 열기")
         self.cancel_btn.clicked.connect(self.cancel_requested)
         self.resume_btn.clicked.connect(self.resume_requested)
         self.out_btn.clicked.connect(self.open_output_requested)
@@ -96,17 +95,17 @@ class ProcessPanel(QWidget):
             return
         if kind == "start":
             self._f0 = f
-            self.detail.setText(f"{ev.get('total_frames')}프레임, {ev.get('chunks')}개 청크"
-                                + (f" - 모자이크 설정 변경: {ev['rerender_chunks']}개 청크는 모자이크만 다시 적용 (추적 재사용)"
+            self.detail.setText(f"{ev.get('total_frames')}프레임, {ev.get('chunks')}개 조각"
+                                + (f" - 모자이크 설정 변경: {ev['rerender_chunks']}개 조각은 모자이크만 다시 적용 (추적 재사용)"
                                    if ev.get("rerender_chunks") else
-                                   f" - 포인트 변경: 청크 1-{ev['reused_chunks']} 재사용, 나머지 다시 처리"
+                                   f" - 클릭 지점 변경: 조각 1-{ev['reused_chunks']} 재사용, 나머지 다시 처리"
                                    if ev.get("points_changed") and ev.get("reused_chunks") else
-                                   f" - 포인트 변경: 전체 다시 처리" if ev.get("points_changed") else
-                                   f" (청크 {ev['resume_from_chunk'] + 1}부터 이어하기)" if ev.get("resume_from_chunk") else ""))
+                                   f" - 클릭 지점 변경: 전체 다시 처리" if ev.get("points_changed") else
+                                   f" (조각 {ev['resume_from_chunk'] + 1}부터 이어하기)" if ev.get("resume_from_chunk") else ""))
         if kind == "progress":
-            self.stage.setText(f"청크 {ev['chunk'] + 1}/{ev['chunks']}: {STAGE_TEXT.get(ev['stage'], ev['stage'])}")
+            self.stage.setText(f"조각 {ev['chunk'] + 1}/{ev['chunks']}: {STAGE_TEXT.get(ev['stage'], ev['stage'])}")
         if kind == "chunk_done":
-            self.detail.setText(f"청크 {ev['chunk'] + 1}/{ev['chunks']} 완료  -  검수 이벤트 {ev.get('events', 0)}건"
+            self.detail.setText(f"조각 {ev['chunk'] + 1}/{ev['chunks']} 완료  -  검수 이벤트 {ev.get('events', 0)}건"
                                 f"  -  메모리 {ev.get('rss_mb', '?')} MB, GPU 최대 {ev.get('cuda_peak_mb', '?')} MB")
         self.bar.setValue(int(f * 1000))
         base = self._f0 or 0.0
@@ -119,10 +118,10 @@ class ProcessPanel(QWidget):
     def on_finished(self, res: dict):
         self.cancel_btn.setEnabled(False)
         status = res.get("status") or "failed"
-        text = {"completed_no_flags": "완료. 검수 플래그가 없습니다 (누락이 없다는 증명은 아니므로 결과를 직접 확인하세요).",
+        text = {"completed_no_flags": "완료. 검수할 항목이 없습니다. 다만 놓친 곳이 없다는 보장은 아니므로 결과 영상을 직접 확인하세요.",
                 "completed_with_review_required": f"완료, 검수 필요: 오류 {res.get('error_events', 0)}건, "
-                                                  f"경고 {res.get('warn_events', 0)}건. 영상을 쓰기 전에 검수 탭을 확인하세요.",
-                "cancelled": "취소됨. 완료된 청크는 보관되며, 이어하기를 누르면 거기서부터 계속합니다.",
+                                                  f"경고 {res.get('warn_events', 0)}건. 결과 영상을 쓰기 전에 '검수' 탭의 항목을 확인하세요.",
+                "cancelled": "취소했습니다. 끝난 조각은 보관되어 있으니 '이어하기'를 누르면 그 뒤부터 계속합니다.",
                 "failed": "실패: " + str(res.get("reason") or "알 수 없는 오류")}.get(status, status)
         if res.get("problems"):
             text += "\n" + "; ".join(res["problems"])

@@ -10,9 +10,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QHBoxLay
 
 from src.review_data import ReviewData
 
+from .ko_text import action_text, event_help, event_text
+
 SEV_COLOR = {"error": "#d64545", "warn": "#e0a030", "info": "#6a8fb8"}
-HEADERS = ["확인", "심각도", "종류", "객체", "프레임", "시간(초)", "건수", "조치"]
-SEV_TEXT = {"error": "오류", "warn": "경고", "info": "정보"}
+HEADERS = ["확인함", "중요도", "무슨 일인지", "대상", "프레임", "시간(초)", "프레임 수", "프로그램이 한 일"]
+SEV_TEXT = {"error": "오류", "warn": "경고", "info": "참고"}
 
 
 class FlagSlider(QSlider):
@@ -50,10 +52,10 @@ class ReviewPanel(QWidget):
         self.banner = QLabel("불러온 검수 로그가 없습니다.")
         self.banner.setWordWrap(True)
         self.sev = QComboBox()
-        for text, val in (("경고 + 오류", "warn"), ("오류만", "error"), ("전체 (정보 포함)", "info")):
+        for text, val in (("경고와 오류", "warn"), ("오류만", "error"), ("전부 (참고 포함)", "info")):
             self.sev.addItem(text, val)
         self.obj = QComboBox()
-        self.obj.addItem("모든 객체", None)
+        self.obj.addItem("모든 대상", None)
         self.hide_done = QCheckBox("확인한 항목 숨기기")
         self.summary = QLabel("")
         self.table = QTableWidget(0, len(HEADERS))
@@ -67,10 +69,10 @@ class ReviewPanel(QWidget):
         self.detail = QLabel("")
         self.detail.setWordWrap(True)
         self.detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.prev_btn = QPushButton("이전 플래그 (B)")
-        self.next_btn = QPushButton("다음 플래그 (M)")
-        self.done_btn = QPushButton("확인 표시 전환 (R)")
-        self.reproc_btn = QPushButton("수정한 포인트로 다시 처리")
+        self.prev_btn = QPushButton("이전 항목 (B)")
+        self.next_btn = QPushButton("다음 항목 (M)")
+        self.done_btn = QPushButton("확인함 표시/해제 (R)")
+        self.reproc_btn = QPushButton("수정한 클릭 지점으로 다시 처리")
         row1 = QHBoxLayout()
         for w in (self.sev, self.obj, self.hide_done):
             row1.addWidget(w)
@@ -103,10 +105,10 @@ class ReviewPanel(QWidget):
         self.data = data
         self._loading = True
         self.obj.clear()
-        self.obj.addItem("모든 객체", None)
+        self.obj.addItem("모든 대상", None)
         if data is not None:
             for oid in data.object_ids():
-                self.obj.addItem(f"객체 {oid}", oid)
+                self.obj.addItem(f"대상 {oid}", oid)
         self._loading = False
         self.set_banner(stale)
         self.refresh()
@@ -120,8 +122,8 @@ class ReviewPanel(QWidget):
             self.banner.setStyleSheet("color: #ff6b6b; font-weight: bold")
         else:
             m = self.data.meta
-            self.banner.setText(f"실행 {m.get('run_id', '?')} ({m.get('created', '')})의 로그입니다. 현재 포인트 및 결과 영상과 일치합니다."
-                                + (f" 청크 1-{m['reused_chunks']}은(는) 이전 실행 결과를 재사용했습니다." if m.get("reused_chunks") else ""))
+            self.banner.setText(f"실행 {m.get('run_id', '?')} ({m.get('created', '')})의 로그입니다. 현재 클릭 지점 및 결과 영상과 일치합니다."
+                                + (f" 조각 1-{m['reused_chunks']}은(는) 이전 실행 결과를 재사용했습니다." if m.get("reused_chunks") else ""))
             self.banner.setStyleSheet("color: #5cc46a")
 
     def refresh(self, *_):
@@ -140,8 +142,9 @@ class ReviewPanel(QWidget):
                 done.setCheckState(Qt.CheckState.Checked if self.data.state.is_reviewed(s) else Qt.CheckState.Unchecked)
                 fr = f"{s['start_frame']}" if s["end_frame"] == s["start_frame"] else f"{s['start_frame']}-{s['end_frame']}"
                 ts = s.get("start_timestamp")
-                vals = [None, SEV_TEXT.get(s["severity"], s["severity"]), s["type"], "" if s.get("object_id") is None else str(s["object_id"]), fr,
-                        "" if ts is None else f"{ts:.2f}", str(s["event_count"]), ", ".join(s.get("actions", []))]
+                vals = [None, SEV_TEXT.get(s["severity"], s["severity"]), event_text(s["type"]),
+                        "" if s.get("object_id") is None else str(s["object_id"]), fr,
+                        "" if ts is None else f"{ts:.2f}", str(s["event_count"]), ", ".join(action_text(a) for a in s.get("actions", []))]
                 self.table.setItem(r, 0, done)
                 for c in range(1, len(HEADERS)):
                     it = QTableWidgetItem(vals[c])
@@ -151,7 +154,7 @@ class ReviewPanel(QWidget):
                     self.table.setItem(r, c, it)
             self.table.resizeColumnsToContents()
             left = self.data.unreviewed_count(self.sev.currentData())
-            self.summary.setText(f"플래그 {len(rows)}건 표시, 미확인 {left}건 (플래그는 추정이며, '확인'은 사람이 봤다는 뜻입니다)")
+            self.summary.setText(f"검수 항목 {len(rows)}건 표시, 미확인 {left}건 (검수 항목은 프로그램의 추정이고, '확인함'은 사람이 직접 봤다는 표시입니다)")
         else:
             self.summary.setText("")
         self._loading = False
@@ -180,7 +183,9 @@ class ReviewPanel(QWidget):
             self.segment_selected.emit(s)
 
     def _show_detail(self, s: dict):
-        self.detail.setText(f"{s['type']} (객체 {s.get('object_id')}): {s.get('first_detail', '')}")
+        who = "" if s.get("object_id") is None else f" (대상 {s.get('object_id')})"
+        raw = s.get("first_detail", "")
+        self.detail.setText(f"{event_text(s['type'])}{who}: {event_help(s['type'])}" + (f"\n기록 원문 [{s['type']}]: {raw}" if raw else ""))
 
     def _cell_changed(self, row: int, col: int):
         if self._loading or col != 0 or self.data is None or not (0 <= row < len(self._rows)):

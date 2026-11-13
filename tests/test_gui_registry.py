@@ -44,9 +44,9 @@ def test_cancelled_job_is_offered_for_resume_and_listed(win, tmp_path):
 
     jobs = JobDB(db_path_for(st.log_dir)).jobs_for_input(win.info.fingerprint)
     rows = job_rows(jobs)
-    assert rows[0][1] == "cancelled" and rows[0][2] == f"{j['chunks_done']}/16"
+    assert rows[0][1] == "취소됨" and rows[0][2] == f"{j['chunks_done']}/16"
     dlg = JobsDialog(win, jobs, "clip.mp4")
-    assert dlg.table.rowCount() == 1 and dlg.table.item(0, 1).text() == "cancelled"
+    assert dlg.table.rowCount() == 1 and dlg.table.item(0, 1).text() == "취소됨"
 
     # 'Resume interrupted job' = plan first, then run with the reusable chunks
     texts = []
@@ -58,7 +58,7 @@ def test_cancelled_job_is_offered_for_resume_and_listed(win, tmp_path):
     assert win.last_result["status"] == "completed_no_flags"
     assert win.resumable_job is None and not win.act_resume_job.isEnabled()
     statuses = [r[1] for r in job_rows(JobDB(db_path_for(st.log_dir)).jobs_for_input(win.info.fingerprint))]
-    assert statuses == ["completed_no_flags", "cancelled"]
+    assert statuses == ["완료 (검수할 항목 없음)", "취소됨"]
     assert job_rows(JobDB(db_path_for(st.log_dir)).jobs_for_input(win.info.fingerprint))[0][3] != "0"     # chunks were reused
 
 

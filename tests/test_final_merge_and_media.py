@@ -108,7 +108,7 @@ def test_progress_panel_shows_warnings_and_the_finalizing_stage():
     p.on_progress({"event": "warning", "text": "the work folder is on a hard disk drive (HDD)"})
     assert "경고: the work folder is on a hard disk drive" in p.log.toPlainText()
     p.on_progress({"event": "stage", "stage": "finalizing"})
-    assert "청크 병합" in p.stage.text()
+    assert "조각을 하나로 합치고" in p.stage.text()
     del app
 
 

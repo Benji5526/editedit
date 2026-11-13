@@ -94,7 +94,21 @@ QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 """
 
 
+def install_korean(app: QApplication) -> bool:
+    """Qt's own Korean texts for the standard buttons and dialogs (OK / Cancel / Yes / No / Save ..., file dialogs). They ship
+    with PySide6; when the file is missing the buttons simply stay English."""
+    from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
+    QLocale.setDefault(QLocale(QLocale.Language.Korean, QLocale.Country.SouthKorea))
+    tr = QTranslator(app)
+    ok = tr.load("qtbase_ko", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath))
+    if ok:
+        app.installTranslator(tr)
+        app._ko_translator = tr                 # keep it alive
+    return ok
+
+
 def apply_theme(app: QApplication) -> None:
+    install_korean(app)
     app.setStyle("Fusion")
     pal = QPalette()
     for role, colour in ((QPalette.ColorRole.Window, BG), (QPalette.ColorRole.Base, "#1a1c20"), (QPalette.ColorRole.AlternateBase, PANEL),

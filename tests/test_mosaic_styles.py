@@ -156,14 +156,14 @@ def test_dialog_auto_strength_slider_and_preview(video, monkeypatch, tmp_path):
     info = probe_video(video)
     dlg = process_dialog.ProcessDialog(None, video, False, info.nb_frames, info=info)
     assert dlg.block_auto.isChecked() and dlg.block.value() == process_dialog.recommended_block(info.width, info.height)
-    assert not dlg.block.isEnabled() and not dlg.preview.pixmap().isNull()
-    dlg.block_auto.setChecked(False)
+    assert dlg.block.isEnabled() and not dlg.preview.pixmap().isNull()      # changing the size by hand switches "automatic" off
     dlg.block_slider.setValue(80)                                    # the slider drives the spin box and the settings
+    assert not dlg.block_auto.isChecked()
     assert dlg.block.value() == 80 and dlg.settings().block == 80 and dlg.settings().block_auto is False
     first = dlg.preview.pixmap().toImage()
     dlg.block.setValue(8)
     assert dlg.preview.pixmap().toImage() != first                   # the preview follows the strength
-    dlg.style.setCurrentText("solid")
+    dlg.style.setCurrentIndex(dlg.style.findData("solid"))
     assert not dlg.preview.pixmap().isNull()
     dlg.block_auto.setChecked(True)
     assert dlg.settings().block == process_dialog.recommended_block(info.width, info.height)

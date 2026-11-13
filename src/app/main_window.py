@@ -36,6 +36,7 @@ from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args, jo
 from .jobs_dialog import JobsDialog
 from .mask_preview import MaskPreview, preview_args
 from .process_dialog import ProcessDialog, find_default_checkpoint, load_last_settings, validate_settings
+from .ko_text import style_text
 from .process_panel import STATUS_TEXT, ProcessPanel
 from .review_panel import FlagSlider, ReviewPanel
 from .timeline import RunSummaryLoader, ThumbnailLoader, TimelineView
@@ -184,7 +185,7 @@ class MainWindow(QMainWindow):
         self.preview.request_failed.connect(self._on_preview_failed)
         self.preview.state_changed.connect(self._on_preview_state)
         self.preview.track_ready.connect(self._on_track_ready)
-        self.statusBar().showMessage("영상을 열어 시작하세요 (Ctrl+O). 왼쪽 클릭 = 이것이 대상, 오른쪽 클릭 = 이것은 대상이 아님.")
+        self.statusBar().showMessage("영상을 열어 시작하세요 (Ctrl+O). 가릴 대상은 왼쪽 클릭, 가리면 안 되는 곳은 오른쪽 클릭으로 알려 줍니다.")
 
     # ------------------------------------------------------------------ UI construction
     def _act(self, text, shortcut, fn):
@@ -198,13 +199,13 @@ class MainWindow(QMainWindow):
         act = self._act
         m = self.menuBar().addMenu("파일(&F)")
         self.act_open_video = act("영상 열기...", "Ctrl+O", self.open_video_dialog)
-        self.act_open_points = act("포인트 열기...", "Ctrl+L", self.open_points_dialog)
+        self.act_open_points = act("클릭 지점 열기...", "Ctrl+L", self.open_points_dialog)
         m.addAction(self.act_open_video)
         m.addAction(self.act_open_points)
         self.act_open_review = act("검수 로그 열기...", "Ctrl+Shift+O", self.open_review_dialog)
         m.addAction(self.act_open_review)
-        m.addAction(act("포인트 저장", "Ctrl+S", self.save_points))
-        m.addAction(act("포인트 다른 이름으로 저장...", "Ctrl+Shift+S", self.save_points_as))
+        m.addAction(act("클릭 지점 저장", "Ctrl+S", self.save_points))
+        m.addAction(act("클릭 지점 다른 이름으로 저장...", "Ctrl+Shift+S", self.save_points_as))
         m.addSeparator()
         m.addAction(act("종료", "Ctrl+Q", self.close))
         pm = self.menuBar().addMenu("처리(&P)")
@@ -213,8 +214,8 @@ class MainWindow(QMainWindow):
         self.act_cancel.setEnabled(False)
         pm.addAction(self.act_start)
         pm.addAction(self.act_cancel)
-        self.act_reprocess = act("수정한 포인트로 다시 처리...", "Ctrl+Shift+R", self.reprocess)
-        self.act_cleanup = act("중간 청크 삭제...", None, self.delete_intermediate)
+        self.act_reprocess = act("수정한 클릭 지점으로 다시 처리...", "Ctrl+Shift+R", self.reprocess)
+        self.act_cleanup = act("중간 조각 삭제...", None, self.delete_intermediate)
         self.act_resume_job = act("중단된 작업 이어하기...", None, self.reprocess)
         self.act_resume_job.setEnabled(False)
         self.act_history = act("작업 기록...", None, self.show_job_history)
@@ -231,22 +232,22 @@ class MainWindow(QMainWindow):
         self.act_last = QAction("지난 실행의 마스크 보기", self)
         self.act_last.setCheckable(True)
         self.act_last.setShortcut(QKeySequence("K"))
-        self.act_last.setToolTip("지난 실행이 프레임마다 남긴 추적 마스크, 탐지 박스, 안전 모드 영역을 보여 줍니다.")
+        self.act_last.setToolTip("지난 실행이 프레임마다 남긴 추적 마스크, 탐지 상자, 안전 모드 영역을 보여 줍니다.")
         self.act_last.toggled.connect(self.toggle_last_masks)
         vm.addAction(self.act_live)
         vm.addAction(self.act_last)
         self.act_brush = QAction("브러시로 마스크 수정", self)
         self.act_brush.setCheckable(True)
         self.act_brush.setShortcut(QKeySequence("G"))
-        self.act_brush.setToolTip("선택한 객체의 마스크를 이 프레임에서 직접 칠해 고칩니다. 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기.")
+        self.act_brush.setToolTip("선택한 대상의 마스크를 이 프레임에서 직접 칠해 고칩니다. 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기.")
         self.act_brush.toggled.connect(self.toggle_brush)
         self.act_undo_stroke = self._act("마지막 붓질 되돌리기", "Ctrl+Z", self.undo_stroke)
         self.act_clear_mask = self._act("이 프레임에서 그린 마스크 지우기", None, self.clear_drawn_mask)
         self.act_compare = self._act("수정 전후 비교 (이 프레임부터 시험 추적)", "C", self.start_compare)
-        self.act_compare.setToolTip("선택한 객체를 이 프레임부터 짧게 추적해 보고, 수정 전과 나란히 비교합니다. 영상은 바뀌지 않습니다.")
+        self.act_compare.setToolTip("선택한 대상을 이 프레임부터 짧게 추적해 보고, 수정 전과 나란히 비교합니다. 영상은 바뀌지 않습니다.")
         e = self.menuBar().addMenu("편집(&E)")
         e.addAction(act("이 프레임의 마지막 점 되돌리기", "U", self.undo_point))
-        e.addAction(act("이 프레임에서 이 객체의 점 지우기", "X", self.clear_frame_points))
+        e.addAction(act("이 프레임에서 이 대상의 점 지우기", "X", self.clear_frame_points))
         e.addSeparator()
         e.addAction(self.act_brush)
         e.addAction(self.act_undo_stroke)
@@ -272,7 +273,7 @@ class MainWindow(QMainWindow):
         tb.setFloatable(False)
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.toolbar = tb
-        self.act_save = self._act("포인트 저장", None, self.save_points)
+        self.act_save = self._act("클릭 지점 저장", None, self.save_points)
         for a in (self.act_open_video, self.act_open_points, self.act_save):
             tb.addAction(a)
         tb.addSeparator()
@@ -301,17 +302,17 @@ class MainWindow(QMainWindow):
         dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
         w = QWidget()
         v = QVBoxLayout(w)
-        v.addWidget(QLabel("객체 (지금 표시할 객체를 선택):"))
+        v.addWidget(QLabel("대상 (지금 표시할 대상을 선택):"))
         self.obj_list = QListWidget()
         self.obj_list.currentRowChanged.connect(self._object_selected)
         v.addWidget(self.obj_list, 1)
-        for text, fn in (("새 객체", self.new_object), ("객체 삭제", self.delete_object),
+        for text, fn in (("새 대상", self.new_object), ("대상 삭제", self.delete_object),
                          ("마지막 점 되돌리기 (U)", self.undo_point), ("이 프레임의 점 지우기 (X)", self.clear_frame_points)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             v.addWidget(b)
-        self.hint = QLabel("객체 추적은 가장 이른 클릭에서 시작합니다. 객체가 처음 보이는 프레임에서 클릭하세요.\n"
-                           "왼쪽 클릭 = 대상, 오른쪽 클릭 = 대상 아님.")
+        self.hint = QLabel("추적은 그 대상을 가장 먼저 클릭한 프레임부터 시작합니다. 대상이 처음 나타나는 프레임에서 클릭하세요.\n"
+                           "왼쪽 클릭 = 가릴 대상, 오른쪽 클릭 = 가리면 안 되는 곳.")
         self.hint.setObjectName("hint")
         self.hint.setWordWrap(True)
         v.addWidget(self.hint)
@@ -330,34 +331,38 @@ class MainWindow(QMainWindow):
         self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         pv.addWidget(self.info_label)
         # per-object mosaic settings ("작업 설정" = whatever is chosen in the processing dialog)
-        self.style_box = QGroupBox("선택한 객체의 모자이크")
+        self.style_box = QGroupBox("선택한 대상의 모자이크")
         form = QFormLayout(self.style_box)
         self.obj_style = QComboBox()
-        self.obj_style.addItem("작업 설정", None)
+        self.obj_style.addItem("처리 설정과 같게", None)
         for name in OBJECT_STYLES:
-            self.obj_style.addItem(name, name)
-        self.obj_style.setToolTip("pixelate(픽셀)와 solid(단색)는 내용을 완전히 없앱니다. blur(흐림)가 가장 약합니다.")
-        form.addRow("형태", self.obj_style)
+            self.obj_style.addItem(style_text(name), name)
+        self.obj_style.setToolTip("이 대상만 다른 방식으로 가립니다. 픽셀 모자이크와 단색 덮기는 내용을 알아볼 수 없게 없애고, 흐림이 가장 약합니다.")
+        form.addRow("가리는 방식", self.obj_style)
         self.obj_block = QSpinBox()
         self.obj_block.setRange(0, 256)
-        self.obj_block.setSpecialValueText("작업 설정")
-        self.obj_block.setToolTip("블록 크기(픽셀) 또는 흐림 강도, 원본 해상도 픽셀 기준 2-256. 0 = 작업 설정의 강도.")
-        form.addRow("강도 (px)", self.obj_block)
+        self.obj_block.setSpecialValueText("처리 설정과 같게")
+        self.obj_block.setSuffix(" px")
+        self.obj_block.setToolTip("이 대상에만 쓸 모자이크 셀 크기입니다. 네모 한 칸의 한 변 길이이며(원본 영상의 픽셀 기준, 2~256), "
+                                  "클수록 더 거칠게 가려집니다. 흐림에서는 흐림의 세기입니다. 0으로 두면 '처리 시작' 창에서 정한 셀 크기를 씁니다.")
+        form.addRow("모자이크 셀 크기", self.obj_block)
         self.obj_pad = QSpinBox()
         self.obj_pad.setRange(-1, 500)
-        self.obj_pad.setSpecialValueText("작업 설정")
-        self.obj_pad.setToolTip("모자이크가 이 객체의 마스크 바깥으로 얼마나 넓게 덮는지, 원본 해상도 픽셀 기준. -1 = 작업 설정의 여백.")
-        form.addRow("여백 (px)", self.obj_pad)
+        self.obj_pad.setSpecialValueText("처리 설정과 같게")
+        self.obj_pad.setSuffix(" px")
+        self.obj_pad.setToolTip("이 대상의 영역보다 바깥으로 얼마나 더 넓게 가릴지 정합니다 (원본 영상의 픽셀 기준). "
+                                "-1로 두면 '처리 시작' 창에서 정한 여백을 씁니다.")
+        form.addRow("가리는 영역 여백", self.obj_pad)
         self.obj_style.currentIndexChanged.connect(self._style_edited)
         self.obj_block.valueChanged.connect(self._style_edited)
         self.obj_pad.valueChanged.connect(self._style_edited)
         pv.addWidget(self.style_box)
-        note = QLabel("탐지(NudeNet) 영역과 안전 모드 영역은 항상 작업 설정을 따릅니다. 영역이 겹치면 더 강한 쪽이 적용됩니다.")
+        note = QLabel("자동 탐지로 찾은 영역과 안전 모드로 가리는 영역은 항상 '처리 시작' 창의 설정을 따릅니다. 영역이 겹치면 더 강하게 가리는 쪽이 적용됩니다.")
         note.setObjectName("hint")
         note.setWordWrap(True)
         pv.addWidget(note)
         # brush: paint the mask of the selected object on the current frame
-        self.brush_box = QGroupBox("브러시 (선택한 객체, 현재 프레임)")
+        self.brush_box = QGroupBox("브러시 (선택한 대상, 현재 프레임)")
         bform = QFormLayout(self.brush_box)
         self.brush_size = QSpinBox()
         self.brush_size.setRange(2, 300)
@@ -471,9 +476,9 @@ class MainWindow(QMainWindow):
         self.review_panel.set_data(data, self._stale_reasons())
         self._update_flag_ticks()
         self.review_dock.raise_()
-        msg = f"검수 로그를 불러왔습니다: 플래그 {len(data.filtered('warn'))}건 (경고 이상), 미확인 {data.unreviewed_count()}건"
+        msg = f"검수 로그를 불러왔습니다: 검수 항목 {len(data.filtered('warn'))}건 (경고 이상), 미확인 {data.unreviewed_count()}건"
         if data.dropped_marks:
-            msg += f"; 해당 청크가 다시 처리되어 '확인' 표시 {data.dropped_marks}건이 초기화되었습니다"
+            msg += f"; 해당 조각이 다시 처리되어 '확인' 표시 {data.dropped_marks}건이 초기화되었습니다"
         self.statusBar().showMessage(msg)
         return True
 
@@ -483,7 +488,7 @@ class MainWindow(QMainWindow):
         pp = self.points_path if self.points_path and os.path.isfile(self.points_path) else None
         reasons = self.review.staleness(pp, bool(self.store.points or self.store.masks))
         if self.dirty:
-            reasons.append("저장하지 않은 포인트 수정이 있습니다")
+            reasons.append("저장하지 않은 클릭 지점 수정이 있습니다")
         return reasons
 
     def _refresh_stale_banner(self):
@@ -517,7 +522,7 @@ class MainWindow(QMainWindow):
         nav = self.review.navigator(self.review_panel.sev.currentData() or "warn")
         tgt = nav.next_after(self.frame_idx) if forward else nav.prev_before(self.frame_idx)
         if tgt is None:
-            self.statusBar().showMessage("그 방향에는 더 이상 플래그가 없습니다.")
+            self.statusBar().showMessage("그 방향에는 더 이상 검수 항목이 없습니다.")
             return
         self._goto_flag(tgt, nav.object_at(tgt))
         self.review_panel.select_row_for(tgt)
@@ -573,11 +578,11 @@ class MainWindow(QMainWindow):
                     f"{full}프레임은 처음부터 다시 처리합니다.\n시작할까요?")
         elif plan["can_resume"] and plan["reusable_chunks"]:
             text = (f"전체 {total}프레임 중 {plan['frames_reused']}프레임은 재사용하고, "
-                    f"{total - plan['frames_reused']}프레임은 다시 처리합니다 (청크 {plan['reusable_chunks'] + 1}-{n}).\n시작할까요?"
+                    f"{total - plan['frames_reused']}프레임은 다시 처리합니다 (조각 {plan['reusable_chunks'] + 1}-{n}).\n시작할까요?"
                     if plan["reusable_chunks"] < n else "바뀐 것이 없습니다. 최종 영상만 다시 만듭니다.\n시작할까요?")
         else:
-            why = ("보관된 중간 청크가 없습니다" if not plan["job_found"] else
-                   "설정이나 영상이 이전 실행과 달라 이전 결과를 쓸 수 없습니다" if not plan["can_resume"] else "재사용할 수 있는 청크가 없습니다")
+            why = ("보관된 중간 조각이 없습니다" if not plan["job_found"] else
+                   "설정이나 영상이 이전 실행과 달라 이전 결과를 쓸 수 없습니다" if not plan["can_resume"] else "재사용할 수 있는 조각이 없습니다")
             text = f"{why}.\n\n전체 {total}프레임을 처리합니다. 시작할까요?"
         if self.ask_confirm(text):
             self.start_processing(dataclasses.replace(self._plan_settings, resume=bool(plan["can_resume"])))
@@ -604,7 +609,7 @@ class MainWindow(QMainWindow):
         if j is not None:
             total = j.get("n_chunks") or "?"
             done = j["chunks_done"] + (0 if j["chunks_done"] else (j.get("reused_chunks") or 0))
-            self.statusBar().showMessage(self.statusBar().currentMessage() + f"  |  중단된 작업이 있습니다 ({j['status']}, 청크 {done}/{total} 완료, "
+            self.statusBar().showMessage(self.statusBar().currentMessage() + f"  |  중단된 작업이 있습니다 ({STATUS_TEXT.get(j['status'], j['status'])}, 조각 {done}/{total} 완료, "
                                          f"{j.get('created')}): 처리 > 중단된 작업 이어하기")
         return j
 
@@ -624,17 +629,17 @@ class MainWindow(QMainWindow):
         work = self.last_settings.work_dir if self.last_settings else ""
         jd = job_dir_for_video(work, self.info.path, self.info.fingerprint)
         if not os.path.isdir(jd):
-            self.statusBar().showMessage("이 영상의 중간 청크가 없습니다.")
+            self.statusBar().showMessage("이 영상의 중간 조각이 없습니다.")
             return
         size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(jd) for f in fs) / 2 ** 20
-        if self.ask_confirm(f"중간 청크 {size:.0f} MB를 삭제할까요?\n결과 영상과 로그는 남지만, 다시 처리할 때는 처음부터 시작합니다."):
+        if self.ask_confirm(f"중간 조각 {size:.0f} MB를 삭제할까요?\n결과 영상과 로그는 남지만, 다시 처리할 때는 처음부터 시작합니다."):
             import shutil
             self._release_job_folder()                     # an open cache file would keep the folder alive on Windows
             shutil.rmtree(jd, ignore_errors=True)
             if os.path.isdir(jd):
-                self.statusBar().showMessage("중간 청크를 모두 지우지 못했습니다. 다른 프로그램이 파일을 쓰고 있는지 확인하세요.")
+                self.statusBar().showMessage("중간 조각을 모두 지우지 못했습니다. 다른 프로그램이 파일을 쓰고 있는지 확인하세요.")
             else:
-                self.statusBar().showMessage(f"중간 청크 {size:.0f} MB를 삭제했습니다.")
+                self.statusBar().showMessage(f"중간 조각 {size:.0f} MB를 삭제했습니다.")
 
     # ------------------------------------------------------------------ processing jobs
     def open_path(self, path: Optional[str]):
@@ -694,7 +699,7 @@ class MainWindow(QMainWindow):
         if self.info is None or self.job_running:
             return False
         if self.dirty:
-            self.show_error("먼저 포인트를 저장하세요 (Ctrl+S). 처리는 저장된 파일을 읽습니다.")
+            self.show_error("먼저 클릭 지점을 저장하세요 (Ctrl+S). 처리는 저장된 파일을 읽습니다.")
             return False
         points = self._points_for_job()
         probs = validate_settings(settings, self.info.path, points is not None)
@@ -710,7 +715,7 @@ class MainWindow(QMainWindow):
         self.process_dock.show()
         self._set_job_running(True)
         self._stop_play()
-        self.statusBar().showMessage("처리 중 ... (처리 > 처리 취소로 중단, 완료된 청크는 보관됩니다)")
+        self.statusBar().showMessage("처리 중 ... (처리 > 처리 취소로 중단, 완료된 조각은 보관됩니다)")
         if not self.runner.start(build_args(self.info.path, points, settings, cancel_file), cancel_file):
             self._set_job_running(False)
             return False
@@ -839,7 +844,7 @@ class MainWindow(QMainWindow):
             elif self.job_running:
                 problem = "작업이 실행 중입니다. 작업이 끝나면 마스크 미리보기를 다시 쓸 수 있습니다."
             elif self.preview_command is None and not os.path.isfile(ckpt):
-                problem = "SAM 2 체크포인트를 찾을 수 없습니다. models/ 폴더에 받거나(models/README.md 참고) 처리 > 처리 시작에서 선택하세요."
+                problem = "SAM 2 모델 파일을 찾을 수 없습니다. models/ 폴더에 받거나(models/README.md 참고) 처리 > 처리 시작에서 선택하세요."
             if problem:
                 self._set_checked(self.act_live, False)
                 self.show_error(problem)
@@ -860,7 +865,7 @@ class MainWindow(QMainWindow):
                 self._job_masks = jm
             except (OSError, ValueError, KeyError):
                 self._set_checked(self.act_last, False)
-                self.statusBar().showMessage("이 영상으로 보관된 마스크가 없습니다. 먼저 \"중간 청크 보관\"을 켜고 처리하세요.")
+                self.statusBar().showMessage("이 영상으로 보관된 마스크가 없습니다. 먼저 \"중간 조각 보관\"을 켜고 처리하세요.")
         self._update_overlay()
 
     def _points_sha(self) -> Optional[str]:
@@ -951,7 +956,7 @@ class MainWindow(QMainWindow):
         oid, frame, prev = self._brush_undo.pop()
         self.store.set_mask(oid, frame, prev)
         self._points_changed()
-        self.statusBar().showMessage(f"객체 {oid}, 프레임 {frame}의 붓질을 되돌렸습니다.")
+        self.statusBar().showMessage(f"대상 {oid}, 프레임 {frame}의 붓질을 되돌렸습니다.")
 
     def clear_drawn_mask(self):
         key = (self.store.current, self.frame_idx)
@@ -960,7 +965,7 @@ class MainWindow(QMainWindow):
         self._brush_undo.append((key[0], key[1], self.store.get_mask(*key).copy()))
         self.store.set_mask(key[0], key[1], None)
         self._points_changed()
-        self.statusBar().showMessage(f"객체 {key[0]}, 프레임 {key[1]}의 그린 마스크를 지웠습니다. 이 프레임은 다시 클릭으로 추적합니다.")
+        self.statusBar().showMessage(f"대상 {key[0]}, 프레임 {key[1]}의 그린 마스크를 지웠습니다. 이 프레임은 다시 클릭으로 추적합니다.")
 
     def _write_corrections(self):
         """After a successful save: one record per mask that was painted since the last save (what it was before, what it is now)."""
@@ -1013,7 +1018,7 @@ class MainWindow(QMainWindow):
         n = min(int(self.compare_frames.value()), self.info.nb_frames - start)
         after_prompts = self._compare_prompts(oid, start, n, corrected=True)
         if 0 not in after_prompts:
-            self.show_error("이 프레임에는 이 객체의 클릭이나 그린 마스크가 없습니다.\n고친 프레임(또는 클릭한 프레임)으로 이동한 뒤 비교를 시작하세요.")
+            self.show_error("이 프레임에는 이 대상의 클릭이나 그린 마스크가 없습니다.\n고친 프레임(또는 클릭한 프레임)으로 이동한 뒤 비교를 시작하세요.")
             return False
         if not self.preview.is_on():
             self.act_live.setChecked(True)             # the trial tracking runs in the mask-preview process
@@ -1041,7 +1046,7 @@ class MainWindow(QMainWindow):
                 cmp["before_source"] = "trial"
         cmp["pending"][self.preview.request_track(oid, start, n, after_prompts)] = "after"
         self._compare = cmp
-        self.statusBar().showMessage(f"비교: 객체 {oid}를 프레임 {start}부터 {n}프레임 시험 추적하는 중 ...")
+        self.statusBar().showMessage(f"비교: 대상 {oid}를 프레임 {start}부터 {n}프레임 시험 추적하는 중 ...")
         self._refresh_compare_panel()
         self._update_overlay()
         return True
@@ -1081,12 +1086,12 @@ class MainWindow(QMainWindow):
         if cmp is None:
             self.compare_info.setText("고친 프레임에서 비교를 시작하면, 그 뒤 프레임들이 어떻게 달라지는지 미리 볼 수 있습니다.")
         elif not ready:
-            self.compare_info.setText(f"객체 {cmp['oid']}, 프레임 {cmp['start']}부터 {cmp['n']}프레임 시험 추적 중 ...")
+            self.compare_info.setText(f"대상 {cmp['oid']}, 프레임 {cmp['start']}부터 {cmp['n']}프레임 시험 추적 중 ...")
         else:
             st = cmp["stats"]
             src = {"last_run": "지난 실행의 마스크", "trial": "고치기 전 상태로 시험 추적한 결과", "none": "없음 (비교 대상 없이 수정 후만 표시)"}[cmp["before_source"]]
             lost = sum(1 for x in st if x["after_px"] == 0)
-            text = (f"객체 {cmp['oid']}, 프레임 {cmp['start']}-{cmp['start'] + cmp['n'] - 1} ({cmp['n']}프레임).\n수정 전 기준: {src}.\n"
+            text = (f"대상 {cmp['oid']}, 프레임 {cmp['start']}-{cmp['start'] + cmp['n'] - 1} ({cmp['n']}프레임).\n수정 전 기준: {src}.\n"
                     f"평균 면적: 수정 후 {sum(x['after_px'] for x in st) // max(1, len(st))} px")
             if cmp["before"] is not None:
                 changed = sum(1 for x in st if x["iou"] < 0.9)
@@ -1117,7 +1122,7 @@ class MainWindow(QMainWindow):
         if self._compare is not None:
             self._end_compare()
             self._update_overlay()
-            self.statusBar().showMessage("수정을 유지합니다. 포인트를 저장하고 다시 처리하면 영상에 반영됩니다.")
+            self.statusBar().showMessage("수정을 유지합니다. 클릭 지점을 저장하고 다시 처리하면 영상에 반영됩니다.")
 
     def revert_correction(self):
         cmp = self._compare
@@ -1133,7 +1138,7 @@ class MainWindow(QMainWindow):
             self._brush_undo.append((key[0], key[1], self.store.get_mask(*key).copy()))
             self.store.set_mask(key[0], key[1], base[0] if base is not None and base[1] == "drawn" else None)
             self._brush_base.pop(key, None)             # back to where it started: no correction record for it
-            self.statusBar().showMessage(f"객체 {key[0]}, 프레임 {key[1]}의 수정을 취소했습니다.")
+            self.statusBar().showMessage(f"대상 {key[0]}, 프레임 {key[1]}의 수정을 취소했습니다.")
         self._end_compare()
         self._points_changed()
 
@@ -1177,7 +1182,7 @@ class MainWindow(QMainWindow):
         self._update_overlay_base()
         if self.info is not None and self.frame_idx >= 0 and self.act_brush.isChecked():
             ov = dict(self.view.overlay() or {})
-            hint = f"[브러시: 객체 {self.store.current}] 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기."
+            hint = f"[브러시: 대상 {self.store.current}] 왼쪽 드래그 = 칠하기, 오른쪽 드래그 = 지우기."
             ov["note"] = hint + ("  " + ov["note"] if ov.get("note") else "")
             self.view.set_overlay(ov)
 
@@ -1200,7 +1205,7 @@ class MainWindow(QMainWindow):
             if hit is not None and hit[0] == sig:
                 note = "이 프레임의 클릭 미리보기 (여백 적용 전 마스크)."
                 if hit[2]:
-                    note += "  표시 안 됨: " + "; ".join(f"객체 {o} - {r}" for o, r in sorted(hit[2].items()))
+                    note += "  표시 안 됨: " + "; ".join(f"대상 {o} - {r}" for o, r in sorted(hit[2].items()))
                 shape = next(iter(hit[1].values())).shape if hit[1] else (self.info.height, self.info.width)
                 self.view.set_overlay(self._make_overlay(shape, hit[1], note=note))
                 return
@@ -1218,11 +1223,11 @@ class MainWindow(QMainWindow):
         if self._job_masks is not None:
             fr = self._job_masks.frame(f)
             stale = self.dirty or (self._job_masks.points_sha is not None and self._job_masks.points_sha != self._points_sha())
-            tail = "  그 실행 이후 포인트가 바뀌었습니다." if stale else ""
+            tail = "  그 실행 이후 클릭 지점이 바뀌었습니다." if stale else ""
             if fr is None:
                 self.view.set_overlay({"note": "지난 실행에 이 프레임의 마스크가 없습니다." + tail})
             else:
-                note = f"지난 실행 ({self._job_masks.created}): 여백 적용 전 마스크, 탐지 박스, 안전 모드 영역(빨강)." + tail
+                note = f"지난 실행 ({self._job_masks.created}): 여백 적용 전 마스크, 탐지 상자, 안전 모드 영역(빨강)." + tail
                 self.view.set_overlay(self._make_overlay(fr["shape"], fr["masks"], fr["boxes"], fr["fc_regions"], fr["fc_full"], note))
             return
         if self.preview.is_on():
@@ -1272,7 +1277,7 @@ class MainWindow(QMainWindow):
     def ask_save_changes(self) -> str:
         """'save' | 'discard' | 'cancel'"""
         B = QMessageBox.StandardButton
-        r = QMessageBox.question(self, "저장하지 않은 포인트", "포인트에 저장하지 않은 변경이 있습니다.", B.Save | B.Discard | B.Cancel)
+        r = QMessageBox.question(self, "저장하지 않은 클릭 지점", "클릭 지점에 저장하지 않은 변경이 있습니다.", B.Save | B.Discard | B.Cancel)
         return {B.Save: "save", B.Discard: "discard"}.get(r, "cancel")
 
     def ask_confirm(self, text: str) -> bool:
@@ -1463,7 +1468,7 @@ class MainWindow(QMainWindow):
         if self.info is None:
             return
         if self.job_running:
-            self.statusBar().showMessage("작업이 실행 중입니다. 끝나거나 취소될 때까지 포인트를 바꿀 수 없습니다.")
+            self.statusBar().showMessage("작업이 실행 중입니다. 끝나거나 취소될 때까지 클릭 지점을 바꿀 수 없습니다.")
             return
         self._stop_play()
         self.store.add(self.frame_idx, fx, fy, label)
@@ -1483,11 +1488,11 @@ class MainWindow(QMainWindow):
     def new_object(self):
         oid = self.store.new_object()
         self._refresh_objects()
-        self.statusBar().showMessage(f"새 객체 {oid}: 영상에서 대상을 왼쪽 클릭하세요")
+        self.statusBar().showMessage(f"새 대상 {oid}: 영상에서 대상을 왼쪽 클릭하세요")
 
     def delete_object(self):
         n = sum(1 for p in self.store.points if p["obj_id"] == self.store.current)
-        if n and not self.ask_confirm(f"객체 {self.store.current}와(과) 그 점 {n}개를 삭제할까요?"):
+        if n and not self.ask_confirm(f"대상 {self.store.current}와(과) 그 점 {n}개를 삭제할까요?"):
             return
         removed = self.store.delete_object()
         if removed:
@@ -1545,13 +1550,13 @@ class MainWindow(QMainWindow):
             pts = [p for p in self.store.points if p["obj_id"] == oid]
             drawn_frames = sorted(self.store.masks.get(oid, {}))
             first = min([p["frame_idx"] for p in pts] + drawn_frames, default=None)
-            text = f"객체 {oid}: {sum(1 for p in pts if p['label'] == 1)} +, {sum(1 for p in pts if p['label'] == 0)} -"
+            text = f"대상 {oid}: 대상 클릭 {sum(1 for p in pts if p['label'] == 1)}, 제외 클릭 {sum(1 for p in pts if p['label'] == 0)}"
             if drawn_frames:
                 text += f", 그린 마스크 {len(drawn_frames)}"
             text += f"  (프레임 {first}부터)" if first is not None else "  (아직 점 없음)"
             st = self.store.styles.get(oid)
             if st:
-                text += "  [" + ", ".join(([st["style"]] if "style" in st else []) + ([f"{st['block']} px"] if "block" in st else [])
+                text += "  [" + ", ".join(([style_text(st["style"])] if "style" in st else []) + ([f"셀 {st['block']} px"] if "block" in st else [])
                                           + ([f"여백 {st['pad_px']:g}"] if "pad_px" in st else [])) + "]"
             it = QListWidgetItem(text)
             it.setData(Qt.ItemDataRole.UserRole, oid)
@@ -1578,13 +1583,13 @@ class MainWindow(QMainWindow):
     def save_points_as(self) -> bool:
         if self.info is None:
             return False
-        path, _ = QFileDialog.getSaveFileName(self, "포인트 저장", self.points_path or "", "포인트 (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "클릭 지점 저장", self.points_path or "", "클릭 지점 (*.json)")
         return self._write_points(path) if path else False
 
     def _write_points(self, path: str) -> bool:
         probs = self.store.valid()
         if probs:
-            self.show_error("포인트를 저장하지 않았습니다:\n" + "\n".join(probs) + "\n각 항목에 긍정(왼쪽 클릭) 점을 하나 이상 추가하세요.")
+            self.show_error("클릭 지점을 저장하지 않았습니다:\n" + "\n".join(probs) + "\n각 항목에 긍정(왼쪽 클릭) 점을 하나 이상 추가하세요.")
             return False
         try:
             save_points(path, self.info, self.store.points, styles=self.store.styles, masks=self.store.masks)
@@ -1603,7 +1608,7 @@ class MainWindow(QMainWindow):
         if self.info is None:
             self.show_error("먼저 영상을 여세요.")
             return
-        path, _ = QFileDialog.getOpenFileName(self, "포인트 열기", os.path.dirname(self.info.path), "포인트 (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "클릭 지점 열기", os.path.dirname(self.info.path), "클릭 지점 (*.json)")
         if path:
             self.statusBar().showMessage(self._try_load_points(path, quiet=False).strip(" -"))
 
@@ -1614,8 +1619,8 @@ class MainWindow(QMainWindow):
             drawn = load_mask_prompts(path, self.info)
         except (PointsError, OSError, ValueError, KeyError) as e:
             if not quiet:
-                self.show_error(f"이 포인트 파일을 쓸 수 없습니다:\n{e}")
-            return f" - 포인트 파일 무시됨: {e}"
+                self.show_error(f"이 클릭 지점 파일을 쓸 수 없습니다:\n{e}")
+            return f" - 클릭 지점 파일 무시됨: {e}"
         if self.dirty and not self._maybe_save_before_leaving():
             return ""
         store = PointStore()
@@ -1643,7 +1648,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ shutdown
     def closeEvent(self, e):
         if self.job_running:
-            if not self.ask_confirm("처리 작업이 실행 중입니다. 취소하고 종료할까요? (완료된 청크는 이어하기용으로 보관됩니다)"):
+            if not self.ask_confirm("처리 작업이 실행 중입니다. 취소하고 종료할까요? (완료된 조각은 이어하기용으로 보관됩니다)"):
                 e.ignore()
                 return
             self.cancel_processing()

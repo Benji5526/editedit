@@ -223,7 +223,7 @@ def test_per_object_mosaic_settings_are_edited_saved_and_reloaded(win):
     win.obj_block.setValue(48)
     win.obj_pad.setValue(30)
     assert win.dirty and win.store.styles == {2: {"style": "solid", "block": 48, "pad_px": 30.0}}
-    assert "solid" in win.obj_list.item(1).text() and "48 px" in win.obj_list.item(1).text()
+    assert "단색 덮기" in win.obj_list.item(1).text() and "셀 48 px" in win.obj_list.item(1).text()
     win.obj_list.setCurrentRow(0)                                             # object 1 has none: the widgets show "job setting"
     assert win.store.current == 1 and win.obj_style.currentData() is None and win.obj_block.value() == 0 and win.obj_pad.value() == -1
     assert win.store.styles == {2: {"style": "solid", "block": 48, "pad_px": 30.0}}      # switching did not edit anything

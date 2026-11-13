@@ -80,23 +80,23 @@ def test_build_args_nudenet_tiles_and_model():
 def test_validate_settings_nudenet_model(tmp_path):
     v, out = str(tmp_path / "v.mp4"), str(tmp_path / "o.mp4")
     model = tmp_path / "640m.onnx"
-    assert any("NudeNet 모델 파일을 찾을 수 없습니다" in p for p in validate_settings(ProcessSettings(output=out, nudenet_model=str(model)), v, False))
+    assert any("탐지 모델 파일을 찾을 수 없습니다" in p for p in validate_settings(ProcessSettings(output=out, nudenet_model=str(model)), v, False))
     model.write_bytes(b"x")
     assert validate_settings(ProcessSettings(output=out, nudenet_model=str(model), nudenet_res=640, nudenet_tiles=2), v, False) == []
     assert any("320 px" in p for p in validate_settings(ProcessSettings(output=out, nudenet_res=640), v, False))
-    assert any("타일" in p for p in validate_settings(ProcessSettings(output=out, nudenet_tiles=9), v, False))
+    assert any("화면 분할 탐지" in p for p in validate_settings(ProcessSettings(output=out, nudenet_tiles=9), v, False))
     off = ProcessSettings(output=out, use_nudenet=False, nudenet_model=str(tmp_path / "gone.onnx"))
-    assert not any("NudeNet 모델" in p for p in validate_settings(off, v, True) if "체크포인트" not in p)
+    assert not any("탐지 모델" in p for p in validate_settings(off, v, True))
 
 
 def test_validate_settings(tmp_path):
     v = str(tmp_path / "v.mp4")
     ok = ProcessSettings(sam2_checkpoint=str(tmp_path / "missing.pt"), output=str(tmp_path / "sub" / "o.mp4"))
-    assert any("체크포인트" in p for p in validate_settings(ok, v, True))
+    assert any("모델 파일" in p for p in validate_settings(ok, v, True))
     assert validate_settings(ok, v, False) == []                              # NudeNet only: no checkpoint needed
-    assert any("할 일이 없습니다" in p for p in validate_settings(ProcessSettings(output=ok.output, use_nudenet=False), v, False))
+    assert any("가릴 것이 없습니다" in p for p in validate_settings(ProcessSettings(output=ok.output, use_nudenet=False), v, False))
     assert any("원본 영상" in p for p in validate_settings(ProcessSettings(output=v), v, False))
-    assert any("청크 크기" in p for p in validate_settings(ProcessSettings(output=ok.output, chunk_size=5), v, False))
+    assert any("조각 크기" in p for p in validate_settings(ProcessSettings(output=ok.output, chunk_size=5), v, False))
     assert os.path.isdir(str(tmp_path / "sub"))                               # output folder is created
 
 

@@ -192,7 +192,7 @@ def test_app_shows_the_mask_of_a_click_and_updates_it(win, tmp_path):
 
     win.new_object()                                                                 # a second object with only a negative click
     win.view.handle_click(*_widget_pos(win, 300, 40), 0)
-    assert pump(lambda: "객체 2" in ((win.view.overlay() or {}).get("note") or ""), timeout=30)
+    assert pump(lambda: "대상 2" in ((win.view.overlay() or {}).get("note") or ""), timeout=30)
     assert len(win.view.overlay()["masks"]) == 1
 
     win.goto(31)                                                                     # a frame without clicks: nothing to preview
@@ -222,7 +222,7 @@ def test_app_needs_a_video_and_a_checkpoint_for_the_preview(win, monkeypatch):
     from src.app.job_runner import ProcessSettings
     monkeypatch.setattr(mw, "load_last_settings", lambda: ProcessSettings(sam2_checkpoint="Z:/nope.pt"))
     win.act_live.setChecked(True)
-    assert "체크포인트를 찾을 수 없습니다" in win.errors[-1] and not win.act_live.isChecked() and not win.preview.is_on()
+    assert "모델 파일을 찾을 수 없습니다" in win.errors[-1] and not win.act_live.isChecked() and not win.preview.is_on()
 
 
 def test_app_shows_the_masks_of_the_last_run(win, tmp_path):
@@ -244,6 +244,6 @@ def test_app_shows_the_masks_of_the_last_run(win, tmp_path):
     assert not ov["masks"] and len(ov["regions"]) == 1                               # lost object: fail-closed area
     assert not win.view.grab().isNull()
     win.view.handle_click(*_widget_pos(win, 300, 100), 1)                            # edited since the run
-    assert "포인트가 바뀌었습니다" in win.view.overlay()["note"]
+    assert "클릭 지점이 바뀌었습니다" in win.view.overlay()["note"]
     win.act_last.setChecked(False)
     assert win.view.overlay() is None

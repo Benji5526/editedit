@@ -6,14 +6,16 @@ from typing import List
 
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox, QLabel, QTableWidget, QTableWidgetItem, QVBoxLayout)
 
-HEADERS = ["시작 시각", "상태", "청크", "재사용", "포인트", "결과 파일", "오류"]
+from .ko_text import status_text
+
+HEADERS = ["시작한 시각", "상태", "끝난 조각", "다시 쓴 조각", "클릭 지점 파일 표식", "결과 영상", "오류 내용"]
 
 
 def job_rows(jobs: List[dict]) -> List[List[str]]:
     rows = []
     for j in jobs:
         total = j.get("n_chunks") or "?"
-        rows.append([j.get("created") or "", j.get("status") or "", f"{j.get('chunks_done', 0)}/{total}",
+        rows.append([j.get("created") or "", status_text(j.get("status")), f"{j.get('chunks_done', 0)}/{total}",
                      str(j.get("reused_chunks") or 0), (j.get("points_sha") or "")[:8],
                      os.path.basename(j["output_path"]) if j.get("output_path") else "", (j.get("error") or "")[:160]])
     return rows
@@ -34,7 +36,7 @@ class JobsDialog(QDialog):
                 self.table.setItem(r, c, QTableWidgetItem(v))
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
-        note = QLabel("최신 작업이 위에 있습니다. 이 목록은 logs/jobs.sqlite에 보관되는 색인이며, 청크를 실제로 재사용할 수 있는지는 "
+        note = QLabel("최신 작업이 위에 있습니다. 이 목록은 logs/jobs.sqlite에 보관되는 색인이며, 조각을 실제로 재사용할 수 있는지는 "
                       "작업을 이어할 때 temp/ 폴더의 파일로 다시 확인합니다." if rows else "이 영상으로 기록된 작업이 아직 없습니다.")
         note.setWordWrap(True)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)

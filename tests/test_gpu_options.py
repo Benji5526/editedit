@@ -126,10 +126,10 @@ def test_settings_dialog_has_the_gpu_choices(tmp_path):
     from src.app.process_dialog import ProcessDialog
     app = QApplication.instance() or QApplication([])
     d = ProcessDialog(None, str(tmp_path / "v.mp4"), False, 100, ProcessSettings())
-    assert d.enc.itemText(0) == "auto" and d.enc.currentText() == "auto" and d.enc.findText("libx264") >= 0
+    assert d.enc.itemData(0) == "auto" and d.enc.currentData() == "auto" and d.enc.findData("libx264") >= 0
     assert [d.ndev.itemData(i) for i in range(d.ndev.count())] == ["auto", "cuda", "cpu"] and d.ndev.currentData() == "auto"
     d.ndev.setCurrentIndex(d.ndev.findData("cpu"))
-    d.enc.setCurrentText("libx264")
+    d.enc.setCurrentIndex(d.enc.findData("libx264"))
     st = d.settings()
     assert st.nudenet_device == "cpu" and st.encoder == "libx264"
     del app

@@ -122,7 +122,7 @@ class TimelineView(QWidget):
     # ---- layout
     def rows(self) -> List[Tuple[str, str]]:
         """(kind, label) of the tracks below the thumbnails, top to bottom."""
-        out = [("object:%d" % oid, f"객체 {oid}") for oid, _, _ in self._objects[:MAX_OBJECT_ROWS]]
+        out = [("object:%d" % oid, f"대상 {oid}") for oid, _, _ in self._objects[:MAX_OBJECT_ROWS]]
         if len(self._objects) > MAX_OBJECT_ROWS:
             out.append(("more", f"+{len(self._objects) - MAX_OBJECT_ROWS}개"))
         if self._has_run_data:

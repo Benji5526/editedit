@@ -48,15 +48,15 @@ def test_review_table_filters_navigation_and_reviewed_marks(win, tmp_path):
     assert win.load_review(path)
     rp = win.review_panel
     types = [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
-    assert "tracking_lost_mid_frame" in types and "tracking_recovered" in types and "chunk_boundary_resumed" not in types   # info hidden
+    assert "추적 끊김 (화면 안쪽)" in types and "추적 다시 잡힘" in types and "조각 경계에서 이어 붙임" not in types   # info hidden
     assert "일치합니다" in rp.banner.text() and win.slider._flags                                # ticks on the slider
     rp.sev.setCurrentIndex(2)                                                                    # everything incl. info
-    assert "chunk_boundary_resumed" in [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
+    assert "조각 경계에서 이어 붙임" in [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
     rp.sev.setCurrentIndex(1)                                                                    # errors only
     assert rp.table.rowCount() == 0
     rp.sev.setCurrentIndex(0)
 
-    row = [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())].index("tracking_lost_mid_frame")
+    row = [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())].index("추적 끊김 (화면 안쪽)")
     rp.table.selectRow(row)                                                                      # selecting a flag jumps to its frame
     assert pump(lambda: win.frame_idx == 70 and shown_code(win) == 70)
     win.goto(0)
@@ -72,7 +72,7 @@ def test_review_table_filters_navigation_and_reviewed_marks(win, tmp_path):
     assert win.frame_idx == 70
     win.goto(159)
     win.next_flag()
-    assert "더 이상 플래그가 없습니다" in win.statusBar().currentMessage() and win.frame_idx == 159
+    assert "더 이상 검수 항목이 없습니다" in win.statusBar().currentMessage() and win.frame_idx == 159
 
     # mark the lost flag reviewed: sidecar file, table, ticks, 'hide reviewed'
     ticks_before = len(win.slider._flags)
@@ -81,7 +81,7 @@ def test_review_table_filters_navigation_and_reviewed_marks(win, tmp_path):
     rp.toggle_reviewed()
     assert os.path.isfile(state_path_for(path)) and len(win.slider._flags) < ticks_before
     rp.hide_done.setChecked(True)
-    assert "tracking_lost_mid_frame" not in [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
+    assert "추적 끊김 (화면 안쪽)" not in [rp.table.item(r, 2).text() for r in range(rp.table.rowCount())]
     # reload: the mark is still there
     assert win.load_review(path)
     assert win.review.state.is_reviewed(next(s for s in win.review.segments if s["type"] == "tracking_lost_mid_frame"))
@@ -92,7 +92,7 @@ def test_staleness_banner_follows_point_edits(win, tmp_path):
     win.load_review(path)
     assert "일치합니다" in win.review_panel.banner.text()
     win.view.handle_click(*_widget_pos(win, 100, 100), 1)                                       # unsaved edit
-    assert "저장하지 않은 포인트 수정" in win.review_panel.banner.text()
+    assert "저장하지 않은 클릭 지점 수정" in win.review_panel.banner.text()
     assert win.save_points()
     assert "points file changed" in win.review_panel.banner.text()
     win.undo_point()
@@ -132,7 +132,7 @@ def test_reprocess_without_kept_chunks_says_so(win, tmp_path):
     texts = []
     win.ask_confirm = lambda t: texts.append(t) or False                                        # user declines
     win.reprocess()
-    assert pump(lambda: bool(texts), 60) and "보관된 중간 청크가 없습니다" in texts[0] and "전체 160프레임" in texts[0]
+    assert pump(lambda: bool(texts), 60) and "보관된 중간 조각이 없습니다" in texts[0] and "전체 160프레임" in texts[0]
     assert not win.job_running
 
 
@@ -195,7 +195,7 @@ def test_real_sam2_review_reclick_partial_reprocess_end_to_end(win, tmp_path):
     win.last_result = None
     win.reprocess()
     assert pump(lambda: bool(texts), 60)
-    assert "160프레임 중 80프레임은 재사용" in texts[0] and "청크 3-4" in texts[0]              # chunks 1-2 reused, 3-4 re-processed
+    assert "160프레임 중 80프레임은 재사용" in texts[0] and "조각 3-4" in texts[0]              # chunks 1-2 reused, 3-4 re-processed
     assert finish(win, 240)
     res = win.last_result
     assert res["status"] in ("completed_no_flags", "completed_with_review_required"), res
