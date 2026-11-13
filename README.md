@@ -306,8 +306,14 @@ Put `--work-dir` on an SSD if you have one; the job warns when the work or outpu
 
 ## Tests
 ```powershell
-python -m pytest tests -q
+python -m pytest tests -q                    # everything (about 10 minutes): run this before a push
+python -m pytest tests -q -m "not slow"      # quick check while working (about 2 minutes)
+python -m pytest tests -q --record-slow 3    # everything, then re-measure which tests are slow
 ```
+`tests/slow_tests.txt` lists the tests that took 3 s or more in a measured full run (86 of 292, which account for over 90 % of the time: real SAM 2 checkpoint, worker
+processes that import torch, encodes that are decoded again). `tests/conftest.py` gives them the marker `slow`. The list only decides what the quick run skips; the full run always
+runs everything, and a test that is not in the list counts as fast (re-record after adding slow tests). The quick run is not a substitute for the full run: bugs have shown up only
+in slow tests.
 * `test_pipeline.py` uses a **colour-threshold stand-in for SAM 2** (named test double in `tests/helpers.py`) on synthetic footage to check chunking, boundary re-seeding, QC events,
   fail-closed, resume, audio and output verification.
 * `test_sam2_api_smoke.py` drives the real SAM 2 code with random weights (API compatibility only).

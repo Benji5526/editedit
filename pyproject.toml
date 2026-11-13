@@ -11,6 +11,9 @@ license = { text = "Not yet chosen" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
+markers = [
+    "slow: listed in tests/slow_tests.txt (measured). Quick run: -m \"not slow\"; re-measure with --record-slow SECONDS",
+]
 filterwarnings = [
     "ignore:cannot import name '_C' from 'sam2':UserWarning",   # optional SAM 2 CUDA post-processing is not built on Windows
 ]
