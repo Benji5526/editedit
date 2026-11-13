@@ -16,7 +16,7 @@ PACKAGES = [
     ("nudenet", "NudeNet (also supplies the bundled 320n.onnx detector model)"),
     ("torch", "PyTorch (CUDA runtime libraries are bundled with the wheel)"),
     ("torchvision", ""),
-    ("onnxruntime", "ONNX Runtime"),
+    ("onnxruntime-gpu", "ONNX Runtime (GPU build)"),
     ("opencv-python", "OpenCV (the wheel bundles its own FFmpeg libraries)"),
     ("numpy", ""),
     ("pillow", ""),

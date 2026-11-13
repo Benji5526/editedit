@@ -225,6 +225,7 @@ Review JSON from PowerShell: `python -c "import json;d=json.load(open('logs/vide
 | `detection_without_mask` | a NudeNet box overlaps no tracked mask (only logged while a clicked object is tracked). Both are mosaicked anyway | info |
 | `chunk_boundary_resumed` / `_from_stale_mask` / `_resume_failed` | how tracking was re-seeded at a chunk boundary (`_from_stale_mask` = object was hidden, SAM 2 re-run from its last good frame) | info / warn / error |
 | `prompt_produced_no_mask` | SAM 2 returned nothing for your click | error |
+| `detection_lost` | a NudeNet box that had been detected (3+ times) is suddenly not detected any more near that place: the region may have left the picture, or the detector missed it. With `--fail-closed` the last box (expanded) stays mosaicked until the box is back or `--det-lost-hold` frames (default 60) have passed; without it the gap is only flagged | warn; info when the gap was covered and the box came back inside the same chunk |
 | `tracking_abandoned` | no mask for `--max-stale-frames`; object no longer followed | warn |
 | `model_error`, `detector_error`, `frame_error` | inference/IO failure in a chunk/frame | error |
 | `frame_count_mismatch`, `output_verification_failed` | output integrity problems | error |
@@ -394,7 +395,7 @@ Build (from the project virtual environment, `pip install -r requirements-build.
 
 * **Two executables, one folder (onedir)**: `VideoCensor.exe` (windowed GUI, no torch/onnxruntime) starts `VideoCensorWorker.exe` (console, SAM 2 + NudeNet)
   as a separate process, like the source checkout starts `censor_video.py`. Onedir was chosen over onefile so start-up does not unpack ~4 GB each time.
-* Size of the last build: **4.35 GB** (dominated by the CUDA libraries of the PyTorch wheel).
+* Size of the last build (2026-11-13, with onnxruntime-gpu): **4.66 GB** (dominated by the CUDA libraries of the PyTorch wheel). In that build the worker exe ran NudeNet on the GPU (`--nudenet-device cuda`, a NudeNet-only job), chose `h264_nvenc` for `--encoder auto`, and answered a mask-preview request (`--preview-server`).
 * Next to the exes (created by the build, never inside `_internal`): `models\`, `input\`, `output\`, `logs\`, `temp\`, `config\`, `ffmpegin\`.
 * **Not bundled**: model weights (download `sam2.1_hiera_small.pt` into `models\`), videos, and FFmpeg/FFprobe (put them in `ffmpegin\` or on PATH).
   The target PC needs only an NVIDIA driver, no Python or CUDA toolkit. End-user text: `packaging\READ_ME_FIRST.txt`; licenses: `THIRD_PARTY_NOTICES.md`.

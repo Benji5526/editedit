@@ -99,6 +99,7 @@ class Config:
     det_pad_px: float = 12.0             # extra px (full-res units)
     det_fill_gap: int = 6
     det_hold: int = 3
+    det_lost_hold: int = 60              # frames: flag (and with fail-closed keep covering) a box the detector stopped finding
     # mosaic
     block: int = 32                      # strength: block size (pixelate) or 2 x sigma (blur), full-res pixels
     mosaic_style: str = "pixelate"       # pixelate | blur | solid
@@ -858,7 +859,22 @@ class Pipeline:
                 qc.detection_mask_mismatch(boxes, ok_masks, f, qlog)
 
         # ---- detection gap filling + records
-        filled, self.det_carry = fill_detections(raw_dets, s, self.det_carry, cfg.det_fill_gap, cfg.det_hold)
+        lost: List[dict] = []
+        filled, self.det_carry = fill_detections(raw_dets, s, self.det_carry, cfg.det_fill_gap, cfg.det_hold,
+                                                 lost_hold=cfg.det_lost_hold, lost=lost)
+        for L in lost:                            # a box that was being detected and is suddenly not: nobody knows whether the
+            i = L["frame"] - s                    # region left the picture or the detector missed it
+            if L["first"]:
+                back = L.get("recovered_after")   # covered the whole gap and the region came back: nothing left to look at
+                qlog.add(L["frame"], qc.DET_LOST, "info" if (back and cfg.fail_closed) else "warn", None,
+                         f"{L['cls']} was detected up to frame {L['last_seen']} and then " +
+                         (f"not for {back} frames" if back else "not found again near that place (so far)"),
+                         action=f"expanded_bbox_mosaic_up_to_{cfg.det_lost_hold}_frames" if cfg.fail_closed else "flagged_only",
+                         last_seen=L["last_seen"])
+            if cfg.fail_closed and not fc_full[i]:
+                b = L["box"]
+                fc_regions[i].append((int(b[0]), int(b[1]), int(np.ceil(b[2])), int(np.ceil(b[3]))))
+                fc_reason[i] = fc_reason[i] or qc.DET_LOST
         self._chunk_dets = []
         for i, ds in enumerate(filled):
             for d in ds:

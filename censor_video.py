@@ -58,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--det-pad-px", type=float, default=12.0, help="extra box padding in full-res pixels")
     g.add_argument("--det-fill-gap", type=int, default=6, help="bridge detection gaps up to N frames")
     g.add_argument("--det-hold", type=int, default=3, help="keep a box N frames after the last detection")
+    g.add_argument("--det-lost-hold", type=int, default=60,
+                   help="a box that was being detected and then is not: flag it for review and, with --fail-closed, keep an "
+                        "expanded mosaic on its last place for up to N frames or until it is detected again (0 = off)")
     g.add_argument("--nudenet-model", help="path to a different NudeNet onnx (e.g. 640m)")
     g.add_argument("--nudenet-res", type=int, default=320, help="inference resolution of that model")
     g.add_argument("--nudenet-device", choices=["auto", "cuda", "cpu"], default="auto",
@@ -125,7 +128,7 @@ def main(argv=None) -> int:
         chunk_size=a.chunk_size, analysis_width=a.analysis_width, max_frames=a.max_frames,
         max_stale_frames=a.max_stale_frames, stale_prefix_frames=a.stale_prefix_frames, jump_ratio=a.jump_ratio,
         detect_every=a.detect_every, det_threshold=a.det_threshold, det_expand=a.det_expand, det_pad_px=a.det_pad_px,
-        det_fill_gap=a.det_fill_gap, det_hold=a.det_hold, block=a.block, mosaic_style=a.mosaic_style, mask_pad_px=a.mask_pad_px,
+        det_fill_gap=a.det_fill_gap, det_hold=a.det_hold, det_lost_hold=a.det_lost_hold, block=a.block, mosaic_style=a.mosaic_style, mask_pad_px=a.mask_pad_px,
         temporal_radius=a.temporal_radius, fail_closed=a.fail_closed, fail_closed_mode=a.fail_closed_mode,
         fail_closed_expand=a.fail_closed_expand, fail_closed_max_frames=a.fail_closed_max_frames,
         encoder=a.encoder, crf=a.crf, preset=a.preset, keep_audio=not a.no_audio, deep_verify=a.deep_verify,

@@ -74,3 +74,64 @@ def test_real_model_runs_on_neutral_images():
     for o in out:
         assert 0 <= o.x1 < o.x2 <= 640 and 0 <= o.y1 < o.y2 <= 360 and o.cls in DEFAULT_CLASSES
     assert det.detect(np.zeros((100, 300, 3), np.uint8)) is not None   # non-square input
+
+
+# ---- a box the detector stops finding ("lost"): reported forward in time so the caller can flag / keep covering it
+def lost_run(per, lost_hold, start=0, carry=None, hold=1, max_gap=2):
+    lost = []
+    out, carry = fill_detections(per, start, carry or [], max_gap=max_gap, hold=hold, lost_hold=lost_hold, lost=lost)
+    return out, carry, lost
+
+
+def test_gap_longer_than_max_gap_is_reported_until_the_box_is_detected_again():
+    per = [[d()], [d()], [d()]] + [[] for _ in range(8)] + [[d(x1=14, x2=54)], [d(x1=14, x2=54)]]
+    out, _, lost = lost_run(per, lost_hold=30)
+    assert [L["frame"] for L in lost] == [4, 5, 6, 7, 8, 9, 10]          # frame 3 is the ordinary hold, 11 is the re-detection
+    assert [L["first"] for L in lost] == [True] + [False] * 6
+    assert all(L["last_seen"] == 2 and L["box"] == [10, 10, 50, 50] for L in lost)
+
+
+def test_lost_window_ends_after_lost_hold_frames():
+    per = [[d()], [d()], [d()]] + [[] for _ in range(20)]
+    _, carry, lost = lost_run(per, lost_hold=6)
+    assert [L["frame"] for L in lost] == [4, 5, 6, 7, 8]                # last seen 2 -> frames 3..8, 3 is the hold
+    assert carry == []
+
+
+def test_a_box_seen_only_once_or_twice_is_not_reported():
+    per = [[d()], [d()]] + [[] for _ in range(10)]
+    assert lost_run(per, lost_hold=6)[2] == []
+
+
+def test_lost_window_continues_in_the_next_chunk_and_is_reported_once():
+    c1 = [[d()], [d()], [d()], [], [], []]
+    _, carry, lost1 = lost_run(c1, lost_hold=8)
+    assert [L["frame"] for L in lost1] == [4, 5] and lost1[0]["first"] and carry and carry[0]["n"] == 3
+    _, carry2, lost2 = lost_run([[] for _ in range(6)], lost_hold=8, start=6, carry=carry)
+    assert [L["frame"] for L in lost2] == [6, 7, 8, 9, 10] and not any(L["first"] for L in lost2)
+    assert carry2 == []
+    # ... and stops in the next chunk as soon as the box is back
+    _, carry3, lost3 = lost_run([[], [d()], [d()], [], [], []], lost_hold=8, start=6, carry=carry)
+    assert [L["frame"] for L in lost3] == [6, 10, 11]                 # 6: still lost; 7-8 back (keeps its history); lost again
+    assert [L["first"] for L in lost3] == [False, True, False]
+
+
+def test_recovery_inside_the_chunk_is_noted_on_the_first_entry():
+    per = [[d()], [d()], [d()]] + [[] for _ in range(5)] + [[d()]]
+    _, _, lost = lost_run(per, lost_hold=30)
+    assert lost[0]["first"] and lost[0]["recovered_after"] == 5
+    _, _, lost = lost_run([[d()], [d()], [d()]] + [[] for _ in range(5)], lost_hold=30)
+    assert "recovered_after" not in lost[0]
+
+
+def test_a_detection_somewhere_else_does_not_end_the_lost_window():
+    far = d(x1=400, y1=400, x2=440, y2=440)
+    per = [[d()], [d()], [d()]] + [[far] for _ in range(6)]
+    _, _, lost = lost_run(per, lost_hold=5)
+    assert [L["frame"] for L in lost] == [4, 5, 6, 7]
+
+
+def test_no_lost_reports_unless_asked():
+    per = [[d()], [d()], [d()]] + [[] for _ in range(10)]
+    out, carry = fill_detections(per, 0, [], max_gap=2, hold=1)
+    assert [len(x) for x in out] == [1, 1, 1, 1] + [0] * 9

@@ -8,6 +8,7 @@
   "det_pad_px": 12,
   "det_fill_gap": 6,
   "det_hold": 3,
+  "det_lost_hold": 60,
   "nudenet_tiles": 2,
   "block": 32,
   "mask_pad_px": 24,

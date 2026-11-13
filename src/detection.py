@@ -80,8 +80,16 @@ def make_session(path: str, device: str = "auto", providers=None):
         if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
             note = "this onnxruntime build has no CUDA provider (install onnxruntime-gpu built for the CUDA version PyTorch uses)"
         else:
+            have_torch = False
             try:
-                if hasattr(onnxruntime, "preload_dlls"):
+                import torch  # noqa: F401  (loads the CUDA 12 / cuDNN 9 libraries it ships into this process; also works in the packaged worker)
+                have_torch = True
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # with torch imported the libraries are already loaded, and preload_dlls would only print a notice on stdout
+                # (which carries the progress protocol for the desktop app)
+                if not have_torch and hasattr(onnxruntime, "preload_dlls"):
                     onnxruntime.preload_dlls()
             except Exception as e:  # noqa: BLE001
                 note = f"could not preload the CUDA libraries ({type(e).__name__}: {e})"
@@ -169,11 +177,12 @@ class NudenetDetector:
 
 
 class _Track:
-    __slots__ = ("cls", "obs")
+    __slots__ = ("cls", "obs", "seen")
 
     def __init__(self, cls: str):
         self.cls = cls
         self.obs: Dict[int, Det] = {}
+        self.seen = 0            # real detections of this track so far, including earlier chunks
 
     @property
     def last_frame(self) -> int:
@@ -181,7 +190,8 @@ class _Track:
 
 
 def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carry: List[dict],
-                    max_gap: int, hold: int, match_iou: float = 0.15) -> Tuple[List[List[Det]], List[dict]]:
+                    max_gap: int, hold: int, match_iou: float = 0.15, lost_hold: int = 0, lost: Optional[list] = None,
+                    min_obs: int = 3) -> Tuple[List[List[Det]], List[dict]]:
     """Temporal gap filling inside one chunk.
 
     per_frame[i] are detections for global frame start_frame+i (None = detector not run on that frame).
@@ -190,12 +200,21 @@ def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carr
     linear box interpolation; after the last observation a box is held for ``hold`` frames.
     Returns (frames with detections incl. filled ones, carry for next chunk).
     This only bridges short misses; it cannot recover an object the detector never sees.
+
+    lost_hold > 0 with a ``lost`` list: a track that was really detected at least ``min_obs`` times and then stops being
+    detected is reported for up to ``lost_hold`` frames after its last detection (after the ``hold`` frames), or until a
+    detection of the same class shows up near its last box. Each entry appended to ``lost`` is
+    {frame, box, cls, last_seen, first}; ``first`` marks the first frame of the episode, and gets ``recovered_after`` (gap
+    length in frames) when the region is detected again inside the same chunk. The caller decides what to do
+    with it (review flag, conservative mosaic). It works forward in time only, so it also covers gaps that are longer
+    than max_gap and gaps that cross a chunk boundary, which interpolation cannot.
     """
     n = len(per_frame)
     tracks: List[_Track] = []
     for c in carry:
         t = _Track(c["cls"])
         t.obs[c["frame"]] = Det(*c["box"], c["score"], c["cls"])
+        t.seen = int(c.get("n", 1))
         tracks.append(t)
     for i, dets in enumerate(per_frame):
         if not dets:
@@ -215,9 +234,14 @@ def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carr
                     best, best_iou = t, v
             if best is None:
                 best = _Track(d.cls)
+                if lost_hold > 0:                 # the same region found again after a longer gap keeps its history, so a
+                    for t in tracks:              # region that flickers is still "known" when it drops out the next time
+                        if t.cls == d.cls and 0 < f - t.last_frame <= lost_hold and _seen_again([d], t.obs[t.last_frame]):
+                            best.seen = max(best.seen, t.seen)
                 tracks.append(best)
             taken.add(id(best))
             best.obs[f] = d
+            best.seen += 1
     out: List[List[Det]] = [list(d) if d else [] for d in per_frame]
     new_carry = []
     end = start_frame + n
@@ -240,9 +264,43 @@ def fill_detections(per_frame: List[Optional[List[Det]]], start_frame: int, carr
         for g in range(last + 1, last + 1 + hold):
             if start_frame <= g < end and not _has_cover(out[g - start_frame], last_det):
                 out[g - start_frame].append(Det(*last_det.box, last_det.score, t.cls, filled=True))
-        if last + hold >= end - 1 and last >= start_frame - 1 - max_gap:
-            new_carry.append({"cls": t.cls, "frame": last, "box": list(last_det.box), "score": last_det.score})
+        watching = False                          # still inside the "lost" window when this chunk ends
+        if lost_hold > 0 and lost is not None and t.seen >= min_obs:
+            watching = True
+            head = None
+            for g in range(max(last + 1, start_frame), last + 1 + lost_hold):
+                if g >= end:
+                    break
+                if _seen_again(per_frame[g - start_frame], last_det):
+                    watching = False
+                    if head is not None:
+                        head["recovered_after"] = g - last - 1
+                    break
+                if g > last + hold:
+                    lost.append({"frame": g, "box": list(last_det.box), "cls": t.cls, "last_seen": last,
+                                 "first": g == last + hold + 1})
+                    if lost[-1]["first"]:
+                        head = lost[-1]
+            else:
+                watching = False                  # the whole window has passed
+        if (last + hold >= end - 1 and last >= start_frame - 1 - max_gap) or watching:
+            new_carry.append({"cls": t.cls, "frame": last, "box": list(last_det.box), "score": last_det.score, "n": t.seen})
     return out, new_carry
+
+
+def _seen_again(dets: Optional[List[Det]], ref: Det) -> bool:
+    """A real detection of the same class near the place where ``ref`` was last seen (overlapping it, or with its centre
+    within one box size around it)."""
+    if not dets:
+        return False
+    w, h = ref.x2 - ref.x1, ref.y2 - ref.y1
+    for d in dets:
+        if d.cls != ref.cls or d.filled:
+            continue
+        cx, cy = (d.x1 + d.x2) / 2, (d.y1 + d.y2) / 2
+        if iou(d.box, ref.box) > 0.05 or (ref.x1 - w <= cx <= ref.x2 + w and ref.y1 - h <= cy <= ref.y2 + h):
+            return True
+    return False
 
 
 def _has_cover(dets: List[Det], ref: Det) -> bool:
