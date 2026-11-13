@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
@@ -14,6 +15,15 @@ COLORS = ["#ffc800", "#50ff50", "#3c78ff", "#ff3cff", "#3cffff", "#c8c83c", "#78
 
 def object_color(obj_id: int) -> QColor:
     return QColor(COLORS[(obj_id - 1) % len(COLORS)])
+
+
+def mask_image(mask: np.ndarray, color: QColor, alpha: int = 110) -> QImage:
+    """Translucent image of a bool mask in one colour (drawn stretched over the frame)."""
+    h, w = mask.shape
+    arr = np.zeros((h, w, 4), dtype=np.uint8)                         # premultiplied ARGB32 = B, G, R, A bytes on little endian
+    k = alpha / 255.0
+    arr[mask] = (int(color.blue() * k), int(color.green() * k), int(color.red() * k), alpha)
+    return QImage(arr.data, w, h, w * 4, QImage.Format.Format_ARGB32_Premultiplied).copy()
 
 
 class VideoView(QWidget):
@@ -29,6 +39,16 @@ class VideoView(QWidget):
         self._points_for_frame: Callable[[], List[dict]] = lambda: []
         self._current_obj: Callable[[], int] = lambda: 1
         self.message = "Open a video (Ctrl+O)"
+        self._overlay: Optional[dict] = None
+
+    def set_overlay(self, overlay: Optional[dict]):
+        """Masks and boxes to draw over the frame, or None. Keys (all optional): size (w, h) of the coordinate space of boxes and
+        regions, masks [QImage], boxes [(x1, y1, x2, y2, text, filled)], regions [(x1, y1, x2, y2)], full (bool), note (str)."""
+        self._overlay = overlay
+        self.update()
+
+    def overlay(self) -> Optional[dict]:
+        return self._overlay
 
     def set_video(self, width: int, height: int):
         self._frame_size = (width, height)
@@ -79,6 +99,34 @@ class VideoView(QWidget):
             p.fillRect(target, QColor("#1b1b22"))
             p.setPen(QColor("#9aa0a6"))
             p.drawText(target, Qt.AlignmentFlag.AlignCenter, "loading frame...")
+        ov = self._overlay
+        if ov:
+            for img in ov.get("masks") or []:
+                p.drawImage(target, img)
+            sw, sh = ov.get("size") or self._frame_size
+            if sw > 0 and sh > 0:
+                def rect(b):
+                    return QRectF(fit.ox + b[0] / sw * fit.w, fit.oy + b[1] / sh * fit.h, (b[2] - b[0]) / sw * fit.w, (b[3] - b[1]) / sh * fit.h)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setFont(QFont("Segoe UI", 8))
+                for b in ov.get("boxes") or []:
+                    p.setPen(QPen(QColor("#3cffff"), 2, Qt.PenStyle.DashLine if b[5] else Qt.PenStyle.SolidLine))
+                    r = rect(b)
+                    p.drawRect(r)
+                    p.drawText(QPointF(r.left() + 2, r.top() - 3), str(b[4]))
+                p.setPen(QPen(QColor("#ff5050"), 2, Qt.PenStyle.DotLine))
+                for b in ov.get("regions") or []:
+                    p.drawRect(rect(b))
+            if ov.get("full"):
+                p.setPen(QPen(QColor("#ff5050"), 4))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(target.adjusted(2, 2, -2, -2))
+            if ov.get("note"):
+                p.setFont(QFont("Segoe UI", 9))
+                box = QRectF(target.left() + 6, target.top() + 6, min(target.width() - 12, 640), 22)
+                p.fillRect(box, QColor(0, 0, 0, 150))
+                p.setPen(QColor("white"))
+                p.drawText(box.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, ov["note"])
         cur = self._current_obj()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))

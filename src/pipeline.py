@@ -28,6 +28,7 @@ import numpy as np
 
 from . import quality_control as qc
 from .job_manager import JobDB, db_path_for
+from .mask_cache import CACHE_VERSION, cache_path, load_chunk_cache, save_chunk_cache  # noqa: F401  (re-exported)
 from .system_guard import disk_check, keep_awake
 from .detection import Det, fill_detections
 from .mosaic import (STYLES, apply_layers, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
@@ -38,7 +39,6 @@ from .video_io import (FrameReader, PrefetchReader, SegmentWriter, VideoError, V
                        is_hdr, probe_video, verify_output)
 
 CODE_VERSION = "2"
-CACHE_VERSION = 1
 PROMPT_NO_MASK = "prompt_produced_no_mask"
 DET_ERROR = "detector_error"
 
@@ -152,67 +152,6 @@ def render_hash(cfg: Config, object_styles: Optional[ObjectStyles] = None) -> st
         d["object_styles"] = {str(k): object_styles[k] for k in sorted(object_styles)}
     d["code"] = CODE_VERSION
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
-
-
-def _json_default(o):
-    if isinstance(o, np.integer):
-        return int(o)
-    if isinstance(o, np.floating):
-        return float(o)
-    if isinstance(o, np.bool_):
-        return bool(o)
-    return str(o)
-
-
-def cache_path(job_dir: str, ci: int) -> str:
-    return os.path.join(job_dir, f"masks_{ci:05d}.npz")
-
-
-def save_chunk_cache(job_dir: str, rj: "RenderJob", shape: Tuple[int, int]) -> None:
-    """Write everything the render stage of one chunk needs (the analysis results) to masks_NNNNN.npz.
-
-    Layout: ``meta`` (JSON string: frame range, analysis-frame shape, object ids, detections per frame incl. gap-filled ones,
-    fail-closed regions/flags, the analysis-stage review events) and per object ``p<id>`` (bool per frame: has a mask) plus
-    ``m<id>`` (the bit-packed masks of the frames that have one, in order; see tracking.pack_mask). Masks are in analysis-frame
-    coordinates. The file is derived from the footage: it stays in the job's work folder and is deleted with it."""
-    arrays = {}
-    for oid, seq in rj.packed.items():
-        present = np.array([m is not None for m in seq], dtype=bool)
-        arrays[f"p{oid}"] = present
-        if present.any():
-            arrays[f"m{oid}"] = np.stack([m for m in seq if m is not None])
-    meta = {"version": CACHE_VERSION, "chunk": rj.ci, "start": rj.s, "end": rj.e, "shape": [int(shape[0]), int(shape[1])],
-            "obj_ids": [int(o) for o in rj.packed], "filled": [[asdict(d) for d in ds] for ds in rj.filled],
-            "fc_regions": [[[int(v) for v in r] for r in rs] for rs in rj.fc_regions], "fc_full": [bool(v) for v in rj.fc_full],
-            "fc_reason": list(rj.fc_reason), "events": rj.a_events, "detections": rj.chunk_dets}
-    arrays["meta"] = np.array(json.dumps(meta, default=_json_default))
-    path = cache_path(job_dir, rj.ci)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        np.savez_compressed(f, **arrays)
-    os.replace(tmp, path)
-
-
-def load_chunk_cache(job_dir: str, ci: int) -> dict:
-    """Read masks_NNNNN.npz back: {"meta": dict, "packed": {obj_id: [packed mask or None per frame]}}."""
-    with np.load(cache_path(job_dir, ci), allow_pickle=False) as z:
-        meta = json.loads(str(z["meta"][()]))
-        if meta.get("version") != CACHE_VERSION:
-            raise ValueError(f"unsupported mask cache version {meta.get('version')}")
-        n = meta["end"] - meta["start"]
-        packed = {}
-        for oid in meta["obj_ids"]:
-            present = z[f"p{oid}"]
-            rows = z[f"m{oid}"] if f"m{oid}" in z.files else None
-            seq, k = [], 0
-            for i in range(n):
-                if present[i]:
-                    seq.append(rows[k])
-                    k += 1
-                else:
-                    seq.append(None)
-            packed[int(oid)] = seq
-    return {"meta": meta, "packed": packed}
 
 
 def file_sha(path: Optional[str]) -> Optional[str]:

@@ -95,6 +95,17 @@ missing makes processing start in full from that chunk; a cache file that exists
 Not measured: the size of the cache on real 4K footage (masks compress well, but it adds to the disk use of the kept chunks) and the time saved on a long video.
 The cache is derived from the footage; it lives in the job's work folder and is deleted with it.
 
+*Mask preview (View menu).* Two overlays show masks on the preview, tinted in each object's colour:
+* **Preview the mask while clicking (`P`)** starts a helper process (`censor_video.py --preview-server`, the same worker as a job, so the app itself never loads torch) that keeps
+  SAM 2 loaded. After every click on the current frame it returns the mask SAM 2 selects for that frame's clicks, usually within a second after the model has loaded. The mask is
+  computed like the first frame of a processing chunk (same analysis size, same JPEG step, same prompt call); `tests/test_mask_preview.py` checks with the real checkpoint that it
+  equals the mask the job produces on the clicked frame (IoU > 0.95 on the synthetic clip). It answers "did my click select the right thing here?" - **not** how well the object is
+  followed on later frames. It uses the checkpoint and analysis width of the last settings, shows the mask before padding, and stops while a job runs (the job needs the GPU).
+* **Show the masks of the last run (`K`)** reads the kept mask cache of this video and shows, for any frame, the tracked masks, the NudeNet boxes (dashed = bridged by gap
+  filling) and the fail-closed areas (red, dotted; a red frame = whole frame). These are the raw results before the render stage grows them (padding, box expansion, temporal union).
+  A note says when the points were edited after that run. Needs "Keep intermediate chunks".
+On a frame with clicks the live preview wins when both are on.
+
 *Per-object mosaic settings.* In the Targets panel, "Mosaic for the selected object" gives a clicked object its own **style** (pixelate / blur / solid), **strength** (px) and
 **padding** (px); each can stay on "job setting" (the value from the processing dialog). The object list shows what is set. The settings are saved in the points file: a file with
 any of them is written as version 2 with an `object_styles` block (`{"2": {"style": "solid", "block": 48, "pad_px": 30}}`); a file without stays version 1, and both versions are read.

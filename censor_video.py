@@ -37,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--plan-only", action="store_true",
                    help="print what a --resume run would reuse (event 'plan') and exit without processing")
     g.add_argument("--cancel-file", help="stop safely at the next checkpoint when this file appears (exit code 3, resumable)")
+    g.add_argument("--preview-server", action="store_true",
+                   help="do not process: keep SAM 2 loaded and answer mask-preview requests on stdin/stdout (used by the desktop app, "
+                        "see src/preview_server.py). Needs --sam2-checkpoint; uses --analysis-width and --device")
     g = p.add_argument_group("SAM 2")
     g.add_argument("--sam2-checkpoint", help="e.g. models/sam2.1_hiera_small.pt (official download, see models/README.md)")
     g.add_argument("--sam2-config", help="e.g. configs/sam2.1/sam2.1_hiera_s.yaml (inferred from checkpoint name if omitted)")
@@ -96,6 +99,11 @@ def main(argv=None) -> int:
             parser.error(f"unknown keys in config: {sorted(unknown)}")
         parser.set_defaults(**defaults)
     a = parser.parse_args(argv)
+    if a.preview_server:
+        if not a.sam2_checkpoint:
+            parser.error("--sam2-checkpoint is required with --preview-server")
+        from src.preview_server import serve
+        return serve(a.input, a.sam2_checkpoint, a.sam2_config, a.device, a.analysis_width)
     if not (1 <= a.chunk_size <= 1000):
         parser.error("--chunk-size must be positive (120-240 recommended)")
     if a.detect_every < 1:

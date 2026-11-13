@@ -7,6 +7,7 @@ from collections import OrderedDict
 from typing import Optional
 
 import dataclasses
+import hashlib
 import time
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, Signal
@@ -21,13 +22,15 @@ from src.video_io import VideoInfo, is_hdr, probe_video
 
 from .frame_server import FrameServer
 from src.job_manager import JobDB, db_path_for
+from src.mask_cache import JobMasks
 
 from .job_runner import PROJECT_ROOT, JobRunner, ProcessSettings, build_args, job_dir_for_video
 from .jobs_dialog import JobsDialog
-from .process_dialog import ProcessDialog, validate_settings
+from .mask_preview import MaskPreview, preview_args
+from .process_dialog import ProcessDialog, find_default_checkpoint, load_last_settings, validate_settings
 from .process_panel import ProcessPanel
 from .review_panel import FlagSlider, ReviewPanel
-from .video_view import VideoView, object_color
+from .video_view import VideoView, mask_image, object_color
 
 log = logging.getLogger("app")
 VIDEO_FILTER = "Video (*.mp4 *.mov *.mkv *.avi *.m4v *.webm *.ts);;All files (*.*)"
@@ -84,6 +87,13 @@ class MainWindow(QMainWindow):
         self.job_running = False
         self.last_settings: Optional[ProcessSettings] = None
         self.last_result: Optional[dict] = None
+        # mask overlays: live preview of the clicked frame (SAM 2 in a helper process) and the kept masks of the last run
+        self.preview = MaskPreview(self)
+        self.preview_command = None            # tests: replaces the worker command line of the preview process
+        self._live_masks: dict = {}            # frame -> (signature of the clicks on it, {obj_id: mask}, {obj_id: reason skipped})
+        self._preview_reqs: dict = {}          # request id -> (frame, signature)
+        self._preview_asked = None             # (frame, signature) of the newest request
+        self._job_masks: Optional[JobMasks] = None
 
         self.view = VideoView()
         self.view.set_provider(self._points_on_frame, lambda: self.store.current)
@@ -130,6 +140,9 @@ class MainWindow(QMainWindow):
         self.runner.progress.connect(self._on_job_progress)
         self.runner.log_line.connect(self.panel.add_log)
         self.runner.job_finished.connect(self._on_job_finished)
+        self.preview.masks_ready.connect(self._on_preview_masks)
+        self.preview.request_failed.connect(self._on_preview_failed)
+        self.preview.state_changed.connect(self._on_preview_state)
         self.statusBar().showMessage("Open a video to start (Ctrl+O). Left-click = this is the object, right-click = this is NOT.")
 
     # ------------------------------------------------------------------ UI construction
@@ -168,6 +181,19 @@ class MainWindow(QMainWindow):
         pm.addAction(self.act_resume_job)
         pm.addAction(self.act_history)
         pm.addAction(self.act_cleanup)
+        vm = self.menuBar().addMenu("&View")
+        self.act_live = QAction("Preview the mask while clicking (SAM 2)", self)
+        self.act_live.setCheckable(True)
+        self.act_live.setShortcut(QKeySequence("P"))
+        self.act_live.setToolTip("Shows what SAM 2 selects for the clicks on the current frame, before any processing.")
+        self.act_live.toggled.connect(self.toggle_live_preview)
+        self.act_last = QAction("Show the masks of the last run", self)
+        self.act_last.setCheckable(True)
+        self.act_last.setShortcut(QKeySequence("K"))
+        self.act_last.setToolTip("Shows the tracked masks, detection boxes and fail-closed areas the last run kept for each frame.")
+        self.act_last.toggled.connect(self.toggle_last_masks)
+        vm.addAction(self.act_live)
+        vm.addAction(self.act_last)
         e = self.menuBar().addMenu("&Edit")
         e.addAction(act("Undo last point on this frame", "U", self.undo_point))
         e.addAction(act("Delete this object's points on this frame", "X", self.clear_frame_points))
@@ -457,6 +483,9 @@ class MainWindow(QMainWindow):
         self.act_cleanup.setEnabled(not running)
         self.act_resume_job.setEnabled(not running and self.resumable_job is not None)
         self.style_box.setEnabled(not running)
+        if running and self.act_live.isChecked():          # the job needs the GPU: the preview process is stopped
+            self.act_live.setChecked(False)
+        self.act_live.setEnabled(not running)
 
     def start_processing_dialog(self):
         if self.info is None:
@@ -526,6 +555,134 @@ class MainWindow(QMainWindow):
         if res.get("review_log") and os.path.isfile(res["review_log"]):
             self.load_review(res["review_log"], quiet=True)
         self.check_resumable()
+        if self.act_last.isChecked():                      # show the masks of the run that just finished
+            self.toggle_last_masks(True)
+
+    # ------------------------------------------------------------------ mask overlays
+    def _set_checked(self, action, on: bool):
+        action.blockSignals(True)
+        action.setChecked(on)
+        action.blockSignals(False)
+
+    def toggle_live_preview(self, on: bool):
+        self.preview.stop()
+        self._live_masks.clear()
+        self._preview_reqs.clear()
+        self._preview_asked = None
+        if on:
+            problem = None
+            st = self.last_settings or load_last_settings()
+            ckpt = st.sam2_checkpoint or find_default_checkpoint()
+            if self.info is None:
+                problem = "Open a video first."
+            elif self.job_running:
+                problem = "A job is running: the mask preview is available again when it has finished."
+            elif self.preview_command is None and not os.path.isfile(ckpt):
+                problem = "SAM 2 checkpoint not found. Download one into models/ (see models/README.md) or select it in Process > Start processing."
+            if problem:
+                self._set_checked(self.act_live, False)
+                self.show_error(problem)
+            else:
+                self.preview.start(preview_args(self.info.path, ckpt, st.analysis_width, st.device), command=self.preview_command)
+        self._update_overlay()
+
+    def toggle_last_masks(self, on: bool):
+        self._job_masks = None
+        if on:
+            try:
+                if self.info is None:
+                    raise FileNotFoundError("no video")
+                work = self.last_settings.work_dir if self.last_settings else ""
+                jm = JobMasks(job_dir_for_video(work, self.info.path, self.info.fingerprint))
+                if not jm.available_chunks():
+                    raise FileNotFoundError("no masks")
+                self._job_masks = jm
+            except (OSError, ValueError, KeyError):
+                self._set_checked(self.act_last, False)
+                self.statusBar().showMessage("No kept masks for this video. Process it with \"Keep intermediate chunks\" switched on first.")
+        self._update_overlay()
+
+    def _points_sha(self) -> Optional[str]:
+        try:
+            with open(self.points_path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except (OSError, TypeError):
+            return None
+
+    def _make_overlay(self, shape, masks: dict, boxes=(), regions=(), full=False, note="") -> dict:
+        return {"size": (shape[1], shape[0]), "masks": [mask_image(m, object_color(oid)) for oid, m in sorted(masks.items())],
+                "boxes": list(boxes), "regions": list(regions), "full": full, "note": note}
+
+    def _update_overlay(self):
+        """Decide what to draw over the current frame: the live preview where the frame has clicks, else the last run's masks."""
+        if self.info is None or self.frame_idx < 0:
+            self.view.set_overlay(None)
+            return
+        f = self.frame_idx
+        pts = [p for p in self.store.points if p["frame_idx"] == f]
+        if self.preview.is_on() and pts:
+            sig = tuple(sorted((p["obj_id"], round(p["x"], 2), round(p["y"], 2), p["label"]) for p in pts))
+            hit = self._live_masks.get(f)
+            if hit is not None and hit[0] == sig:
+                note = "Preview of this frame's clicks (mask before padding)."
+                if hit[2]:
+                    note += "  Not shown: " + "; ".join(f"object {o} - {r}" for o, r in sorted(hit[2].items()))
+                shape = next(iter(hit[1].values())).shape if hit[1] else (self.info.height, self.info.width)
+                self.view.set_overlay(self._make_overlay(shape, hit[1], note=note))
+                return
+            self.view.set_overlay({"note": "Computing the mask ..." if self.preview.is_ready() else "Loading the model for the mask preview ..."})
+            if self._preview_asked != (f, sig):
+                objects: dict = {}
+                for p in pts:
+                    o = objects.setdefault(p["obj_id"], {"points": [], "labels": []})
+                    o["points"].append([p["x"], p["y"]])
+                    o["labels"].append(p["label"])
+                rid = self.preview.request(f, objects)
+                self._preview_reqs[rid] = (f, sig)
+                self._preview_asked = (f, sig)
+            return
+        if self._job_masks is not None:
+            fr = self._job_masks.frame(f)
+            stale = self.dirty or (self._job_masks.points_sha is not None and self._job_masks.points_sha != self._points_sha())
+            tail = "  The points changed since that run." if stale else ""
+            if fr is None:
+                self.view.set_overlay({"note": "The last run kept no masks for this frame." + tail})
+            else:
+                note = f"Last run ({self._job_masks.created}): masks before padding, detection boxes, fail-closed areas (red)." + tail
+                self.view.set_overlay(self._make_overlay(fr["shape"], fr["masks"], fr["boxes"], fr["fc_regions"], fr["fc_full"], note))
+            return
+        if self.preview.is_on():
+            self.view.set_overlay({"note": "Mask preview is on: click the object on this frame to see what SAM 2 selects."})
+            return
+        self.view.set_overlay(None)
+
+    def _on_preview_masks(self, rid: int, frame: int, masks: dict, skipped: dict):
+        req = self._preview_reqs.pop(rid, None)
+        if req is None:
+            return
+        self._live_masks[frame] = (req[1], masks, skipped)
+        while len(self._live_masks) > 60:
+            self._live_masks.pop(next(iter(self._live_masks)))
+        if frame == self.frame_idx:
+            self._update_overlay()
+
+    def _on_preview_failed(self, rid: int, reason: str):
+        self._preview_reqs.pop(rid, None)
+        self._preview_asked = None
+        self.statusBar().showMessage("Mask preview failed for this frame: " + reason)
+        self.view.set_overlay({"note": "Mask preview failed: " + reason})
+
+    def _on_preview_state(self, state: str, detail: str):
+        if state == "failed":
+            self._set_checked(self.act_live, False)
+            self.preview.stop()
+            self.show_error("The mask preview could not be started:\n" + detail)
+        elif state == "loading":
+            self.statusBar().showMessage("Mask preview: loading the model (a few seconds) ...")
+        elif state == "ready":
+            self.statusBar().showMessage("Mask preview is ready: click the object to see what SAM 2 selects on this frame.")
+        if state != "off":
+            self._update_overlay()
 
     # ------------------------------------------------------------------ dialogs (overridable for tests)
     def show_error(self, text: str):
@@ -578,6 +735,13 @@ class MainWindow(QMainWindow):
         if self.server is not None:
             self.server.close()
         self.info = info
+        self._set_checked(self.act_live, False)          # overlays belong to the previous video
+        self._set_checked(self.act_last, False)
+        self.preview.stop()
+        self._live_masks.clear()
+        self._preview_reqs.clear()
+        self._preview_asked, self._job_masks = None, None
+        self.view.set_overlay(None)
         self.review = None
         self.review_panel.set_data(None)
         self.slider.set_flags([])
@@ -644,6 +808,7 @@ class MainWindow(QMainWindow):
         else:
             self._awaiting = True
             self.server.request(idx)
+        self._update_overlay()
         self.view.update()
 
     def _frame_ready(self, idx: int, img):
@@ -718,6 +883,7 @@ class MainWindow(QMainWindow):
         self._refresh_stale_banner()
         self._refresh_objects()
         self._update_title()
+        self._update_overlay()
         self.view.update()
 
     def new_object(self):
@@ -884,6 +1050,7 @@ class MainWindow(QMainWindow):
             e.ignore()
             return
         self._stop_play()
+        self.preview.stop()
         if self.server is not None:
             self.server.close()
         e.accept()
