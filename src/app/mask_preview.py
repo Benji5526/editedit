@@ -9,7 +9,9 @@ from typing import Dict, List, Optional
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from src.paths import worker_command
-from src.preview_server import PREVIEW_PREFIX, decode_mask
+import numpy as np
+
+from src.preview_server import PREVIEW_PREFIX, decode_mask, encode_mask
 
 from .job_runner import CREATE_NO_WINDOW, PROJECT_ROOT, kill_tree
 
@@ -23,6 +25,7 @@ class MaskPreview(QObject):
     masks_ready = Signal(int, int, object, object)
     state_changed = Signal(str, str)             # state ("off" | "loading" | "ready" | "failed"), detail text
     request_failed = Signal(int, str)            # request id, reason
+    track_ready = Signal(int, int, object)       # request id, first frame, [bool mask (analysis size) or None per frame]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -32,6 +35,7 @@ class MaskPreview(QObject):
         self._next_id = 0
         self._busy = False
         self._waiting: Optional[dict] = None
+        self._queue: List[dict] = []             # trial-tracking requests: sent in order, never replaced
 
     def is_on(self) -> bool:
         return self._proc is not None
@@ -60,7 +64,7 @@ class MaskPreview(QObject):
         p.readyReadStandardError.connect(lambda: p.readAllStandardError())        # drain so the pipe never fills up
         p.finished.connect(self._on_finished)
         p.errorOccurred.connect(self._on_error)
-        self._proc, self._buf, self._busy, self._waiting = p, "", False, None
+        self._proc, self._buf, self._busy, self._waiting, self._queue = p, "", False, None, []
         cmd = list(command) if command else worker_command() + args
         self._set_state("loading", "모델을 불러오는 중 ...")
         p.start(cmd[0], cmd[1:])
@@ -68,7 +72,7 @@ class MaskPreview(QObject):
 
     def stop(self):
         p, self._proc = self._proc, None
-        self._busy, self._waiting = False, None
+        self._busy, self._waiting, self._queue = False, None, []
         if p is not None:
             try:
                 p.finished.disconnect(self._on_finished)
@@ -102,6 +106,26 @@ class MaskPreview(QObject):
             self._send(req)
         return self._next_id
 
+    def request_track(self, obj_id: int, frame: int, frames: int, prompts: Dict[int, dict]) -> int:
+        """Trial tracking of one object over ``frames`` frames from ``frame``. prompts: {offset: {"points", "labels"} or
+        {"mask": bool array}}. Returns the request id (0 when the server is off)."""
+        if self._proc is None:
+            return 0
+        self._next_id += 1
+        wire = {}
+        for off, pr in prompts.items():
+            if pr.get("mask") is not None:
+                m = np.ascontiguousarray(pr["mask"], dtype=bool)
+                wire[str(int(off))] = {"mask": encode_mask(np.packbits(m.reshape(-1))), "shape": [int(m.shape[0]), int(m.shape[1])]}
+            else:
+                wire[str(int(off))] = {"points": pr["points"], "labels": pr["labels"]}
+        req = {"cmd": "track", "id": self._next_id, "obj_id": int(obj_id), "frame": int(frame), "frames": int(frames), "prompts": wire}
+        if self._busy or self.state != "ready":
+            self._queue.append(req)
+        else:
+            self._send(req)
+        return self._next_id
+
     # ---- internals
     def _send(self, req: dict):
         self._busy = True
@@ -130,17 +154,23 @@ class MaskPreview(QObject):
             self._set_state("ready", "")
         elif kind == "fatal":
             self._set_state("failed", str(ev.get("reason")))
-        elif kind in ("masks", "error"):
+        elif kind in ("masks", "error", "track"):
             self._busy = False
-            if kind == "masks":
+            if kind == "track":
+                shape = tuple(ev["shape"])
+                self.track_ready.emit(int(ev["id"]), int(ev["frame"]), [None if m is None else decode_mask(m, shape) for m in ev["masks"]])
+            elif kind == "masks":
                 shape = tuple(ev["shape"])
                 masks = {int(k): decode_mask(v, shape) for k, v in ev["masks"].items()}
                 self.masks_ready.emit(int(ev["id"]), int(ev["frame"]), masks, {int(k): v for k, v in (ev.get("skipped") or {}).items()})
             else:
                 self.request_failed.emit(int(ev.get("id") or 0), str(ev.get("reason")))
-        if self.state == "ready" and not self._busy and self._waiting is not None and self._proc is not None:
-            req, self._waiting = self._waiting, None
-            self._send(req)
+        if self.state == "ready" and not self._busy and self._proc is not None:
+            if self._queue:
+                self._send(self._queue.pop(0))
+            elif self._waiting is not None:
+                req, self._waiting = self._waiting, None
+                self._send(req)
 
     def _on_error(self, err):
         if err == QProcess.ProcessError.FailedToStart and self._proc is not None:
@@ -152,6 +182,6 @@ class MaskPreview(QObject):
             return
         self._read()
         self._proc = None
-        self._busy, self._waiting = False, None
+        self._busy, self._waiting, self._queue = False, None, []
         if self.state != "failed":
             self._set_state("failed", f"미리보기 프로세스가 종료되었습니다 (종료 코드 {code})")

@@ -261,7 +261,7 @@ def test_editor_layout_and_dark_theme(qapp, win):
     assert win.dockWidgetArea(win.targets_dock) == Qt.DockWidgetArea.LeftDockWidgetArea          # objects on the left
     assert win.dockWidgetArea(win.props_dock) == Qt.DockWidgetArea.RightDockWidgetArea           # properties + review tab on the right
     assert win.review_dock in win.tabifiedDockWidgets(win.props_dock)
-    assert win.style_box.parent() is win.props_dock.widget() and win.info_label.parent() is win.props_dock.widget()
+    assert win.props_dock.isAncestorOf(win.style_box) and win.props_dock.isAncestorOf(win.info_label) and win.props_dock.isAncestorOf(win.compare_box)
     assert win.slider.parent() is win.timeline                                                   # the timeline strip under the preview
     acts = win.toolbar.actions()
     assert win.act_open_video in acts and win.act_live in acts and win.act_last in acts and win.act_cancel in acts

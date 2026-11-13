@@ -8,19 +8,21 @@ from typing import Optional
 
 import dataclasses
 import hashlib
+import json
 import time
 
 import cv2
 import numpy as np
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (QApplication, QComboBox, QDockWidget, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QToolBar,
+                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QToolBar,
                                QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from src.corrections import save_correction
-from src.points_io import OBJECT_STYLES, PointStore, PointsError, load_mask_prompts, load_object_styles, load_points, save_points
+from src.points_io import (OBJECT_STYLES, PointStore, PointsError, load_mask_prompts, load_object_styles, load_points, mask_digest,
+                           save_points)
 from src.review import ReviewError
 from src.review_data import ReviewData, load_review_data
 from src.video_io import VideoInfo, is_hdr, probe_video
@@ -107,6 +109,7 @@ class MainWindow(QMainWindow):
         self._stroke_key = None
         self._stroke_mask: Optional[np.ndarray] = None
         self.corrections_saved: list = []      # paths of the correction records written by the last save
+        self._compare: Optional[dict] = None   # before/after comparison of a correction (see start_compare)
 
         self.view = VideoView()
         self.view.set_provider(self._points_on_frame, lambda: self.store.current)
@@ -180,6 +183,7 @@ class MainWindow(QMainWindow):
         self.preview.masks_ready.connect(self._on_preview_masks)
         self.preview.request_failed.connect(self._on_preview_failed)
         self.preview.state_changed.connect(self._on_preview_state)
+        self.preview.track_ready.connect(self._on_track_ready)
         self.statusBar().showMessage("영상을 열어 시작하세요 (Ctrl+O). 왼쪽 클릭 = 이것이 대상, 오른쪽 클릭 = 이것은 대상이 아님.")
 
     # ------------------------------------------------------------------ UI construction
@@ -238,6 +242,8 @@ class MainWindow(QMainWindow):
         self.act_brush.toggled.connect(self.toggle_brush)
         self.act_undo_stroke = self._act("마지막 붓질 되돌리기", "Ctrl+Z", self.undo_stroke)
         self.act_clear_mask = self._act("이 프레임에서 그린 마스크 지우기", None, self.clear_drawn_mask)
+        self.act_compare = self._act("수정 전후 비교 (이 프레임부터 시험 추적)", "C", self.start_compare)
+        self.act_compare.setToolTip("선택한 객체를 이 프레임부터 짧게 추적해 보고, 수정 전과 나란히 비교합니다. 영상은 바뀌지 않습니다.")
         e = self.menuBar().addMenu("편집(&E)")
         e.addAction(act("이 프레임의 마지막 점 되돌리기", "U", self.undo_point))
         e.addAction(act("이 프레임에서 이 객체의 점 지우기", "X", self.clear_frame_points))
@@ -245,6 +251,7 @@ class MainWindow(QMainWindow):
         e.addAction(self.act_brush)
         e.addAction(self.act_undo_stroke)
         e.addAction(self.act_clear_mask)
+        e.addAction(self.act_compare)
         e.addSeparator()
         self.act_cut = act("결과 영상 자르기...", "Ctrl+T", self.open_cut_dialog)
         self.act_cut.setToolTip("처리가 끝난 영상에서 구간을 잘라내 새 파일로 내보냅니다. 원본과 추적 결과는 바뀌지 않습니다.")
@@ -272,6 +279,10 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_live)
         tb.addAction(self.act_last)
         tb.addAction(self.act_brush)
+        tb.addAction(self.act_compare)
+        for a, short in ((self.act_live, "마스크 미리보기"), (self.act_last, "지난 실행 마스크"), (self.act_brush, "브러시"),
+                         (self.act_compare, "수정 전후 비교")):
+            a.setIconText(short)                         # shorter labels on the toolbar; the menus keep the full text
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         spacer.setStyleSheet("background: transparent")
@@ -366,8 +377,46 @@ class MainWindow(QMainWindow):
         bnote.setWordWrap(True)
         bform.addRow(bnote)
         pv.addWidget(self.brush_box)
+        # before/after comparison of a correction
+        self.compare_box = QGroupBox("수정 전후 비교")
+        cform = QFormLayout(self.compare_box)
+        self.compare_frames = QSpinBox()
+        self.compare_frames.setRange(5, 300)
+        self.compare_frames.setValue(60)
+        self.compare_frames.setToolTip("현재 프레임부터 몇 프레임을 시험 추적해서 비교할지 정합니다.")
+        cform.addRow("비교할 프레임 수", self.compare_frames)
+        self.compare_btn = QPushButton("이 프레임부터 비교 시작 (C)")
+        self.compare_btn.clicked.connect(self.start_compare)
+        cform.addRow(self.compare_btn)
+        self.compare_mode = QComboBox()
+        for text, val in (("차이 (초록 = 늘어남, 빨강 = 줄어듦)", "diff"), ("수정 전", "before"), ("수정 후", "after")):
+            self.compare_mode.addItem(text, val)
+        self.compare_mode.currentIndexChanged.connect(lambda *_: self._update_overlay())
+        cform.addRow("보기", self.compare_mode)
+        self.compare_info = QLabel("고친 프레임에서 비교를 시작하면, 그 뒤 프레임들이 어떻게 달라지는지 미리 볼 수 있습니다.")
+        self.compare_info.setObjectName("hint")
+        self.compare_info.setWordWrap(True)
+        self.compare_jump = QPushButton("가장 많이 달라진 프레임으로 이동")
+        self.compare_jump.clicked.connect(self.goto_biggest_change)
+        self.compare_keep = QPushButton("수정 유지")
+        self.compare_keep.clicked.connect(self.keep_correction)
+        self.compare_revert = QPushButton("수정 취소 (되돌리기)")
+        self.compare_revert.clicked.connect(self.revert_correction)
+        cform.addRow(self.compare_jump)
+        crow = QHBoxLayout()
+        crow.addWidget(self.compare_keep)
+        crow.addWidget(self.compare_revert)
+        cform.addRow(crow)
+        cform.addRow(self.compare_info)               # below the buttons, so keep / revert stay in view
+        pv.addWidget(self.compare_box)
+        self._refresh_compare_panel()
         pv.addStretch(1)
-        pdock.setWidget(pw)
+        scroll = QScrollArea()                           # the panel is taller than a small window: let it scroll
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(pw)
+        pdock.setWidget(scroll)
         pdock.setMinimumWidth(300)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, pdock)
         self._refresh_objects()
@@ -612,8 +661,10 @@ class MainWindow(QMainWindow):
         self.act_live.setEnabled(not running)
         if running and self.act_brush.isChecked():         # masks are locked like the points while a job runs
             self.act_brush.setChecked(False)
-        for w in (self.act_brush, self.act_undo_stroke, self.act_clear_mask, self.brush_box):
+        for w in (self.act_brush, self.act_undo_stroke, self.act_clear_mask, self.brush_box, self.act_compare, self.compare_box):
             w.setEnabled(not running)
+        if running:
+            self._end_compare()
 
     def start_processing_dialog(self):
         if self.info is None:
@@ -774,6 +825,7 @@ class MainWindow(QMainWindow):
         action.blockSignals(False)
 
     def toggle_live_preview(self, on: bool):
+        self._end_compare()                            # a comparison in progress lives in the preview process
         self.preview.stop()
         self._live_masks.clear()
         self._preview_reqs.clear()
@@ -927,8 +979,201 @@ class MainWindow(QMainWindow):
                 log.warning("could not write a correction record", exc_info=True)
         self._brush_base.clear()
 
+    # ------------------------------------------------------------------ before/after comparison of a correction
+    def _compare_prompts(self, oid: int, start: int, n: int, corrected: bool) -> dict:
+        """The object's prompts in [start, start + n) as offsets from ``start``. corrected=True: as they are now (drawn masks
+        win over clicks). corrected=False: as they were before the brush touched the start frame."""
+        out = {}
+        for k in range(start, start + n):
+            drawn = self.store.get_mask(oid, k)
+            if not corrected and k == start:
+                base = self._brush_base.get((oid, k))
+                drawn = base[0] if base is not None and base[1] == "drawn" else (None if base is not None else drawn)
+                if base is None and drawn is not None:
+                    drawn = None                       # a mask loaded from the file: "before" means without it
+            if drawn is not None:
+                out[k - start] = {"mask": drawn}
+                continue
+            pts = [p for p in self.store.points if p["obj_id"] == oid and p["frame_idx"] == k]
+            if pts and any(p["label"] == 1 for p in pts):
+                out[k - start] = {"points": [[p["x"], p["y"]] for p in pts], "labels": [p["label"] for p in pts]}
+        return out
+
+    @staticmethod
+    def _prompt_sig(prompts: dict) -> str:
+        items = [[off, mask_digest(pr["mask"])] if pr.get("mask") is not None else [off, pr["points"], pr["labels"]]
+                 for off, pr in sorted(prompts.items())]
+        return hashlib.sha256(json.dumps(items).encode()).hexdigest()[:16]
+
+    def start_compare(self) -> bool:
+        """Trial-track the selected object from the current frame and compare with what was there before."""
+        if self.info is None or self.job_running:
+            return False
+        oid, start = self.store.current, self.frame_idx
+        n = min(int(self.compare_frames.value()), self.info.nb_frames - start)
+        after_prompts = self._compare_prompts(oid, start, n, corrected=True)
+        if 0 not in after_prompts:
+            self.show_error("이 프레임에는 이 객체의 클릭이나 그린 마스크가 없습니다.\n고친 프레임(또는 클릭한 프레임)으로 이동한 뒤 비교를 시작하세요.")
+            return False
+        if not self.preview.is_on():
+            self.act_live.setChecked(True)             # the trial tracking runs in the mask-preview process
+            if not self.preview.is_on():
+                return False
+        self._end_compare()
+        before, source = None, "none"
+        jm = self._job_masks
+        if jm is None:
+            try:
+                work = self.last_settings.work_dir if self.last_settings else ""
+                jm = JobMasks(job_dir_for_video(work, self.info.path, self.info.fingerprint))
+            except (OSError, ValueError, KeyError):
+                jm = None
+        if jm is not None:
+            frames = [jm.frame(k) for k in range(start, start + n)]
+            if any(fr is not None for fr in frames):
+                before, source = [None if fr is None else fr["masks"].get(oid) for fr in frames], "last_run"
+        cmp = {"oid": oid, "start": start, "n": n, "sig": self._prompt_sig(after_prompts), "after": None, "before": before,
+               "before_source": source, "pending": {}, "ready": False, "stats": None}
+        if before is None:
+            before_prompts = self._compare_prompts(oid, start, n, corrected=False)
+            if 0 in before_prompts and self._prompt_sig(before_prompts) != cmp["sig"]:
+                cmp["pending"][self.preview.request_track(oid, start, n, before_prompts)] = "before"
+                cmp["before_source"] = "trial"
+        cmp["pending"][self.preview.request_track(oid, start, n, after_prompts)] = "after"
+        self._compare = cmp
+        self.statusBar().showMessage(f"비교: 객체 {oid}를 프레임 {start}부터 {n}프레임 시험 추적하는 중 ...")
+        self._refresh_compare_panel()
+        self._update_overlay()
+        return True
+
+    def _on_track_ready(self, rid: int, frame: int, masks: list):
+        cmp = self._compare
+        if cmp is None or rid not in cmp["pending"]:
+            return
+        cmp[cmp["pending"].pop(rid)] = masks
+        if cmp["pending"]:
+            return
+        shape = next((m.shape for m in cmp["after"] if m is not None), None)
+        stats = []
+        for i in range(len(cmp["after"])):
+            a = cmp["after"][i]
+            b = cmp["before"][i] if cmp["before"] is not None and i < len(cmp["before"]) else None
+            if a is not None and b is not None and b.shape != a.shape:
+                b = cv2.resize(b.astype(np.uint8), (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+                cmp["before"][i] = b
+            a_px, b_px = (0 if a is None else int(a.sum())), (0 if b is None else int(b.sum()))
+            if a is None or b is None:
+                union, inter = max(a_px, b_px), 0
+            else:
+                union, inter = int((a | b).sum()), int((a & b).sum())
+            stats.append({"after_px": a_px, "before_px": b_px, "iou": 1.0 if union == 0 else inter / union})
+        cmp.update(ready=True, stats=stats, shape=shape, n=len(cmp["after"]))
+        self.timeline_view.set_highlight((cmp["start"], cmp["start"] + cmp["n"]))
+        self.statusBar().showMessage("비교 준비 완료: 프레임을 넘기며 수정 전후를 확인한 뒤 '수정 유지' 또는 '수정 취소'를 고르세요.")
+        self._refresh_compare_panel()
+        self._update_overlay()
+
+    def _refresh_compare_panel(self):
+        cmp = self._compare
+        ready = cmp is not None and cmp["ready"]
+        for w in (self.compare_mode, self.compare_jump, self.compare_keep, self.compare_revert):
+            w.setEnabled(ready)
+        if cmp is None:
+            self.compare_info.setText("고친 프레임에서 비교를 시작하면, 그 뒤 프레임들이 어떻게 달라지는지 미리 볼 수 있습니다.")
+        elif not ready:
+            self.compare_info.setText(f"객체 {cmp['oid']}, 프레임 {cmp['start']}부터 {cmp['n']}프레임 시험 추적 중 ...")
+        else:
+            st = cmp["stats"]
+            src = {"last_run": "지난 실행의 마스크", "trial": "고치기 전 상태로 시험 추적한 결과", "none": "없음 (비교 대상 없이 수정 후만 표시)"}[cmp["before_source"]]
+            lost = sum(1 for x in st if x["after_px"] == 0)
+            text = (f"객체 {cmp['oid']}, 프레임 {cmp['start']}-{cmp['start'] + cmp['n'] - 1} ({cmp['n']}프레임).\n수정 전 기준: {src}.\n"
+                    f"평균 면적: 수정 후 {sum(x['after_px'] for x in st) // max(1, len(st))} px")
+            if cmp["before"] is not None:
+                changed = sum(1 for x in st if x["iou"] < 0.9)
+                text += (f", 수정 전 {sum(x['before_px'] for x in st) // max(1, len(st))} px.\n"
+                         f"달라진 프레임(겹침 90% 미만): {changed}개.")
+            else:
+                text += "."
+            if lost:
+                text += f"\n수정 후 마스크가 없는 프레임: {lost}개."
+            text += "\n시험 추적은 추정입니다. 실제 결과는 저장 후 다시 처리해야 확정됩니다."
+            self.compare_info.setText(text)
+
+    def _end_compare(self):
+        if self._compare is not None:
+            self._compare = None
+            self.timeline_view.set_highlight(None)
+            self._refresh_compare_panel()
+
+    def goto_biggest_change(self):
+        cmp = self._compare
+        if cmp is None or not cmp["ready"]:
+            return
+        st = cmp["stats"]
+        i = min(range(len(st)), key=lambda k: st[k]["iou"]) if cmp["before"] is not None else min(range(len(st)), key=lambda k: st[k]["after_px"])
+        self.goto(cmp["start"] + i)
+
+    def keep_correction(self):
+        if self._compare is not None:
+            self._end_compare()
+            self._update_overlay()
+            self.statusBar().showMessage("수정을 유지합니다. 포인트를 저장하고 다시 처리하면 영상에 반영됩니다.")
+
+    def revert_correction(self):
+        cmp = self._compare
+        if cmp is None:
+            return
+        key = (cmp["oid"], cmp["start"])
+        base = self._brush_base.get(key)
+        if self.store.get_mask(*key) is None:
+            self.statusBar().showMessage("이 프레임에는 되돌릴 그린 마스크가 없습니다 (클릭만 있는 프레임).")
+        elif base is None and not self.ask_confirm("이 프레임의 그린 마스크는 이전에 저장된 것입니다. 지울까요?"):
+            return
+        else:
+            self._brush_undo.append((key[0], key[1], self.store.get_mask(*key).copy()))
+            self.store.set_mask(key[0], key[1], base[0] if base is not None and base[1] == "drawn" else None)
+            self._brush_base.pop(key, None)             # back to where it started: no correction record for it
+            self.statusBar().showMessage(f"객체 {key[0]}, 프레임 {key[1]}의 수정을 취소했습니다.")
+        self._end_compare()
+        self._points_changed()
+
+    def _compare_overlay(self) -> Optional[dict]:
+        """The overlay of the comparison for the current frame, or None when the frame is outside the compared range."""
+        cmp = self._compare
+        if cmp is None:
+            return None
+        i = self.frame_idx - cmp["start"]
+        if not (0 <= i < cmp["n"]):
+            return None
+        if not cmp["ready"]:
+            return {"note": "비교: 시험 추적 중 ..."}
+        a = cmp["after"][i]
+        b = cmp["before"][i] if cmp["before"] is not None and i < len(cmp["before"]) else None
+        shape = cmp["shape"] or (self.info.height, self.info.width)
+        zero = np.zeros(shape, dtype=bool)
+        a = zero if a is None else a
+        has_before = cmp["before"] is not None
+        b = zero if b is None else b
+        mode = self.compare_mode.currentData() if has_before else "after"
+        col = object_color(cmp["oid"])
+        st = cmp["stats"][i]
+        head = f"[비교 {i + 1}/{cmp['n']}] "
+        if mode == "before":
+            imgs, note = [mask_image(b, col, 130)], head + f"수정 전: {st['before_px']} px"
+        elif mode == "after":
+            imgs = [mask_image(a, col, 130)]
+            note = head + f"수정 후: {st['after_px']} px" + ("" if has_before else "  (비교할 수정 전 마스크가 없습니다)")
+        else:
+            imgs = [mask_image(a & b, col, 90), mask_image(a & ~b, QColor("#35d07f"), 190), mask_image(b & ~a, QColor("#ff5050"), 190)]
+            note = head + f"초록 = 수정으로 늘어난 부분, 빨강 = 줄어든 부분.  수정 전 {st['before_px']} px → 수정 후 {st['after_px']} px"
+        return {"size": (shape[1], shape[0]), "masks": imgs, "note": note, "boxes": [], "regions": [], "full": False}
+
     def _update_overlay(self):
         """Decide what to draw over the current frame, then add the brush hint when the brush is on."""
+        cmp_overlay = self._compare_overlay()
+        if cmp_overlay is not None:
+            self.view.set_overlay(cmp_overlay)
+            return
         self._update_overlay_base()
         if self.info is not None and self.frame_idx >= 0 and self.act_brush.isChecked():
             ov = dict(self.view.overlay() or {})
@@ -996,6 +1241,12 @@ class MainWindow(QMainWindow):
             self._update_overlay()
 
     def _on_preview_failed(self, rid: int, reason: str):
+        if self._compare is not None and rid in self._compare["pending"]:
+            self._end_compare()
+            self.statusBar().showMessage("비교용 시험 추적에 실패했습니다: " + reason)
+            self.show_error("비교용 시험 추적에 실패했습니다:\n" + reason)
+            self._update_overlay()
+            return
         self._preview_reqs.pop(rid, None)
         self._preview_asked = None
         self.statusBar().showMessage("이 프레임의 마스크 미리보기에 실패했습니다: " + reason)
@@ -1071,6 +1322,7 @@ class MainWindow(QMainWindow):
         self._preview_reqs.clear()
         self._preview_asked, self._job_masks = None, None
         self._set_checked(self.act_brush, False)
+        self._end_compare()
         self.view.set_brush(False)
         self._brush_base.clear()
         self._brush_undo.clear()
@@ -1219,6 +1471,9 @@ class MainWindow(QMainWindow):
 
     def _points_changed(self):
         self.dirty = True
+        cmp = self._compare
+        if cmp is not None and self._prompt_sig(self._compare_prompts(cmp["oid"], cmp["start"], cmp["n"], corrected=True)) != cmp["sig"]:
+            self._end_compare()                        # the prompts were edited: the comparison no longer describes them
         self._refresh_stale_banner()
         self._refresh_objects()
         self._update_title()

@@ -67,6 +67,7 @@ class TimelineView(QWidget):
         self._cuts: List[Tuple[int, int]] = []                           # [start, end) ranges that will be cut out
         self._selection: Optional[Tuple[int, int]] = None                # [start, end) range being marked
         self._show_cuts = False
+        self._highlight: Optional[Tuple[int, int]] = None                # [start, end) range marked on the ruler and the strip
         self._update_height()
 
     # ---- data
@@ -75,6 +76,7 @@ class TimelineView(QWidget):
         self._thumbs = []
         self.set_run_data(None)
         self._flags = []
+        self._highlight = None
         self.update()
 
     def set_frame(self, idx: int):
@@ -105,6 +107,11 @@ class TimelineView(QWidget):
         """Ranges to be removed (red) and the range currently being marked (blue); used by the cutting window."""
         self._cuts, self._selection, self._show_cuts = list(cuts), selection, True
         self._update_height()
+        self.update()
+
+    def set_highlight(self, rng: Optional[Tuple[int, int]]):
+        """Mark a frame range [start, end) (the frames of a before/after comparison), or None."""
+        self._highlight = rng
         self.update()
 
     def set_flags(self, flags: List[Tuple[int, int, str]]):
@@ -228,6 +235,13 @@ class TimelineView(QWidget):
                 if self._selection is not None:
                     self._bar(p, row, self._selection[0], self._selection[1], QColor(76, 141, 255, 220))
             y += ROW_H + ROW_GAP
+        if self._highlight is not None:                                                       # compared range: a band over everything
+            x0, x1 = self.x_of(self._highlight[0]), self.x_of(max(self._highlight[0], self._highlight[1] - 1))
+            band = QRectF(x0, 0, max(3.0, x1 - x0), self.height())
+            p.fillRect(band, QColor(76, 141, 255, 55))
+            p.setPen(QPen(QColor(76, 141, 255), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(band)
         # playhead
         x = self.x_of(self._frame)
         p.setPen(QPen(text, 2))
