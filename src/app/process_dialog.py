@@ -104,6 +104,25 @@ class ProcessDialog(QDialog):
         self.thr.setSingleStep(0.05)
         self.thr.setValue(st.det_threshold)
         form.addRow("  threshold", self.thr)
+        self.tiles = QSpinBox()
+        self.tiles.setRange(1, 4)
+        self.tiles.setValue(st.nudenet_tiles)
+        self.tiles.setToolTip("1 = whole frame only. N > 1 also scans an N x N grid of overlapping crops, so small regions get more "
+                              "resolution. Slower: about 1 + N x N detector runs per frame.")
+        form.addRow("  tiles (N x N extra crops, 1 = off)", self.tiles)
+        self.nmodel = QLineEdit(st.nudenet_model)
+        self.nmodel.setPlaceholderText("bundled 320 px model")
+        self.nmodel.setToolTip("Leave empty for the model that ships with NudeNet. To use a larger one (e.g. 640m), download its "
+                               ".onnx into models/ and select it here, then set its input size below.")
+        form.addRow("  model file (.onnx, optional)", path_row(self.nmodel, self._browse_nmodel))
+        self.nres = QComboBox()
+        for r in (320, 640):
+            self.nres.addItem(str(r), r)
+        self.nres.setCurrentText(str(st.nudenet_res) if st.nudenet_model else "320")
+        self.nres.setToolTip("Input size the selected model was exported for. Ignored (320) when no model file is selected.")
+        form.addRow("  model input size (px)", self.nres)
+        self.nmodel.textChanged.connect(lambda t: self.nres.setEnabled(bool(t.strip())))
+        self.nres.setEnabled(bool(st.nudenet_model))
 
         self.fc = QCheckBox("Fail-closed: cover uncertain frames conservatively")
         self.fc.setChecked(st.fail_closed)
@@ -219,6 +238,11 @@ class ProcessDialog(QDialog):
         if p:
             self.ckpt.setText(p)
 
+    def _browse_nmodel(self):
+        p, _ = QFileDialog.getOpenFileName(self, "NudeNet model", os.path.join(PROJECT_ROOT, "models"), "ONNX model (*.onnx)")
+        if p:
+            self.nmodel.setText(p)
+
     def _browse_out(self):
         p, _ = QFileDialog.getSaveFileName(self, "Output file", self.out.text(), "MP4 (*.mp4)")
         if p:
@@ -228,7 +252,8 @@ class ProcessDialog(QDialog):
         return ProcessSettings(
             sam2_checkpoint=self.ckpt.text().strip(), output=self.out.text().strip(), chunk_size=self.chunk.value(),
             analysis_width=int(self.aw.currentData()), use_nudenet=self.nude.isChecked(), detect_every=self.every.value(),
-            det_threshold=round(self.thr.value(), 3), fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
+            det_threshold=round(self.thr.value(), 3), nudenet_tiles=self.tiles.value(), nudenet_model=self.nmodel.text().strip(),
+            nudenet_res=int(self.nres.currentData()) if self.nmodel.text().strip() else 320, fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
             block=self.block.value(), block_auto=self.block_auto.isChecked(), mosaic_style=self.style.currentText(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
             max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentText(),
             keep_chunks=self.keep.isChecked())
@@ -260,6 +285,13 @@ def validate_settings(st: ProcessSettings, video_path: str, needs_sam2: bool) ->
             probs.append(f"Cannot create the output folder: {e}")
     if not needs_sam2 and not st.use_nudenet:
         probs.append("Nothing to do: no targets were clicked and NudeNet is off.")
+    if st.use_nudenet:
+        if st.nudenet_model and not os.path.isfile(st.nudenet_model):
+            probs.append("NudeNet model file not found. Clear the field to use the bundled model, or select an existing .onnx file.")
+        if not st.nudenet_model and st.nudenet_res != 320:
+            probs.append("The bundled NudeNet model only works at 320 px. Select a model file for another input size.")
+        if not (1 <= st.nudenet_tiles <= 4):
+            probs.append("NudeNet tiles must be 1-4.")
     if not (10 <= st.chunk_size <= 1000):
         probs.append("Chunk size must be 10-1000 frames.")
     return probs

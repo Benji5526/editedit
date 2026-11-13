@@ -62,7 +62,8 @@ python app.py [video]        # or double-click run_app.bat (no console window)
 Clicks are converted from widget to full-resolution frame coordinates with letterbox handling (clicks on the black bars are ignored, not clamped);
 the preview is decoded by FFmpeg (same decoder, rotation and frame numbering as the processing pipeline) and never blocks the UI thread.
 
-**Stage 3 (processing):** `Process > Start processing... (Ctrl+R)` opens the settings (SAM 2 checkpoint, output, chunk size, analysis width, NudeNet,
+**Stage 3 (processing):** `Process > Start processing... (Ctrl+R)` opens the settings (SAM 2 checkpoint, output, chunk size, analysis width, NudeNet
+(threshold, tiles, optional larger model file such as 640m with its input size),
 fail-closed, mosaic block/padding, audio, encoder, test run on the first N frames, resume). The job runs in a **separate worker process**
 (`censor_video.py --progress-json`), so the UI stays responsive and a crash/out-of-memory in the worker cannot take the app down. The panel shows the stage
 (reading+detecting / tracking / mosaic+encoding), chunk n/N, overall progress, elapsed and estimated remaining time, per-chunk memory (RSS, GPU peak) and the log.

@@ -49,6 +49,9 @@ class ProcessSettings:
     use_nudenet: bool = True
     detect_every: int = 1
     det_threshold: float = 0.25
+    nudenet_tiles: int = 1      # N x N grid of overlapping crops scanned in addition to the whole frame (finds smaller regions, slower)
+    nudenet_model: str = ""     # empty = the 320 px model bundled with NudeNet; otherwise the path of another NudeNet onnx (e.g. 640m)
+    nudenet_res: int = 320      # input resolution of nudenet_model
     fail_closed: bool = True
     fail_closed_mode: str = "bbox"
     block: int = 32
@@ -76,6 +79,10 @@ def build_args(video: str, points_path: Optional[str], st: ProcessSettings, canc
         a += ["--points", points_path, "--sam2-checkpoint", st.sam2_checkpoint]
     if not st.use_nudenet:
         a.append("--no-nudenet")
+    else:
+        a += ["--nudenet-tiles", str(st.nudenet_tiles)]
+        if st.nudenet_model:
+            a += ["--nudenet-model", st.nudenet_model, "--nudenet-res", str(st.nudenet_res)]
     if st.fail_closed:
         a += ["--fail-closed", "--fail-closed-mode", st.fail_closed_mode]
     if not st.keep_audio:

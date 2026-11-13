@@ -65,6 +65,30 @@ def test_build_args_defaults_and_options():
     assert "--points" not in b and "--sam2-checkpoint" not in b and "--fail-closed" not in b and "--no-nudenet" not in b
 
 
+def test_build_args_nudenet_tiles_and_model():
+    a = build_args("v.mp4", None, ProcessSettings(output="o.mp4"), "c.flag")
+    assert a[a.index("--nudenet-tiles") + 1] == "1" and "--nudenet-model" not in a and "--nudenet-res" not in a
+    st = ProcessSettings(output="o.mp4", nudenet_tiles=2, nudenet_model="models/640m.onnx", nudenet_res=640)
+    b = build_args("v.mp4", None, st, "c.flag")
+    assert b[b.index("--nudenet-tiles") + 1] == "2"
+    assert b[b.index("--nudenet-model") + 1] == "models/640m.onnx" and b[b.index("--nudenet-res") + 1] == "640"
+    st.use_nudenet = False                                                    # detector off: none of its options are passed
+    c = build_args("v.mp4", None, st, "c.flag")
+    assert "--no-nudenet" in c and not any(x.startswith("--nudenet-") for x in c)
+
+
+def test_validate_settings_nudenet_model(tmp_path):
+    v, out = str(tmp_path / "v.mp4"), str(tmp_path / "o.mp4")
+    model = tmp_path / "640m.onnx"
+    assert any("NudeNet model file not found" in p for p in validate_settings(ProcessSettings(output=out, nudenet_model=str(model)), v, False))
+    model.write_bytes(b"x")
+    assert validate_settings(ProcessSettings(output=out, nudenet_model=str(model), nudenet_res=640, nudenet_tiles=2), v, False) == []
+    assert any("320 px" in p for p in validate_settings(ProcessSettings(output=out, nudenet_res=640), v, False))
+    assert any("tiles" in p for p in validate_settings(ProcessSettings(output=out, nudenet_tiles=9), v, False))
+    off = ProcessSettings(output=out, use_nudenet=False, nudenet_model=str(tmp_path / "gone.onnx"))
+    assert not any("NudeNet model" in p for p in validate_settings(off, v, True) if "checkpoint" not in p)
+
+
 def test_validate_settings(tmp_path):
     v = str(tmp_path / "v.mp4")
     ok = ProcessSettings(sam2_checkpoint=str(tmp_path / "missing.pt"), output=str(tmp_path / "sub" / "o.mp4"))
@@ -216,3 +240,19 @@ def test_runner_reports_missing_executable(qapp, tmp_path):
     r.start([], str(tmp_path / "c.flag"), command=[str(tmp_path / "no_such_program.exe")])
     assert pump(lambda: bool(done), 10)
     assert done[0]["status"] == "failed" and "could not start" in done[0]["reason"]
+
+
+def test_process_dialog_nudenet_options_round_trip(qapp, tmp_path):
+    from src.app.process_dialog import ProcessDialog
+    model = tmp_path / "640m.onnx"
+    model.write_bytes(b"x")
+    d = ProcessDialog(None, str(tmp_path / "v.mp4"), False, 100,
+                      ProcessSettings(nudenet_tiles=2, nudenet_model=str(model), nudenet_res=640))
+    st = d.settings()
+    assert (st.nudenet_tiles, st.nudenet_model, st.nudenet_res) == (2, str(model), 640) and d.nres.isEnabled()
+    d.nmodel.setText("")                                                     # back to the bundled model: its size is always 320
+    st = d.settings()
+    assert st.nudenet_model == "" and st.nudenet_res == 320 and not d.nres.isEnabled()
+    d2 = ProcessDialog(None, str(tmp_path / "v.mp4"), False, 100, ProcessSettings())
+    st2 = d2.settings()
+    assert (st2.nudenet_tiles, st2.nudenet_model, st2.nudenet_res) == (1, "", 320)
