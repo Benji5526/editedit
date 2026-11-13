@@ -14,7 +14,8 @@ import subprocess
 import tempfile
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from .video_io import CREATE_NO_WINDOW, VideoError, VideoInfo, color_tags, count_packets, find_tool, frame_exact_timescale, probe_video
+from .video_io import (CREATE_NO_WINDOW, VideoError, VideoInfo, color_tags, count_packets, encoder_args, find_tool, frame_exact_timescale,
+                       probe_video, resolve_encoder)
 
 Range = Tuple[int, int]          # [start, end) in frames
 MAX_PIECES = 200                 # keeps the ffmpeg command line well below the Windows limit
@@ -99,10 +100,7 @@ def export_cut(src_path: str, remove: Sequence[Range], out_path: str, encoder: s
     cmd = [find_tool("ffmpeg"), "-v", "error", "-nostdin", "-y", "-i", src_path, "-filter_complex", graph, "-map", vlabel]
     if alabel:
         cmd += ["-map", alabel, "-c:a", "aac", "-b:a", "256k"]
-    if encoder == "h264_nvenc":
-        cmd += ["-c:v", "h264_nvenc", "-cq", str(crf), "-preset", "p5", "-rc", "vbr", "-b:v", "0"]
-    else:
-        cmd += ["-c:v", encoder, "-crf", str(crf), "-preset", preset]
+    cmd += encoder_args(resolve_encoder(encoder), crf, preset)
     cmd += ["-pix_fmt", "yuv420p", "-colorspace", cs_tag, "-color_primaries", "bt709" if cs_tag == "bt709" else cs_tag, "-color_trc", trc_tag,
             "-fps_mode", "passthrough", "-video_track_timescale", str(frame_exact_timescale(info.fps_rational)),
             "-progress", "pipe:1", "-nostats", "-f", "mp4", partial]

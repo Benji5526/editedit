@@ -6,8 +6,9 @@ NudeNet 3.4.x facts this module is written against (verified against the install
   * ``NudeDetector.detect`` hard-codes a 0.2 score floor and 0.25 NMS score threshold, so a lower
     user threshold would have no effect through that API. This module therefore reuses the loaded
     ONNX session but performs its own post-processing with a configurable threshold.
-  * the package installs plain ``onnxruntime`` (CPU). Detection runs on CPU unless the user installs
-    ``onnxruntime-gpu`` and passes providers.
+  * the package depends on plain ``onnxruntime`` (CPU). This project installs ``onnxruntime-gpu`` instead (the build for
+    the CUDA major version PyTorch ships, see requirements.txt) and chooses the device itself (``make_session``): "auto"
+    uses the GPU when it works and says so when it does not, "cuda" fails instead of falling back.
 Lowering the threshold increases recall AND false positives; it does not make misses impossible.
 NudeNet cannot detect arbitrary objects - user-picked targets are SAM 2's job.
 """
@@ -57,11 +58,51 @@ def iou(a: Sequence[float], b: Sequence[float]) -> float:
     return inter / ua if ua > 0 else 0.0
 
 
+DEVICES = ("auto", "cuda", "cpu")
+
+
+def make_session(path: str, device: str = "auto", providers=None):
+    """ONNX Runtime session for ``path`` on the requested device. Returns (session, provider actually used, note).
+
+    device: "cpu"; "cuda" (fails when the GPU cannot be used - never a silent fallback); "auto" (GPU when it works, else CPU with
+    a note saying why). The session is always created with an explicit provider list: with onnxruntime-gpu installed, the
+    library's default would try TensorRT first.
+    The CUDA build needs the CUDA 12 / cuDNN 9 libraries in the process; PyTorch ships them, and ``preload_dlls`` loads them from
+    there when PyTorch has not been imported yet (a NudeNet-only job)."""
+    import onnxruntime
+    if device not in DEVICES:
+        raise ValueError(f"unknown detector device {device!r}; choose one of {DEVICES}")
+    if providers:                                              # explicit list (tests, special setups): used as given
+        sess = onnxruntime.InferenceSession(path, providers=list(providers))
+        return sess, sess.get_providers()[0], ""
+    note = ""
+    if device in ("auto", "cuda"):
+        if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
+            note = "this onnxruntime build has no CUDA provider (install onnxruntime-gpu built for the CUDA version PyTorch uses)"
+        else:
+            try:
+                if hasattr(onnxruntime, "preload_dlls"):
+                    onnxruntime.preload_dlls()
+            except Exception as e:  # noqa: BLE001
+                note = f"could not preload the CUDA libraries ({type(e).__name__}: {e})"
+            try:
+                sess = onnxruntime.InferenceSession(path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                if sess.get_providers()[0] == "CUDAExecutionProvider":
+                    return sess, "CUDAExecutionProvider", ""
+                note = note or "the CUDA provider could not be initialised (CUDA 12 / cuDNN 9 libraries not found?)"
+            except Exception as e:  # noqa: BLE001
+                note = f"the CUDA provider failed ({type(e).__name__}: {e})"
+        if device == "cuda":
+            raise RuntimeError("NudeNet was asked to run on the GPU but cannot: " + note + ". Use --nudenet-device cpu or auto.")
+    sess = onnxruntime.InferenceSession(path, providers=["CPUExecutionProvider"])
+    return sess, "CPUExecutionProvider", note
+
+
 class NudenetDetector:
     def __init__(self, threshold: float = 0.25, nms_iou: float = 0.45, classes: Optional[Sequence[str]] = None,
-                 model_path: Optional[str] = None, resolution: int = 320, tiles: int = 1, providers=None):
-        import onnxruntime
-        from nudenet import NudeDetector
+                 model_path: Optional[str] = None, resolution: int = 320, tiles: int = 1, providers=None, device: str = "cpu"):
+        import os
+        import nudenet
 
         labels = supported_labels()
         classes = list(classes) if classes else list(DEFAULT_CLASSES)
@@ -72,14 +113,12 @@ class NudenetDetector:
         self.class_ids = np.array([labels.index(c) for c in classes])
         self.classes = classes
         self.threshold, self.nms_iou, self.resolution, self.tiles = float(threshold), float(nms_iou), int(resolution), int(tiles)
-        det = NudeDetector(model_path=model_path, inference_resolution=resolution)
-        if providers:  # NudeDetector ignores providers; rebuild session when asked
-            import os
-            import nudenet
-            path = model_path or os.path.join(os.path.dirname(nudenet.__file__), "320n.onnx")
-            det.onnx_session = onnxruntime.InferenceSession(path, providers=providers)
-        self.session = det.onnx_session
-        self.input_name = det.input_name
+        path = model_path or os.path.join(os.path.dirname(nudenet.__file__), "320n.onnx")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"NudeNet model not found: {path}")
+        # the library's own NudeDetector is not used: it creates its session with every available provider and ignores a choice
+        self.session, self.provider, self.device_note = make_session(path, device, providers)
+        self.input_name = self.session.get_inputs()[0].name
         out_dim = self.session.get_outputs()[0].shape
         if len(out_dim) != 3 or out_dim[1] != 4 + len(labels):
             raise RuntimeError(f"unexpected NudeNet output shape {out_dim} for {len(labels)} labels")

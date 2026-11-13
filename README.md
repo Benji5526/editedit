@@ -137,6 +137,17 @@ fingerprint). Nothing reads these records yet; they are the raw material for lat
 machine. Limits: a drawn mask applies to its own frame only - the frames after it are whatever the tracker makes of it, and only a new run shows that; there is no "apply to the
 neighbouring frames and compare before/after" step yet; masks are edited at preview resolution (at most 1280 px wide).
 
+*Before/after comparison of a correction (`수정 전후 비교`, `C`).* On a frame where the selected object has a drawn mask or clicks, this tracks that object over the next frames
+(5-300, default 60) in the mask-preview process - a **trial tracking**, like one processing chunk that starts at this frame - and shows it against what was there before:
+the masks of the last kept run when there is one, else a second trial tracking from the prompts as they were before the brush touched the frame, else nothing. While stepping through
+the range the preview shows the difference (green = added by the correction, red = removed, object colour = unchanged), or only "before" / only "after"; the panel reports the mean
+areas and how many frames changed (overlap below 90 %), a button jumps to the frame that changed most, and the range is marked on the timeline. Then **keep** the correction or
+**revert** it (the drawn mask goes back to what it was before the brush touched it; a reverted correction leaves no record; `Ctrl+Z` undoes the revert). Nothing is applied to the
+video or to other frames by the comparison itself; editing the prompts ends it. The trial tracking is an estimate: a real run reaches these frames with the memory of the frames
+before them and has its chunk boundaries elsewhere. With the real checkpoint `tests/test_compare.py` checks that, when the corrected frame is the object's first prompt, the trial
+equals the job's masks for the rest of that chunk (IoU > 0.95) and still follows the same object past the job's chunk boundary (IoU > 0.8). The final result is only fixed by saving
+and re-processing.
+
 *Per-object mosaic settings.* In the Targets panel, "Mosaic for the selected object" gives a clicked object its own **style** (pixelate / blur / solid), **strength** (px) and
 **padding** (px); each can stay on "job setting" (the value from the processing dialog). The object list shows what is set. The settings are saved in the points file: a file with
 any of them is written as version 2 with an `object_styles` block (`{"2": {"style": "solid", "block": 48, "pad_px": 30}}`); a file without stays version 1, and both versions are read.
@@ -248,7 +259,7 @@ Without the flag the same events are logged but the frames pass through as compu
   In the app's settings dialog the strength has an **auto** mode (about 1/60 of the video's longer side: 1920 -> 32, 3840 -> 64; a rule of thumb), a slider, and a **preview** on a real frame of the video
   (the same `apply_mosaic` code as the worker, on an ellipse in the middle). The worker still receives one number (`--block`).
 * Mosaic area = union of (all objects' masks over ±`--temporal-radius` frames, grown by `--mask-pad-px`) ∪ (NudeNet boxes grown by `--det-expand`/`--det-pad-px`, with short gaps bridged and boxes held `--det-hold` frames) ∪ fail-closed regions. A union cannot lose one of its members. The pixel grid is anchored to the image so blocks do not shimmer as masks move.
-* NudeNet: model output is post-processed here with a configurable `--det-threshold` (the library's own `detect()` hard-codes a 0.2/0.25 floor). Lowering the threshold gives more detections and more false positives, not guaranteed recall. `--nudenet-tiles 2` additionally scans overlapping crops (small regions get more resolution; slower). It runs on CPU unless you install `onnxruntime-gpu` yourself.
+* NudeNet: model output is post-processed here with a configurable `--det-threshold` (the library's own `detect()` hard-codes a 0.2/0.25 floor). Lowering the threshold gives more detections and more false positives, not guaranteed recall. `--nudenet-tiles 2` additionally scans overlapping crops (small regions get more resolution; slower). It runs on the GPU when that works (see "What runs on the GPU").
 
 ### Chunk boundaries and SAM 2 state (important)
 SAM 2's internal memory bank cannot be carried across separately initialised chunks. Each chunk after the first therefore starts with one **overlap frame**
@@ -277,6 +288,28 @@ Hardware: RTX 4070 Ti 12 GB, 16 cores / 24 threads, 32 GB RAM, Windows 11. Foota
 At ~10 fps a 40 minute 4K60 video (144,000 frames) takes roughly **4 hours** with this configuration; that is an extrapolation, not a measurement of a 40 minute run. A 3 minute run is in the
 table below. Per-stage times of every chunk are in the `chunk_done` events, `temp/<job>/job.json` and the log (`tools/leak_probe.py` isolates memory growth per component).
 `--analysis-width 1280` is a little faster (about 8%) but gives NudeNet and the tracker fewer pixels; SAM 2 itself works at 1024 px.
+
+**What runs on the GPU (measured 2026-11-13, `python tools/gpu_bench.py` and a 360-frame 3840x2160 60 fps synthetic clip through the real pipeline, SAM 2.1 small,
+120-frame chunks).** SAM 2 always ran on the GPU. Three more places were examined:
+
+| | CPU | GPU | decision |
+|---|---|---|---|
+| NudeNet, bundled 320 px model (per frame at 1920 px, incl. pre/post-processing) | 8.0 ms | 6.7 ms | GPU when available (`--nudenet-device auto`, the default) |
+| NudeNet, 640m model | 87 ms | 13 ms | same; the larger model is only practical on the GPU |
+| encoding one 4K frame | 65 ms (`libx264` medium) | 16 ms (`h264_nvenc`) | the app's default encoder is `auto` = `h264_nvenc` when it works |
+| decoding (`-hwaccel auto`) | 25.7 ms full size, 10.0 ms scaled | 25.2 ms, 14.0 ms | **not used**: no gain, and the full-size frames were not identical to software decoding |
+
+Whole pipeline, steady state: `libx264` + NudeNet on the CPU 8.6 fps; `h264_nvenc` + NudeNet on the GPU 12.1 fps; with the 640m model 5.6 fps on the CPU against 12.3 fps
+on the GPU. After that the time per 120-frame chunk is about 7 s SAM 2 (GPU bound), 1.5 s reading, 1-2 s detection and 10 s rendering, of which most is reading the 4K frames
+and applying the mosaic on the CPU.
+*NudeNet device.* `onnxruntime-gpu` 1.26.0 (the last build for CUDA 12, matching the PyTorch wheel) replaces the CPU-only `onnxruntime`; it uses the CUDA libraries inside the
+PyTorch install. `auto` uses the GPU when it works and otherwise the CPU, and then the log and the processing panel say why; `cuda` fails instead of falling back. Which device
+ran the detector is recorded with the job but is not part of the settings hash (CPU and GPU give the same detections up to floating-point noise, checked in
+`tests/test_gpu_options.py`).
+*`h264_nvenc` quality.* The arguments used before (`-rc vbr -cq N -b:v 0`) did **not** work as a quality setting with this ffmpeg: the output was the same for every N and clearly
+worse than `libx264` (SSIM 0.62 against 0.77 on a noisy 4K clip). `h264_nvenc` now runs in constant-QP mode at CRF + 3, which matched `libx264 -crf 16 -preset medium` on that clip
+(SSIM 0.76-0.78 at 270-340 MiB against 0.77 at 294 MiB) at about a quarter of the time. Segments made with the old arguments are re-rendered on resume. These numbers are from one
+noisy synthetic clip; real footage was not measured.
 
 **Memory.** Resident memory is bounded: it rises in steps to a high-water mark and then stays flat (80 identical SAM 2 chunks: one +0.5 GB step, then flat). It does not grow with the video
 length. Rule of thumb for the tracker's input: about 12.6 MB per frame of (chunk size + up to `--stale-prefix-frames` re-run frames) on top of ~1.8 GB base, e.g. 120+90 frames = ~2.6 GB.
@@ -391,4 +424,4 @@ install from the official repository (`pip install git+https://github.com/facebo
 * Detection/tracking run on downscaled frames (`--analysis-width`); very small targets may be lost.
 * Audio is stream-copied and verified bit-identical to the source (unless AAC re-encoding was needed); A/V sync is checked through durations and the untouched audio timeline, not by listening. A source whose audio starts at a different time than its video is not corrected.
 * `--resume` relies on frame-exact FFmpeg seeking; it checks one frame fingerprint at the resume point and refuses if it differs.
-* Speed: about 10 fps for 4K60 with SAM 2 + per-frame NudeNet on this PC (see "Long runs"); the source is decoded twice (analysis and render), frames take a JPEG round trip into SAM 2, NudeNet runs on the CPU. A 40 minute video has not been run end to end.
+* Speed: about 10 fps for 4K60 with SAM 2 + per-frame NudeNet on this PC (see "Long runs"); the source is decoded twice (analysis and render), frames take a JPEG round trip into SAM 2, a 40 minute video has not been run end to end.

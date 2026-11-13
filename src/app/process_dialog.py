@@ -35,9 +35,12 @@ def load_last_settings() -> ProcessSettings:
     st = ProcessSettings()
     try:
         with open(LAST_SETTINGS_PATH, encoding="utf-8") as f:
-            for k, v in json.load(f).items():
-                if hasattr(st, k) and k not in ("output", "resume", "max_frames"):
+            saved = json.load(f)
+            for k, v in saved.items():
+                if hasattr(st, k) and k not in ("output", "resume", "max_frames", "settings_rev"):
                     setattr(st, k, v)
+            if (saved.get("settings_rev") or 1) < 2:           # saved before the GPU options existed: take the new default once
+                st.encoder = "auto"
     except (OSError, ValueError):
         pass
     return st
@@ -123,6 +126,13 @@ class ProcessDialog(QDialog):
         form.addRow("  모델 입력 크기 (px)", self.nres)
         self.nmodel.textChanged.connect(lambda t: self.nres.setEnabled(bool(t.strip())))
         self.nres.setEnabled(bool(st.nudenet_model))
+        self.ndev = QComboBox()
+        for text, val in (("자동 (GPU가 되면 GPU, 아니면 CPU)", "auto"), ("GPU만 (안 되면 시작하지 않음)", "cuda"), ("CPU", "cpu")):
+            self.ndev.addItem(text, val)
+        self.ndev.setCurrentIndex(max(0, self.ndev.findData(st.nudenet_device)))
+        self.ndev.setToolTip("NudeNet 탐지를 어디서 실행할지 정합니다. 큰 모델(640m)과 타일은 GPU에서 훨씬 빠릅니다. "
+                             "자동일 때 GPU를 못 쓰면 처리 로그에 이유가 남습니다.")
+        form.addRow("  탐지 실행 장치", self.ndev)
 
         self.fc = QCheckBox("안전 모드(fail-closed): 불확실한 프레임은 넓게 가리기")
         self.fc.setChecked(st.fail_closed)
@@ -177,7 +187,10 @@ class ProcessDialog(QDialog):
         self.enc.addItem("libx264")
         if nvenc_available():
             self.enc.addItem("h264_nvenc")
-        self.enc.setCurrentText(st.encoder if self.enc.findText(st.encoder) >= 0 else "libx264")
+        self.enc.insertItem(0, "auto")
+        self.enc.setCurrentText(st.encoder if self.enc.findText(st.encoder) >= 0 else "auto")
+        self.enc.setToolTip("auto = GPU 인코더(h264_nvenc)가 이 PC에서 동작하면 GPU, 아니면 CPU(libx264). "
+                            "GPU 인코더는 4K에서 약 4배 빠르고, 화질은 libx264와 같게 맞춰져 있습니다.")
         form.addRow("인코더", self.enc)
         self.test_n = QSpinBox()
         self.test_n.setRange(0, max(1, n_frames))
@@ -256,7 +269,8 @@ class ProcessDialog(QDialog):
             sam2_checkpoint=self.ckpt.text().strip(), output=self.out.text().strip(), chunk_size=self.chunk.value(),
             analysis_width=int(self.aw.currentData()), use_nudenet=self.nude.isChecked(), detect_every=self.every.value(),
             det_threshold=round(self.thr.value(), 3), nudenet_tiles=self.tiles.value(), nudenet_model=self.nmodel.text().strip(),
-            nudenet_res=int(self.nres.currentData()) if self.nmodel.text().strip() else 320, fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
+            nudenet_res=int(self.nres.currentData()) if self.nmodel.text().strip() else 320, nudenet_device=self.ndev.currentData(),
+            fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentText(),
             block=self.block.value(), block_auto=self.block_auto.isChecked(), mosaic_style=self.style.currentText(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
             max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentText(),
             keep_chunks=self.keep.isChecked())

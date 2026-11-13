@@ -125,7 +125,7 @@ class Config:
 
 
 NON_HASHED = {"resume", "deep_verify", "work_dir", "log_dir", "output", "input", "points", "skip_disk_check", "faststart"}
-NON_HASHED_EXTRA = {"keep_temp"}
+NON_HASHED_EXTRA = {"keep_temp", "nudenet_provider"}
 # Options that are only read by the render stage (mosaic + encoding). They do not change what the tracker, the detector or the QC
 # heuristics produce, so a job whose analysis results are cached (masks_NNNNN.npz) can be re-rendered with other values without
 # running SAM 2 or NudeNet again. Everything else is part of config_hash.
@@ -150,6 +150,8 @@ def render_hash(cfg: Config, object_styles: Optional[ObjectStyles] = None) -> st
     d = {k: v for k, v in asdict(cfg).items() if k in RENDER_ONLY}
     if object_styles:
         d["object_styles"] = {str(k): object_styles[k] for k in sorted(object_styles)}
+    if cfg.encoder == "h264_nvenc":
+        d["nvenc_args"] = 2                # constant-QP arguments (see video_io.encoder_args); older nvenc segments are re-rendered
     d["code"] = CODE_VERSION
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:24]
 

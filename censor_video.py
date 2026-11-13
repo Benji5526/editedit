@@ -60,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--det-hold", type=int, default=3, help="keep a box N frames after the last detection")
     g.add_argument("--nudenet-model", help="path to a different NudeNet onnx (e.g. 640m)")
     g.add_argument("--nudenet-res", type=int, default=320, help="inference resolution of that model")
+    g.add_argument("--nudenet-device", choices=["auto", "cuda", "cpu"], default="auto",
+                   help="where NudeNet runs: auto = GPU when it works, else CPU (the log says which and why); cuda = GPU or fail; cpu")
     g.add_argument("--nudenet-tiles", type=int, default=1, help="also scan a NxN grid of crops (slower, finds smaller regions)")
     g = p.add_argument_group("mosaic")
     g.add_argument("--block", type=int, default=32, help="mosaic strength in full-res pixels: block size (pixelate) or 2 x sigma (blur)")
@@ -74,7 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--fail-closed-expand", type=float, default=1.0, help="bbox growth per side (fraction of size)")
     g.add_argument("--fail-closed-max-frames", type=int, default=180, help="max frames of conservative mosaic per loss episode")
     g = p.add_argument_group("output")
-    g.add_argument("--encoder", default="libx264", choices=["libx264", "h264_nvenc"])
+    g.add_argument("--encoder", default="libx264", choices=["libx264", "h264_nvenc", "auto"],
+                   help="auto = h264_nvenc (GPU) when it works on this machine, else libx264. With h264_nvenc, --crf N is encoded as "
+                        "constant QP N+3 (measured to match libx264's quality); --preset is ignored")
     g.add_argument("--crf", type=int, default=16)
     g.add_argument("--preset", default="medium")
     g.add_argument("--no-audio", action="store_true")
@@ -112,6 +116,10 @@ def main(argv=None) -> int:
         parser.error("nothing to do: give --points and/or leave NudeNet enabled")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if a.encoder == "auto":
+        from src.video_io import resolve_encoder
+        a.encoder = resolve_encoder("auto")          # resolved before the settings are hashed: the job records the real encoder
+        logging.info("encoder: auto -> %s", a.encoder)
     cfg = Config(
         input=a.input, output=a.output or "", points=a.points, work_dir=a.work_dir, log_dir=a.log_dir,
         chunk_size=a.chunk_size, analysis_width=a.analysis_width, max_frames=a.max_frames,
@@ -159,9 +167,13 @@ def main(argv=None) -> int:
         if not a.no_nudenet:
             from src.detection import NudenetDetector, nudenet_version
             detector = NudenetDetector(a.det_threshold, classes=a.det_classes, model_path=a.nudenet_model,
-                                       resolution=a.nudenet_res, tiles=a.nudenet_tiles)
-            logging.info("NudeNet %s classes=%s threshold=%.2f (CPU onnxruntime unless configured otherwise)",
-                         nudenet_version(), detector.classes, a.det_threshold)
+                                       resolution=a.nudenet_res, tiles=a.nudenet_tiles, device=a.nudenet_device)
+            cfg.extra["nudenet_provider"] = detector.provider          # recorded with the job, not part of the settings hash
+            logging.info("NudeNet %s classes=%s threshold=%.2f running on %s", nudenet_version(), detector.classes, a.det_threshold,
+                         "the GPU (CUDA)" if detector.provider == "CUDAExecutionProvider" else "the CPU")
+            if detector.device_note:
+                logging.warning("NudeNet is not on the GPU: %s", detector.device_note)
+                emit({"event": "warning", "text": "NudeNet runs on the CPU: " + detector.device_note})
     except Exception as e:  # noqa: BLE001
         logging.error("model setup failed: %s", e)
         emit({"event": "finished", "exit_code": 1, "status": "failed", "reason": f"model setup failed: {e}"})

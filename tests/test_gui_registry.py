@@ -27,7 +27,8 @@ def finish(win, timeout=120):
 
 
 def test_cancelled_job_is_offered_for_resume_and_listed(win, tmp_path):
-    open_clip(win)
+    win.last_settings = settings_for(tmp_path)        # look at this test's own registry, not the project's logs/ (every run of the
+    open_clip(win)                                    # suite uses the same synthetic clip, so an aborted run there would be "found")
     assert win.resumable_job is None and not win.act_resume_job.isEnabled()
     st = settings_for(tmp_path)
     assert win.start_processing(st)

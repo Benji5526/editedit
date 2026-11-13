@@ -52,6 +52,7 @@ class ProcessSettings:
     nudenet_tiles: int = 1      # N x N grid of overlapping crops scanned in addition to the whole frame (finds smaller regions, slower)
     nudenet_model: str = ""     # empty = the 320 px model bundled with NudeNet; otherwise the path of another NudeNet onnx (e.g. 640m)
     nudenet_res: int = 320      # input resolution of nudenet_model
+    nudenet_device: str = "auto"   # auto = GPU when it works, else CPU; cuda = GPU or fail; cpu
     fail_closed: bool = True
     fail_closed_mode: str = "bbox"
     block: int = 32
@@ -61,7 +62,8 @@ class ProcessSettings:
     keep_audio: bool = True
     max_frames: Optional[int] = None
     resume: bool = False
-    encoder: str = "libx264"
+    encoder: str = "auto"       # auto = h264_nvenc (GPU) when it works on this machine, else libx264
+    settings_rev: int = 2       # 2: "auto" encoder and detector device exist (older saved settings get them once)
     device: str = "cuda"
     allow_vfr: bool = False
     keep_chunks: bool = True    # keep intermediate chunks after success: enables fast re-processing after re-clicks (uses disk)
@@ -80,7 +82,7 @@ def build_args(video: str, points_path: Optional[str], st: ProcessSettings, canc
     if not st.use_nudenet:
         a.append("--no-nudenet")
     else:
-        a += ["--nudenet-tiles", str(st.nudenet_tiles)]
+        a += ["--nudenet-tiles", str(st.nudenet_tiles), "--nudenet-device", st.nudenet_device]
         if st.nudenet_model:
             a += ["--nudenet-model", st.nudenet_model, "--nudenet-res", str(st.nudenet_res)]
     if st.fail_closed:

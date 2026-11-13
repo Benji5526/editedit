@@ -369,6 +369,45 @@ def nvenc_available() -> bool:
         return False
 
 
+_NVENC_USABLE: Optional[bool] = None
+NVENC_QP_OFFSET = 3      # h264_nvenc constqp (crf + 3) matched libx264 crf 16 "medium" in SSIM and size on noisy 4K (see README)
+
+
+def nvenc_usable() -> bool:
+    """True when h264_nvenc really encodes on this machine (ffmpeg lists it even without an NVIDIA GPU). Tried once per process."""
+    global _NVENC_USABLE
+    if _NVENC_USABLE is None:
+        ok = False
+        if nvenc_available():
+            try:
+                p = subprocess.run([find_tool("ffmpeg"), "-v", "error", "-nostdin", "-f", "lavfi", "-i", "color=size=256x256:rate=30",
+                                    "-frames:v", "3", "-c:v", "h264_nvenc", "-f", "null", "-"], capture_output=True, timeout=30,
+                                   creationflags=CREATE_NO_WINDOW)
+                ok = p.returncode == 0
+            except Exception:  # noqa: BLE001
+                ok = False
+        _NVENC_USABLE = ok
+    return _NVENC_USABLE
+
+
+def resolve_encoder(name: str) -> str:
+    """"auto" -> the GPU encoder when it works here, else libx264."""
+    if name == "auto":
+        return "h264_nvenc" if nvenc_usable() else "libx264"
+    return name
+
+
+def encoder_args(encoder: str, crf: int, preset: str) -> List[str]:
+    """ffmpeg video encoder arguments for a quality setting given as an x264-style CRF.
+
+    h264_nvenc runs in constant-QP mode at crf + NVENC_QP_OFFSET. (The earlier "-rc vbr -cq N -b:v 0" did not behave as constant
+    quality with this ffmpeg: the output was the same for every N and clearly worse than libx264.) ``preset`` only applies to
+    software encoders."""
+    if encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-rc", "constqp", "-qp", str(int(crf) + NVENC_QP_OFFSET), "-preset", "p5"]
+    return ["-c:v", encoder, "-crf", str(crf), "-preset", preset]
+
+
 def frame_exact_timescale(fps_rational: str) -> int:
     """Container timescale in which one frame lasts a whole number of ticks.
 
@@ -391,10 +430,7 @@ class SegmentWriter:
         cmd = [find_tool("ffmpeg"), "-v", "error", "-nostdin", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{info.width}x{info.height}",
                "-r", info.fps_rational, "-i", "-", "-an", "-vf", vf]
-        if encoder == "h264_nvenc":
-            cmd += ["-c:v", "h264_nvenc", "-cq", str(crf), "-preset", "p5", "-rc", "vbr", "-b:v", "0"]
-        else:
-            cmd += ["-c:v", encoder, "-crf", str(crf), "-preset", preset]
+        cmd += encoder_args(encoder, crf, preset)
         cmd += ["-colorspace", cs_tag, "-color_primaries", "bt709" if cs_tag == "bt709" else cs_tag,
                 "-color_trc", trc_tag, "-pix_fmt", "yuv420p", "-video_track_timescale", str(frame_exact_timescale(info.fps_rational)), path]
         self._cmd = cmd
