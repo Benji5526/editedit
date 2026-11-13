@@ -30,7 +30,7 @@ from . import quality_control as qc
 from .job_manager import JobDB, db_path_for
 from .mask_cache import CACHE_VERSION, cache_path, load_chunk_cache, save_chunk_cache  # noqa: F401  (re-exported)
 from .system_guard import disk_check, keep_awake
-from .detection import Det, fill_detections, EXACT_CLASSES
+from .detection import Det, fill_detections, EXACT_CLASSES, round_face_part
 from .exclusions import is_excluded
 from .mosaic import (STYLES, apply_layers, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
@@ -104,6 +104,7 @@ class Config:
     # mosaic
     block: int = 32                      # strength: block size (pixelate) or 2 x sigma (blur), full-res pixels
     mosaic_style: str = "pixelate"       # pixelate | blur | solid
+    det_shape: str = "box"               # box | ellipse: outline of the regions that come from detections (not of tracked masks)
     mask_pad_px: float = 24.0            # full-res pixels
     temporal_radius: int = 2
     # fail-closed
@@ -131,7 +132,7 @@ NON_HASHED_EXTRA = {"keep_temp", "nudenet_provider", "det_exclusions"}     # det
 # Options that are only read by the render stage (mosaic + encoding). They do not change what the tracker, the detector or the QC
 # heuristics produce, so a job whose analysis results are cached (masks_NNNNN.npz) can be re-rendered with other values without
 # running SAM 2 or NudeNet again. Everything else is part of config_hash.
-RENDER_ONLY = {"block", "mosaic_style", "mask_pad_px", "temporal_radius", "det_expand", "det_pad_px", "fail_closed_expand",
+RENDER_ONLY = {"block", "mosaic_style", "det_shape", "mask_pad_px", "temporal_radius", "det_expand", "det_pad_px", "fail_closed_expand",
                "fail_closed_mode", "encoder", "crf", "preset"}
 
 
@@ -154,6 +155,8 @@ def render_hash(cfg: Config, object_styles: Optional[ObjectStyles] = None) -> st
         d["object_styles"] = {str(k): object_styles[k] for k in sorted(object_styles)}
     if (cfg.extra or {}).get("det_exclusions"):
         d["det_exclusions"] = cfg.extra["det_exclusions"]      # detections marked "not a target": only the mosaic changes
+    if d.get("det_shape") == "box":
+        del d["det_shape"]                 # the default: segments rendered before this option existed stay valid
     if cfg.encoder == "h264_nvenc":
         d["nvenc_args"] = 2                # constant-QP arguments (see video_io.encoder_args); older nvenc segments are re-rendered
     d["code"] = CODE_VERSION
@@ -955,12 +958,25 @@ class Pipeline:
                                 m_obj = dilate_mask(m_obj, pad_o)
                                 layers[key] = m_obj if key not in layers else (layers[key] | m_obj)
                     m_an = dilate_mask(m_an, pad_an)
-                    dboxes = [expand_box(d.box, 0.0 if d.cls in EXACT_CLASSES else cfg.det_expand,
-                                         0.0 if d.cls in EXACT_CLASSES else det_pad_an, shape) for d in filled[i] if not d.poly]
-                    polys = [np.round(np.array(d.poly)).astype(np.int32) for d in filled[i] if d.poly]
-                    if polys:
+                    round_ = cfg.det_shape == "ellipse"
+                    dboxes, polys, ovals = [], [], []
+                    for d in filled[i]:
+                        if d.cls in EXACT_CLASSES:                        # part of a face: never grown (the eyes stay visible)
+                            poly = d.poly or [[d.x1, d.y1], [d.x2, d.y1], [d.x2, d.y2], [d.x1, d.y2]]
+                            polys.append(np.round(np.array(round_face_part(poly, d.cls) if round_ else poly)).astype(np.int32))
+                        elif round_:
+                            # the ellipse inscribed in the grown box; with the default growth (25 % per side) it still
+                            # contains the whole detected box
+                            ovals.append(expand_box(d.box, cfg.det_expand, det_pad_an, shape))
+                        else:
+                            dboxes.append(expand_box(d.box, cfg.det_expand, det_pad_an, shape))
+                    if polys or ovals:
                         pm = np.zeros(shape, np.uint8)
-                        cv2.fillPoly(pm, polys, 1)
+                        if polys:
+                            cv2.fillPoly(pm, polys, 1)
+                        for x1, y1, x2, y2 in ovals:
+                            cv2.ellipse(pm, (int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2))),
+                                        (max(1, int(np.ceil((x2 - x1) / 2))), max(1, int(np.ceil((y2 - y1) / 2)))), 0, 0, 360, 1, -1)
                         m_an |= pm.astype(bool)
                     if dboxes:
                         m_an |= boxes_to_mask(dboxes, shape)

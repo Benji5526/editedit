@@ -152,6 +152,11 @@ class ProcessDialog(QDialog):
         self.pad.setToolTip("추적으로 찾은 영역보다 바깥으로 이만큼 더 넓게 가립니다 (원본 영상의 픽셀 기준). "
                             "가장자리가 비치면 늘리세요.")
         form.addRow("가리는 영역 여백", self.pad)
+        self.shape = combo((("둥글게 (타원)", "ellipse"), ("네모", "box")), st.det_shape)
+        self.shape.setToolTip("자동 탐지로 찾은 곳을 가리는 모양입니다. '둥글게'는 탐지된 네모를 조금 넓힌 뒤 그 안에 꽉 차는 타원으로 가립니다. "
+                              "얼굴의 눈 아래/눈 위는 눈 쪽 경계만 직선으로 두고 반대쪽을 둥글게 합니다. "
+                              "클릭해서 추적하는 대상은 항상 대상의 윤곽을 따라 가려집니다. 안전 모드로 넓게 가릴 때는 네모로 가립니다.")
+        form.addRow("자동 탐지 영역의 모양", self.shape)
 
         section("자동 탐지 (NudeNet)")
         self.nude = QCheckBox("노출 부위를 자동으로 찾아서 함께 가리기")
@@ -356,7 +361,7 @@ class ProcessDialog(QDialog):
             nudenet_res=int(self.nres.currentData()) if self.nmodel.text().strip() else 320, nudenet_device=self.ndev.currentData(),
             det_male=self.det_male.isChecked(), det_female=self.det_female.isChecked(), face_mode=self.face.currentData(),
             fail_closed=self.fc.isChecked(), fail_closed_mode=self.fcm.currentData(),
-            block=self.block.value(), block_auto=self.block_auto.isChecked(), mosaic_style=self.style.currentData(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
+            block=self.block.value(), block_auto=self.block_auto.isChecked(), mosaic_style=self.style.currentData(), det_shape=self.shape.currentData(), mask_pad_px=float(self.pad.value()), keep_audio=self.audio.isChecked(),
             max_frames=self.test_n.value() or None, resume=self.resume.isChecked(), encoder=self.enc.currentData(),
             keep_chunks=self.keep.isChecked())
 

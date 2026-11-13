@@ -56,6 +56,7 @@ class ProcessSettings:
     det_male: bool = True       # what the detector looks for: exposed male / female genitalia, faces
     det_female: bool = True
     face_mode: str = "off"      # off | full (whole face) | below_eyes | above_eyes
+    det_shape: str = "ellipse"  # outline of the mosaic on detected regions: box | ellipse
     exclusions: str = ""        # file with detections marked "not a target" (set by the main window per video, not remembered)
     fail_closed: bool = True
     fail_closed_mode: str = "bbox"
@@ -88,7 +89,7 @@ def build_args(video: str, points_path: Optional[str], st: ProcessSettings, canc
     a = [video, "--progress-json", "--cancel-file", cancel_file, "-o", st.output,
          "--chunk-size", str(st.chunk_size), "--analysis-width", str(st.analysis_width),
          "--detect-every", str(st.detect_every), "--det-threshold", str(st.det_threshold),
-         "--block", str(st.block), "--mosaic-style", st.mosaic_style, "--mask-pad-px", str(st.mask_pad_px), "--encoder", st.encoder, "--device", st.device]
+         "--block", str(st.block), "--mosaic-style", st.mosaic_style, "--det-shape", st.det_shape, "--mask-pad-px", str(st.mask_pad_px), "--encoder", st.encoder, "--device", st.device]
     if points_path:
         a += ["--points", points_path, "--sam2-checkpoint", st.sam2_checkpoint]
     classes = detector_classes(st)

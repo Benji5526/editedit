@@ -198,6 +198,19 @@ class NudenetDetector:
         return dets
 
 
+def round_face_part(poly, cls: str, n: int = 24) -> list:
+    """Half-ellipse version of a face-part rectangle [[x, y] x 4] (corner order as made by face_parts: for FACE_BELOW the first
+    two corners are on the eye side, for FACE_ABOVE the last two). The edge next to the eyes stays straight - rounding it would
+    either cover the eyes or uncover the nose - and the far side (chin / forehead) becomes a curve."""
+    p = [np.array(q, float) for q in poly]
+    if cls == FACE_ABOVE:
+        e0, e1, far = p[3], p[2], p[0]
+    else:
+        e0, e1, far = p[0], p[1], p[3]
+    c, a, b = (e0 + e1) / 2, (e1 - e0) / 2, far - e0
+    return [[float(v[0]), float(v[1])] for v in (c + a * np.cos(t) + b * np.sin(t) for t in np.linspace(0.0, np.pi, n + 1))]
+
+
 class FaceLandmarks:
     """Eye positions of the faces in a frame, from the YuNet face detector that OpenCV runs (cv2.FaceDetectorYN). Local file,
     no network. detect() returns [(x1, y1, x2, y2, (rx, ry), (lx, ly), score, (nose_x, nose_y))] in frame pixels."""
