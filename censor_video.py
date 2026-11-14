@@ -12,6 +12,7 @@ import sys
 import threading
 
 from src.job_manager import file_signature
+from src.paths import app_root
 from src.pipeline import Config, Pipeline, plan_reprocess
 
 
@@ -66,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--face", choices=("off", "full", "below_eyes", "above_eyes"), default="off",
                    help="also mosaic faces found by NudeNet: the whole face, or only the part below / above the eyes "
                         "(eye line from the face landmark model when --face-model exists, else rough proportions of the face box)")
-    g.add_argument("--face-model", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_detection_yunet_2023mar.onnx"),
+    g.add_argument("--face-model", default=os.path.join(app_root(), "models", "face_detection_yunet_2023mar.onnx"),
                    help="YuNet face landmark model (onnx) for --face below_eyes / above_eyes; skipped when the file is missing")
     g.add_argument("--nudenet-model", help="path to a different NudeNet onnx (e.g. 640m)")
     g.add_argument("--nudenet-res", type=int, default=320, help="inference resolution of that model")
