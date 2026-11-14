@@ -40,3 +40,4 @@ dist/
 .venv-train/
 training/data/
 training/runs/
+training/weights/
