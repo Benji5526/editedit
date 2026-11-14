@@ -32,6 +32,7 @@ from .mask_cache import CACHE_VERSION, cache_path, load_chunk_cache, save_chunk_
 from .system_guard import disk_check, keep_awake
 from .detection import Det, fill_detections, EXACT_CLASSES, round_face_part
 from .exclusions import is_excluded
+from .mosaic import merge_overlapping
 from .mosaic import (STYLES, apply_layers, apply_mosaic, boxes_to_mask, dilate_mask, expand_box, mask_bbox,
                      temporal_union, upscale_mask)
 from .points_io import MaskPrompts, ObjectStyles, Prompts, load_mask_prompts, load_object_styles, load_points, mask_digest
@@ -155,6 +156,7 @@ def render_hash(cfg: Config, object_styles: Optional[ObjectStyles] = None) -> st
         d["object_styles"] = {str(k): object_styles[k] for k in sorted(object_styles)}
     if (cfg.extra or {}).get("det_exclusions"):
         d["det_exclusions"] = cfg.extra["det_exclusions"]      # detections marked "not a target": only the mosaic changes
+    d["merge_overlaps"] = 1                # overlapping detection regions are merged into one shape (segments before that are re-rendered)
     if d.get("det_shape") == "box":
         del d["det_shape"]                 # the default: segments rendered before this option existed stay valid
     if cfg.encoder == "h264_nvenc":
@@ -970,14 +972,17 @@ class Pipeline:
                             ovals.append(expand_box(d.box, cfg.det_expand, det_pad_an, shape))
                         else:
                             dboxes.append(expand_box(d.box, cfg.det_expand, det_pad_an, shape))
-                    if polys or ovals:
+                    if polys or ovals or dboxes:
                         pm = np.zeros(shape, np.uint8)
-                        if polys:
-                            cv2.fillPoly(pm, polys, 1)
+                        for poly in polys:                                # one call per polygon: a single fillPoly call
+                            cv2.fillPoly(pm, [poly], 1)                   # leaves the overlap of two polygons unfilled
                         for x1, y1, x2, y2 in ovals:
                             cv2.ellipse(pm, (int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2))),
                                         (max(1, int(np.ceil((x2 - x1) / 2))), max(1, int(np.ceil((y2 - y1) / 2)))), 0, 0, 360, 1, -1)
-                        m_an |= pm.astype(bool)
+                        if dboxes:
+                            pm |= boxes_to_mask(dboxes, shape).astype(np.uint8)
+                        m_an |= merge_overlapping(pm).astype(bool)        # overlapping detections: one shape
+                        dboxes = []
                     if dboxes:
                         m_an |= boxes_to_mask(dboxes, shape)
                     if fc_regions[i]:

@@ -111,6 +111,18 @@ def pixelate_region(frame: np.ndarray, mask: np.ndarray, block: int) -> np.ndarr
 STYLES = ("pixelate", "blur", "solid")
 
 
+def merge_overlapping(mask: np.ndarray) -> np.ndarray:
+    """Regions that touch or overlap become one region: every connected blob of the uint8 mask is replaced by its convex hull,
+    so two overlapping ellipses read as one rounded shape instead of a figure eight. A single box, ellipse or half-ellipse is
+    convex already and stays as it is. The result never covers less than the input."""
+    out = mask.copy()
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        if len(c) >= 3:
+            cv2.fillConvexPoly(out, cv2.convexHull(c), 1)
+    return out
+
+
 def recommended_block(width: int, height: int) -> int:
     """Strength that scales with the video: about 1/24 of the longer side, in multiples of 4 (1280 -> 52, 1920 -> 80, 3840 -> 160).
     (1/60 until 2026-11-14: judged far too weak on real 4K footage by the user, who asked for five times the 32 px used then.)
