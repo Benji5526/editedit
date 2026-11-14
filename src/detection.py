@@ -122,6 +122,20 @@ class NudenetDetector:
         import nudenet
 
         labels = supported_labels()
+        # a model trained here (training/train.py) brings its own class list and input size in "<model>.labels.json"
+        self.custom = False
+        meta_path = os.path.splitext(model_path)[0] + ".labels.json" if model_path else ""
+        if meta_path and os.path.isfile(meta_path):
+            import json
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            labels, self.custom = [str(v) for v in meta["labels"]], True
+            resolution = int(meta.get("resolution", resolution))
+            if not classes or not any(c in labels for c in classes):
+                classes = list(labels)                 # the usual NudeNet class names mean nothing to this model: use all of its own
+            if face_mode != "off":
+                raise ValueError("this detector model was trained here and has no face classes: switch the face option off, "
+                                 "or use the standard NudeNet model for faces")
         classes = list(classes) if classes else list(DEFAULT_CLASSES)
         if face_mode not in FACE_MODES:
             raise ValueError(f"unknown face mode {face_mode!r}; choose one of {FACE_MODES}")

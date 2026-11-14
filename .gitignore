@@ -37,3 +37,6 @@ backups/
 # PyInstaller output (rebuilt by tools/build_exe.py)
 build/
 dist/
+.venv-train/
+training/data/
+training/runs/

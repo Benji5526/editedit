@@ -175,3 +175,21 @@ def test_gap_filling_keeps_the_polygon():
     b = Det(20, 10, 60, 50, 0.9, "FACE_BELOW_EYES", poly=[[20, 10], [60, 10], [60, 50], [20, 50]])
     out, _ = fill_detections([[a], [], [], [], [b], []], 0, [], max_gap=4, hold=1)
     assert out[2][0].filled and out[2][0].poly[0] == [15.0, 10.0] and out[5][0].poly == b.poly
+
+
+def test_a_model_trained_here_brings_its_own_labels(tmp_path):
+    import json
+    import os
+    import shutil
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "training", "runs", "smoke", "smoke", "model.onnx")
+    if not os.path.isfile(src):
+        pytest.skip("no locally trained model (training/train.py smoke run)")
+    m = str(tmp_path / "mine.onnx")
+    shutil.copy2(src, m)
+    with open(str(tmp_path / "mine.labels.json"), "w", encoding="utf-8") as f:
+        json.dump({"labels": ["censor"], "resolution": 320}, f)
+    det = NudenetDetector(0.25, classes=["MALE_GENITALIA_EXPOSED"], model_path=m, resolution=640)
+    assert det.custom and det.classes == ["censor"] and det.resolution == 320
+    assert isinstance(det.detect(np.zeros((180, 320, 3), np.uint8)), list)
+    with pytest.raises(ValueError):
+        NudenetDetector(0.25, model_path=m, face_mode="below_eyes")
